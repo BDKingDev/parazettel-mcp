@@ -135,6 +135,14 @@ def _result_to_records(result: Any) -> List[Dict[str, Any]]:
     return records
 
 
+def _result_first_column(result: Any) -> List[Any]:
+    """Return the first column of every row in a Kuzu QueryResult as a list."""
+    values: List[Any] = []
+    while result.has_next():
+        values.append(result.get_next()[0])
+    return values
+
+
 def _db_dict_to_note(
     nd: Dict[str, Any], tags: List[Tag], links: List[Link]
 ) -> Note:
@@ -194,7 +202,13 @@ class NoteRepository(Repository[Note]):
         """Release resources held by this repository."""
 
     def _get_conn(self) -> kuzu.Connection:
-        """Create a new Kuzu connection (one per operation)."""
+        """Create a new Kuzu connection for a single operation.
+
+        Kuzu connections are not thread-safe, so one connection is created per
+        repository operation.  This is the standard Kuzu pattern for concurrent
+        access: multiple ``Connection`` objects share the same underlying
+        ``Database`` which manages concurrency at the storage layer.
+        """
         return kuzu.Connection(self.db)
 
     def _build_tmp_path(self, file_path: Path) -> Path:
@@ -235,7 +249,7 @@ class NoteRepository(Repository[Note]):
         """Rebuild the graph index from files when the ID sets diverge."""
         conn = self._get_conn()
         id_result = conn.execute("MATCH (n:Note) RETURN n.id")
-        db_ids = {id_result.get_next()[0] for _ in range(id_result.get_num_tuples())}
+        db_ids = set(_result_first_column(id_result))
         file_stems = {p.stem for p in self.notes_dir.glob("*.md")}
         if db_ids != file_stems:
             self.rebuild_index()
@@ -839,7 +853,7 @@ class NoteRepository(Repository[Note]):
         """Return all notes, reconstructed from the graph index."""
         conn = self._get_conn()
         id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
-        ids = [id_result.get_next()[0] for _ in range(id_result.get_num_tuples())]
+        ids = _result_first_column(id_result)
         return self._fetch_notes_by_ids(conn, ids)
 
     def update(self, note: Note) -> Note:
@@ -1041,7 +1055,7 @@ class NoteRepository(Repository[Note]):
 
         conn = self._get_conn()
         result = conn.execute("\n".join(query_parts), params)
-        ids = [result.get_next()[0] for _ in range(result.get_num_tuples())]
+        ids = _result_first_column(result)
 
         return self._fetch_notes_by_ids(conn, ids)
 
@@ -1062,14 +1076,14 @@ class NoteRepository(Repository[Note]):
                 "RETURN DISTINCT t.id AS id",
                 {"id": note_id},
             )
-            ids = [result.get_next()[0] for _ in range(result.get_num_tuples())]
+            ids = _result_first_column(result)
         elif direction == "incoming":
             result = conn.execute(
                 "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
                 "RETURN DISTINCT s.id AS id",
                 {"id": note_id},
             )
-            ids = [result.get_next()[0] for _ in range(result.get_num_tuples())]
+            ids = _result_first_column(result)
         elif direction == "both":
             out_result = conn.execute(
                 "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
@@ -1081,11 +1095,8 @@ class NoteRepository(Repository[Note]):
                 "RETURN DISTINCT s.id AS id",
                 {"id": note_id},
             )
-            ids_set: Set[str] = set()
-            for _ in range(out_result.get_num_tuples()):
-                ids_set.add(out_result.get_next()[0])
-            for _ in range(in_result.get_num_tuples()):
-                ids_set.add(in_result.get_next()[0])
+            ids_set: Set[str] = set(_result_first_column(out_result))
+            ids_set.update(_result_first_column(in_result))
             ids_set.discard(note_id)
             ids = list(ids_set)
         else:
@@ -1100,7 +1111,7 @@ class NoteRepository(Repository[Note]):
         """Return all tags stored in the graph."""
         conn = self._get_conn()
         result = conn.execute("MATCH (t:Tag) RETURN t.name AS name")
-        return [Tag(name=result.get_next()[0]) for _ in range(result.get_num_tuples())]
+        return [Tag(name=name) for name in _result_first_column(result)]
 
     def get_link(
         self, source_id: str, target_id: str, link_type: str
@@ -1127,24 +1138,13 @@ class NoteRepository(Repository[Note]):
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""
         conn = self._get_conn()
-
-        all_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
-        all_ids = {
-            all_result.get_next()[0] for _ in range(all_result.get_num_tuples())
-        }
-
-        out_result = conn.execute(
-            "MATCH (n:Note)-[:LINKS_TO]->(:Note) RETURN DISTINCT n.id AS id"
-        )
-        in_result = conn.execute(
-            "MATCH (:Note)-[:LINKS_TO]->(n:Note) RETURN DISTINCT n.id AS id"
-        )
-        linked: Set[str] = set()
-        for _ in range(out_result.get_num_tuples()):
-            linked.add(out_result.get_next()[0])
-        for _ in range(in_result.get_num_tuples()):
-            linked.add(in_result.get_next()[0])
-
+        all_ids = set(_result_first_column(conn.execute("MATCH (n:Note) RETURN n.id AS id")))
+        linked = set(_result_first_column(
+            conn.execute("MATCH (n:Note)-[:LINKS_TO]->(:Note) RETURN DISTINCT n.id AS id")
+        ))
+        linked.update(_result_first_column(
+            conn.execute("MATCH (:Note)-[:LINKS_TO]->(n:Note) RETURN DISTINCT n.id AS id")
+        ))
         return list(all_ids - linked)
 
     def get_connection_counts(self, limit: int = 10) -> List[Tuple[str, int]]:

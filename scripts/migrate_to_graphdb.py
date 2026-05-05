@@ -187,18 +187,23 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
 
 def _build_repo_without_auto_rebuild():
     """Build a NoteRepository without triggering auto-rebuild."""
+    from contextlib import contextmanager
+
     from parazettel_mcp.storage.note_repository import NoteRepository
 
-    # Temporarily replace rebuild_index_if_needed with a no-op so __init__
-    # does not try to rebuild (the DB may not exist yet).
-    original_method = NoteRepository.rebuild_index_if_needed
-    NoteRepository.rebuild_index_if_needed = lambda self: None  # type: ignore[method-assign]
-    try:
-        from parazettel_mcp.config import config
+    @contextmanager
+    def _patch_noop(cls, method_name):
+        original = getattr(cls, method_name)
+        setattr(cls, method_name, lambda self: None)
+        try:
+            yield
+        finally:
+            setattr(cls, method_name, original)
 
+    from parazettel_mcp.config import config
+
+    with _patch_noop(NoteRepository, "rebuild_index_if_needed"):
         repo = NoteRepository(notes_dir=config.get_absolute_path(config.notes_dir))
-    finally:
-        NoteRepository.rebuild_index_if_needed = original_method  # type: ignore[method-assign]
     return repo
 
 
