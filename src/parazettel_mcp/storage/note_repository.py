@@ -25,7 +25,7 @@ import frontmatter
 import kuzu
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.graph_db import init_graph_db
+from parazettel_mcp.models.graph_db import close_graph_db, init_graph_db
 from parazettel_mcp.models.schema import (
     Link,
     LinkType,
@@ -193,13 +193,19 @@ class NoteRepository(Repository[Note]):
         )
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
-        self.db = init_graph_db(config.get_graph_db_path())
+        self.graph_db_path = config.get_graph_db_path()
+        self.db = init_graph_db(self.graph_db_path)
         self.file_lock = threading.RLock()
+        self._closed = False
 
         self.rebuild_index_if_needed()
 
     def close(self) -> None:
         """Release resources held by this repository."""
+        if self._closed:
+            return
+        close_graph_db(self.graph_db_path)
+        self._closed = True
 
     def _get_conn(self) -> kuzu.Connection:
         """Create a new Kuzu connection for a single operation.

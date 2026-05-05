@@ -1,12 +1,18 @@
 """Tests for the NoteRepository class."""
 
+import shutil
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
-from parazettel_mcp.storage.note_repository import _coerce_datetime, _normalize_wiki_target
+from parazettel_mcp.storage.note_repository import (
+    NoteRepository,
+    _coerce_datetime,
+    _normalize_wiki_target,
+)
 
 
 def test_create_note(note_repository):
@@ -629,6 +635,84 @@ def test_graph_db_initialized(note_repository):
     result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
     count = result.get_next()[0]
     assert count == 0  # empty repository has no notes
+
+
+def test_repository_close_allows_reopen_same_graph_path():
+    """Closing a repository should release the graph path for a fresh reopen."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    first_repo = None
+    reopened_repo = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+
+        first_repo = NoteRepository(notes_dir=notes_dir)
+        saved = first_repo.create(Note(title="Reopen Test", content="Reopen body"))
+        first_repo.close()
+        first_repo = None
+
+        reopened_repo = NoteRepository(notes_dir=notes_dir)
+        reopened = reopened_repo.search(title="Reopen Test")
+        assert len(reopened) == 1
+        assert reopened[0].id == saved.id
+    finally:
+        if reopened_repo is not None:
+            reopened_repo.close()
+        if first_repo is not None:
+            first_repo.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_multiple_repositories_share_same_graph_path():
+    """Repositories for the same graph path should share the DB handle safely."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    first_repo = None
+    second_repo = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+
+        first_repo = NoteRepository(notes_dir=notes_dir)
+        second_repo = NoteRepository(notes_dir=notes_dir)
+
+        saved = first_repo.create(
+            Note(title="Shared Graph Note", content="Shared body")
+        )
+        results = second_repo.search(title="Shared Graph Note")
+        assert len(results) == 1
+        assert results[0].id == saved.id
+
+        first_repo.close()
+        first_repo = None
+
+        still_available = second_repo.search(title="Shared Graph Note")
+        assert len(still_available) == 1
+    finally:
+        if second_repo is not None:
+            second_repo.close()
+        if first_repo is not None:
+            first_repo.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        shutil.rmtree(test_root, ignore_errors=True)
 
 
 def test_create_leaves_no_tmp_file(note_repository):

@@ -72,13 +72,14 @@ class TestIntegration:
 
         yield
 
+        if getattr(self, "server", None) is not None:
+            self.server.close()
+        if getattr(self, "zettel_service", None) is not None:
+            self.zettel_service.close()
+
         # Restore original config
         config.notes_dir = self.original_notes_dir
         config.graph_db_path = self.original_graph_db_path
-
-        # Kuzu releases file handles on garbage collection; no explicit dispose needed.
-        _ = getattr(self.zettel_service, "repository", None)
-        _ = getattr(getattr(self.server, "zettel_service", None), "repository", None)
 
         # Clean up test directories
         shutil.rmtree(self.test_root, ignore_errors=True)

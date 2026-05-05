@@ -88,7 +88,6 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
     # Import here so that the script fails fast if the package is not installed.
     try:
         from parazettel_mcp.models.graph_db import init_graph_db
-        from parazettel_mcp.storage.note_repository import NoteRepository
     except ImportError as exc:
         logger.error(
             "Could not import parazettel_mcp. "
@@ -103,54 +102,46 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
         logger.info("Initialising graph database at %s …", graph_db_path)
         graph_db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Use a temporary NoteRepository pointed at the notes dir.  We bypass
-    # rebuild_index_if_needed because we want full control over the import.
-    from parazettel_mcp.config import config
+    repo = _build_repo_helpers(notes_dir)
 
-    original_notes_dir = config.notes_dir
-    original_graph_db_path = config.graph_db_path
-    config.notes_dir = notes_dir
-    config.graph_db_path = graph_db_path
+    # Parse all notes (pass 1 and 2 happen inside rebuild_index)
+    imported = 0
+    skipped = 0
+    notes = []
+
+    for file_path in note_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            note = repo._parse_note_from_markdown(content)
+            notes.append(note)
+            imported += 1
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", file_path.name, exc)
+            skipped += 1
+
+    logger.info("Parsed %d notes (%d skipped).", imported, skipped)
+
+    if dry_run:
+        logger.info("Dry run complete – nothing written.")
+        return
+
+    logger.info("Importing into graph database (pass 1: nodes) …")
+    import kuzu
+
+    from parazettel_mcp.models.graph_db import close_graph_db
+
+    db = init_graph_db(graph_db_path)
+    conn = kuzu.Connection(db)
 
     try:
-        # Instantiate a thin repo that just provides the parser and indexer.
-        # We must NOT call rebuild_index_if_needed automatically, so we patch
-        # the method temporarily.
-        repo = _build_repo_without_auto_rebuild()
-
-        # Parse all notes (pass 1 and 2 happen inside rebuild_index)
-        imported = 0
-        skipped = 0
-        notes = []
-
-        for file_path in note_files:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                note = repo._parse_note_from_markdown(content)
-                notes.append(note)
-                imported += 1
-            except Exception as exc:
-                logger.warning("Skipping %s: %s", file_path.name, exc)
-                skipped += 1
-
-        logger.info("Parsed %d notes (%d skipped).", imported, skipped)
-
-        if dry_run:
-            logger.info("Dry run complete – nothing written.")
-            return
-
-        logger.info("Importing into graph database (pass 1: nodes) …")
-        import kuzu
-
-        db = init_graph_db(graph_db_path)
-        conn = kuzu.Connection(db)
-
         for note in notes:
             try:
                 repo._index_note_nodes_only(note, conn)
             except Exception as exc:
-                logger.warning("Failed to index node %s (%s): %s", note.id, note.title, exc)
+                logger.warning(
+                    "Failed to index node %s (%s): %s", note.id, note.title, exc
+                )
 
         logger.info("Importing into graph database (pass 2: relationships) …")
         for note in notes:
@@ -164,7 +155,6 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
                     exc,
                 )
 
-        # Verify
         result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
         note_count = result.get_next()[0]
         result = conn.execute("MATCH ()-[r:LINKS_TO]->() RETURN count(r) AS cnt")
@@ -179,31 +169,17 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
             link_count,
             tag_count,
         )
-
     finally:
-        config.notes_dir = original_notes_dir
-        config.graph_db_path = original_graph_db_path
+        conn.close()
+        close_graph_db(graph_db_path)
 
 
-def _build_repo_without_auto_rebuild():
-    """Build a NoteRepository without triggering auto-rebuild."""
-    from contextlib import contextmanager
-
+def _build_repo_helpers(notes_dir: Path):
+    """Build a lightweight NoteRepository instance without opening the graph DB."""
     from parazettel_mcp.storage.note_repository import NoteRepository
 
-    @contextmanager
-    def _patch_noop(cls, method_name):
-        original = getattr(cls, method_name)
-        setattr(cls, method_name, lambda self: None)
-        try:
-            yield
-        finally:
-            setattr(cls, method_name, original)
-
-    from parazettel_mcp.config import config
-
-    with _patch_noop(NoteRepository, "rebuild_index_if_needed"):
-        repo = NoteRepository(notes_dir=config.get_absolute_path(config.notes_dir))
+    repo = object.__new__(NoteRepository)
+    repo.notes_dir = notes_dir
     return repo
 
 

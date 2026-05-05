@@ -15,9 +15,19 @@ Kuzu DATE values so that NULL is representable without a sentinel and round-trip
 through Python cleanly.
 """
 
+import threading
 from pathlib import Path
+from typing import Dict, Tuple
 
 import kuzu
+
+_DB_CACHE_LOCK = threading.Lock()
+_DB_CACHE: Dict[str, Tuple[kuzu.Database, int]] = {}
+
+
+def _db_cache_key(db_path: Path) -> str:
+    """Return a normalized cache key for a graph database path."""
+    return str(Path(db_path).expanduser().resolve())
 
 
 def init_graph_db(db_path: Path) -> kuzu.Database:
@@ -32,11 +42,42 @@ def init_graph_db(db_path: Path) -> kuzu.Database:
     Returns:
         An open :class:`kuzu.Database` instance.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    db = kuzu.Database(str(db_path))
-    conn = kuzu.Connection(db)
-    _create_schema(conn)
-    return db
+    db_path = Path(db_path).expanduser().resolve()
+    cache_key = _db_cache_key(db_path)
+
+    with _DB_CACHE_LOCK:
+        cached = _DB_CACHE.get(cache_key)
+        if cached is not None:
+            db, refcount = cached
+            _DB_CACHE[cache_key] = (db, refcount + 1)
+            return db
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = kuzu.Database(str(db_path))
+        conn = kuzu.Connection(db)
+        try:
+            _create_schema(conn)
+        finally:
+            conn.close()
+        _DB_CACHE[cache_key] = (db, 1)
+        return db
+
+
+def close_graph_db(db_path: Path) -> None:
+    """Release a shared graph database handle for *db_path*."""
+    cache_key = _db_cache_key(db_path)
+
+    with _DB_CACHE_LOCK:
+        cached = _DB_CACHE.get(cache_key)
+        if cached is None:
+            return
+        db, refcount = cached
+        if refcount > 1:
+            _DB_CACHE[cache_key] = (db, refcount - 1)
+            return
+        del _DB_CACHE[cache_key]
+
+    db.close()
 
 
 def _create_schema(conn: kuzu.Connection) -> None:

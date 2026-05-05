@@ -1,8 +1,8 @@
 """Common test fixtures for the Zettelkasten MCP server."""
 
-import os
-import tempfile
+import shutil
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -13,10 +13,18 @@ from parazettel_mcp.storage.note_repository import NoteRepository
 
 @pytest.fixture
 def temp_dirs():
-    """Create temporary directories for notes and graph database."""
-    with tempfile.TemporaryDirectory() as notes_dir:
-        with tempfile.TemporaryDirectory() as graph_db_dir:
-            yield Path(notes_dir), Path(graph_db_dir)
+    """Create workspace-local directories for notes and graph database."""
+    test_root = (
+        Path(__file__).resolve().parents[1] / ".tmp" / "test-fixtures" / uuid4().hex
+    )
+    notes_dir = test_root / "notes"
+    graph_db_dir = test_root / "db"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        yield notes_dir, graph_db_dir
+    finally:
+        shutil.rmtree(test_root, ignore_errors=True)
 
 
 @pytest.fixture
