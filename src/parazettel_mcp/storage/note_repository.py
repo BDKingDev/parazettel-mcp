@@ -976,7 +976,7 @@ class NoteRepository(Repository[Note]):
 
         Supported keyword arguments
         ---------------------------
-        content, title, note_type, tag, tags, linked_to, linked_from,
+        text, content, title, note_type, tag, tags, linked_to, linked_from,
         created_after, created_before, updated_after, updated_before,
         status, source, due_date_before, due_date_after, priority,
         remind_at_before, remind_at_after, project_id, area_id
@@ -1007,11 +1007,15 @@ class NoteRepository(Repository[Note]):
             )
             params["linked_from"] = kwargs["linked_from"]
 
-        if "content" in kwargs:
+        if "text" in kwargs:
             where_parts.append(
-                "(n.content CONTAINS $content OR n.title CONTAINS $content)"
+                "(LOWER(n.content) CONTAINS $text_lower OR LOWER(n.title) CONTAINS $text_lower)"
             )
-            params["content"] = kwargs["content"]
+            params["text_lower"] = kwargs["text"].lower()
+
+        if "content" in kwargs:
+            where_parts.append("LOWER(n.content) CONTAINS $content_lower")
+            params["content_lower"] = kwargs["content"].lower()
 
         if "title" in kwargs:
             where_parts.append("LOWER(n.title) CONTAINS $title_lower")

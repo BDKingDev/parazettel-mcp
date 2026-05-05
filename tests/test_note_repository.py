@@ -192,6 +192,11 @@ def test_search_notes(note_repository):
     assert len(javascript_notes) == 1
     assert javascript_notes[0].id == saved_note2.id
 
+    # Search by broad text across title/content
+    text_notes = note_repository.search(text="javascript")
+    assert len(text_notes) == 1
+    assert text_notes[0].id == saved_note2.id
+
     # Search by note_type
     structure_notes = note_repository.search(note_type=NoteType.STRUCTURE)
     assert len(structure_notes) == 1

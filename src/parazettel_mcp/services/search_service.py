@@ -30,6 +30,20 @@ class SearchService:
         # Initialize the zettel service if it hasn't been initialized
         self.zettel_service.initialize()
 
+    def _get_text_candidates(
+        self, query: str, *, include_content: bool, include_title: bool
+    ) -> List[Note]:
+        """Use the repository to prefilter text-search candidates."""
+        if not include_content and not include_title:
+            return []
+
+        repository = self.zettel_service.repository
+        if include_content and include_title:
+            return repository.search(text=query)
+        if include_title:
+            return repository.search(title=query)
+        return repository.search(content=query)
+
     def search_by_text(
         self, query: str, include_content: bool = True, include_title: bool = True
     ) -> List[SearchResult]:
@@ -41,8 +55,10 @@ class SearchService:
         query = query.lower()
         query_terms = set(query.split())
 
-        # Get all notes
-        all_notes = self.zettel_service.get_all_notes()
+        # Use the graph index to narrow the candidate set before scoring in Python.
+        all_notes = self._get_text_candidates(
+            query, include_content=include_content, include_title=include_title
+        )
         results = []
 
         for note in all_notes:
@@ -197,6 +213,8 @@ class SearchService:
             search_kwargs["created_after"] = start_date
         if end_date:
             search_kwargs["created_before"] = end_date
+        if text:
+            search_kwargs["text"] = text
 
         all_notes = self.zettel_service.repository.search(**search_kwargs)
 
