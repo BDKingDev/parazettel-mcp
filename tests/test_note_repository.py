@@ -720,6 +720,43 @@ def test_multiple_repositories_share_same_graph_path():
         shutil.rmtree(test_root, ignore_errors=True)
 
 
+def test_create_uses_graph_db_without_creating_legacy_sqlite():
+    """Repository writes should index into Kuzu without creating the legacy SQLite DB."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    legacy_db_path = test_root / "db" / "legacy-parazettel.db"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    original_database_path = config.database_path
+    repository = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+        config.database_path = legacy_db_path
+
+        repository = NoteRepository(notes_dir=notes_dir)
+        saved = repository.create(Note(title="Graph Write Test", content="Uses Kuzu"))
+
+        assert graph_db_path.exists()
+        assert not legacy_db_path.exists()
+
+        conn = repository._get_conn()
+        result = conn.execute("MATCH (n:Note {id: $id}) RETURN count(n) AS cnt", {"id": saved.id})
+        assert result.get_next()[0] == 1
+    finally:
+        if repository is not None:
+            repository.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        config.database_path = original_database_path
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
 def test_create_leaves_no_tmp_file(note_repository):
     """Atomic write: no .md.tmp file should remain after create()."""
     note = Note(title="Atomic Create", content="Test atomic write.")
