@@ -22,7 +22,13 @@ class ZettelkastenConfig(BaseModel):
     notes_dir: Path = Field(
         default_factory=lambda: Path(os.getenv("PARAZETTEL_NOTES_DIR", "data/notes"))
     )
-    # Database configuration
+    # Graph database configuration (Kuzu directory path)
+    graph_db_path: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv("PARAZETTEL_GRAPH_DB_PATH", "data/db/graph.kuzu")
+        )
+    )
+    # Legacy SQLite path – kept for backward compatibility and migration tooling only
     database_path: Path = Field(
         default_factory=lambda: Path(
             os.getenv("PARAZETTEL_DATABASE_PATH", "data/db/parazettel.db")
@@ -32,7 +38,7 @@ class ZettelkastenConfig(BaseModel):
     server_name: str = Field(
         default=os.getenv("PARAZETTEL_SERVER_NAME", "parazettel")
     )
-    server_version: str = Field(default="0.4.0")
+    server_version: str = Field(default="0.5.0")
     # Date format for ID generation (using ISO format for timestamps)
     id_date_format: str = Field(default="%Y%m%dT%H%M%S")
     # Default note template
@@ -55,8 +61,18 @@ class ZettelkastenConfig(BaseModel):
             return path
         return self.base_dir / path
 
+    def get_graph_db_path(self) -> Path:
+        """Get the absolute path for the Kuzu graph database file.
+
+        The parent directory is created if it does not exist.  The path itself
+        must *not* be pre-created; Kuzu manages its own file structure.
+        """
+        graph_db_path = self.get_absolute_path(self.graph_db_path)
+        graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+        return graph_db_path
+
     def get_db_url(self) -> str:
-        """Get the database URL for SQLite."""
+        """Get the legacy SQLite database URL (used by migration tooling only)."""
         db_path = self.get_absolute_path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path}"

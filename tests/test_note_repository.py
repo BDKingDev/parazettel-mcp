@@ -3,10 +3,8 @@
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.db_models import DBLink
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
 from parazettel_mcp.storage.note_repository import _coerce_datetime, _normalize_wiki_target
 
@@ -594,45 +592,30 @@ def test_delete_preserves_remaining_link_created_at(note_repository):
     source.add_link(second_target.id, LinkType.REFERENCE)
     note_repository.update(source)
 
-    with note_repository.session_factory() as session:
-        original_link = session.scalar(
-            select(DBLink).where(
-                DBLink.source_id == source.id,
-                DBLink.target_id == second_target.id,
-                DBLink.link_type == LinkType.REFERENCE.value,
-            )
-        )
-        assert original_link is not None
-        original_created_at = original_link.created_at
+    original_link = note_repository.get_link(
+        source.id, second_target.id, LinkType.REFERENCE.value
+    )
+    assert original_link is not None
+    original_created_at = original_link["created_at"]
 
     note_repository.delete(first_target.id)
 
-    with note_repository.session_factory() as session:
-        refreshed_link = session.scalar(
-            select(DBLink).where(
-                DBLink.source_id == source.id,
-                DBLink.target_id == second_target.id,
-                DBLink.link_type == LinkType.REFERENCE.value,
-            )
-        )
-        assert refreshed_link is not None
-        assert refreshed_link.created_at == original_created_at
+    refreshed_link = note_repository.get_link(
+        source.id, second_target.id, LinkType.REFERENCE.value
+    )
+    assert refreshed_link is not None
+    assert refreshed_link["created_at"] == original_created_at
 
 
-def test_rebuild_index_creates_database_backup(note_repository):
-    """Rebuild should back up the SQLite database before clearing tables."""
-    saved = note_repository.create(Note(title="Backup Test", content="Backup content."))
-    db_path = config.get_absolute_path(config.database_path)
-    for backup_path in db_path.parent.glob(f"{db_path.name}.*.bak"):
-        backup_path.unlink()
+def test_rebuild_index_repopulates_graph(note_repository):
+    """rebuild_index() should clear and re-import all notes from markdown files."""
+    saved = note_repository.create(Note(title="Rebuild Test", content="Rebuild content."))
 
     note_repository.rebuild_index()
-    backup_paths = list(db_path.parent.glob(f"{db_path.name}.*.bak"))
 
-    assert len(backup_paths) == 1
-    assert backup_paths[0] == note_repository.last_rebuild_backup_path
-    assert backup_paths[0].stat().st_size > 0
-    assert note_repository.get(saved.id) is not None
+    result = note_repository.get(saved.id)
+    assert result is not None
+    assert result.title == "Rebuild Test"
 
 
 # ---------------------------------------------------------------------------
@@ -640,13 +623,12 @@ def test_rebuild_index_creates_database_backup(note_repository):
 # ---------------------------------------------------------------------------
 
 
-def test_wal_mode_enabled(note_repository):
-    """Database should be set to WAL journal mode after init."""
-    from sqlalchemy import text
-
-    with note_repository.session_factory() as session:
-        row = session.execute(text("PRAGMA journal_mode")).fetchone()
-    assert row[0] == "wal"
+def test_graph_db_initialized(note_repository):
+    """Graph database should be initialised after repository construction."""
+    conn = note_repository._get_conn()
+    result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
+    count = result.get_next()[0]
+    assert count == 0  # empty repository has no notes
 
 
 def test_create_leaves_no_tmp_file(note_repository):
@@ -775,19 +757,9 @@ def test_rebuild_index_if_needed_detects_extra_file(note_repository):
     """rebuild_index_if_needed() should trigger rebuild when a file exists but DB lacks it."""
     note = Note(title="Extra File Test", content="Exists on disk only.")
     saved = note_repository.create(note)
-    # Manually delete from DB but leave file
-    from sqlalchemy import text
-
-    with note_repository.session_factory() as session:
-        session.execute(
-            text("DELETE FROM links WHERE source_id = :id OR target_id = :id"),
-            {"id": saved.id},
-        )
-        session.execute(
-            text("DELETE FROM note_tags WHERE note_id = :id"), {"id": saved.id}
-        )
-        session.execute(text("DELETE FROM notes WHERE id = :id"), {"id": saved.id})
-        session.commit()
+    # Manually delete from graph DB but leave file
+    conn = note_repository._get_conn()
+    conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": saved.id})
     # Should detect mismatch and rebuild (DB re-indexed from file)
     note_repository.rebuild_index_if_needed()
     result = note_repository.get(saved.id)

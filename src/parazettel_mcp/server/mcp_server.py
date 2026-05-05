@@ -6,8 +6,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
-from sqlalchemy import exc as sqlalchemy_exc
-
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (
     LinkType,
@@ -498,7 +496,7 @@ class ZettelkastenMcpServer:
                     return f"Bidirectional link created between {source_id} and {target_id}"
                 else:
                     return f"Link created from {source_id} to {target_id}"
-            except (Exception, sqlalchemy_exc.IntegrityError) as e:
+            except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
                     return f"A link of this type already exists between these notes. Try a different link type."
                 return self.format_error_response(e)

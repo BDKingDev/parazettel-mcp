@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.db_models import init_db
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
 from parazettel_mcp.utils import setup_logging
 
@@ -22,10 +21,10 @@ def parse_args():
         default=os.environ.get("PARAZETTEL_NOTES_DIR"),
     )
     parser.add_argument(
-        "--database-path",
-        help="SQLite database file path",
+        "--graph-db-path",
+        help="Kuzu graph database directory path",
         type=str,
-        default=os.environ.get("PARAZETTEL_DATABASE_PATH"),
+        default=os.environ.get("PARAZETTEL_GRAPH_DB_PATH"),
     )
     parser.add_argument(
         "--log-level",
@@ -40,37 +39,23 @@ def update_config(args):
     """Update the global config with command line arguments."""
     if args.notes_dir:
         config.notes_dir = Path(args.notes_dir)
-    if args.database_path:
-        config.database_path = Path(args.database_path)
+    if args.graph_db_path:
+        config.graph_db_path = Path(args.graph_db_path)
 
 
 def main():
     """Run the Zettelkasten MCP server."""
-    # Parse arguments and update config
     args = parse_args()
     update_config(args)
 
-    # Set up logging
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
 
     # Ensure directories exist
     notes_dir = config.get_absolute_path(config.notes_dir)
     notes_dir.mkdir(parents=True, exist_ok=True)
-    db_dir = config.get_absolute_path(config.database_path).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
-
-    # Initialize database schema
-    engine = None
-    try:
-        logger.info(f"Using SQLite database: {config.get_db_url()}")
-        engine = init_db()
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-        sys.exit(1)
-    finally:
-        if engine is not None:
-            engine.dispose()
+    graph_db_path = config.get_graph_db_path()
+    logger.info(f"Using Kuzu graph database: {graph_db_path}")
 
     # Create and run the MCP server
     server = None
