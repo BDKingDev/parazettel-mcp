@@ -274,6 +274,76 @@ def test_update_note_assigns_project_routing(zettel_service):
     assert LinkType.HAS_PART in project_links
 
 
+def test_update_project_reparents_and_inherits_parent_area(zettel_service):
+    """Reparenting a subproject should update hierarchy and inherited area links."""
+    area_one = zettel_service.create_area_note(
+        title="Engineering", content="Software delivery and maintenance."
+    )
+    area_two = zettel_service.create_area_note(
+        title="Operations", content="Operational coordination."
+    )
+    parent_one = zettel_service.create_project_note(
+        title="Parent A", content="First parent project.", area_id=area_one.id
+    )
+    parent_two = zettel_service.create_project_note(
+        title="Parent B", content="Second parent project.", area_id=area_two.id
+    )
+    child = zettel_service.create_project_note(
+        title="Child Project", content="Nested implementation project.", project_id=parent_one.id
+    )
+
+    updated = zettel_service.update_note(note_id=child.id, project_id=parent_two.id)
+    stored_child = zettel_service.get_note(child.id)
+    parent_one_links = {
+        (link.target_id, link.link_type) for link in zettel_service.get_note(parent_one.id).links
+    }
+    parent_two_links = {
+        (link.target_id, link.link_type) for link in zettel_service.get_note(parent_two.id).links
+    }
+
+    assert updated.project_id == parent_two.id
+    assert updated.area_id == area_two.id
+    assert stored_child is not None
+    child_links = {(link.target_id, link.link_type) for link in stored_child.links}
+    assert (parent_one.id, LinkType.PART_OF) not in child_links
+    assert (parent_two.id, LinkType.PART_OF) in child_links
+    assert (area_one.id, LinkType.PART_OF) not in child_links
+    assert (area_two.id, LinkType.PART_OF) in child_links
+    assert (child.id, LinkType.HAS_PART) not in parent_one_links
+    assert (child.id, LinkType.HAS_PART) in parent_two_links
+    assert zettel_service.get_parent_project(child.id).id == parent_two.id
+    assert zettel_service.get_subprojects(parent_one.id) == []
+    assert [note.id for note in zettel_service.get_subprojects(parent_two.id)] == [child.id]
+
+
+def test_update_project_can_clear_parent_and_stay_top_level(zettel_service):
+    """Clearing a subproject parent should keep the project routed to its area."""
+    area = zettel_service.create_area_note(
+        title="Engineering", content="Software delivery and maintenance."
+    )
+    parent = zettel_service.create_project_note(
+        title="Parent Project", content="Primary initiative.", area_id=area.id
+    )
+    child = zettel_service.create_project_note(
+        title="Child Project", content="Nested implementation project.", project_id=parent.id
+    )
+
+    updated = zettel_service.update_note(note_id=child.id, project_id=None)
+    stored_child = zettel_service.get_note(child.id)
+    parent_links = {
+        (link.target_id, link.link_type) for link in zettel_service.get_note(parent.id).links
+    }
+
+    assert updated.project_id is None
+    assert updated.area_id == area.id
+    assert stored_child is not None
+    child_links = {(link.target_id, link.link_type) for link in stored_child.links}
+    assert (parent.id, LinkType.PART_OF) not in child_links
+    assert (area.id, LinkType.PART_OF) in child_links
+    assert (child.id, LinkType.HAS_PART) not in parent_links
+    assert zettel_service.get_parent_project(child.id) is None
+
+
 def test_delete_note(zettel_service):
     """Test deleting a note through the service."""
     # Create a test note

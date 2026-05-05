@@ -300,7 +300,124 @@ class TestMcpServer:
             outcome=None,
             deadline=None,
             area_id="area123",
+            project_id=None,
             tags=["product", "launch"],
+            source=NoteSource.TRANSCRIPT,
+        )
+
+    def test_create_project_tool_can_create_subproject(self):
+        """pzk_create_project should accept parent_project_id for advanced subproject creation."""
+        mock_project = MagicMock()
+        mock_project.id = "project123"
+        mock_parent = MagicMock()
+        mock_parent.note_type = NoteType.PROJECT
+        mock_parent.area_id = "area123"
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.create_project_note.return_value = mock_project
+        self.mock_zettel_service.get_note.side_effect = (
+            lambda note_id: {
+                "project999": mock_parent,
+                "area123": mock_area,
+            }.get(note_id)
+        )
+
+        create_project_func = self.registered_tools["pzk_create_project"]
+        result = create_project_func(
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            source="transcript",
+            parent_project_id="project999",
+            tags="child",
+        )
+
+        assert "successfully" in result
+        self.mock_zettel_service.create_project_note.assert_called_with(
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            outcome=None,
+            deadline=None,
+            area_id="area123",
+            project_id="project999",
+            tags=["child"],
+            source=NoteSource.TRANSCRIPT,
+        )
+
+    def test_create_subproject_tool_requires_parent_and_passes_source(self):
+        """pzk_create_subproject should inherit the parent project area."""
+        assert "pzk_create_subproject" in self.registered_tools
+        mock_project = MagicMock()
+        mock_project.id = "project123"
+        mock_parent = MagicMock()
+        mock_parent.note_type = NoteType.PROJECT
+        mock_parent.area_id = "area123"
+        self.mock_zettel_service.create_project_note.return_value = mock_project
+        self.mock_zettel_service.get_note.return_value = mock_parent
+
+        create_subproject_func = self.registered_tools["pzk_create_subproject"]
+        result = create_subproject_func(
+            parent_project_id="project999",
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            source="transcript",
+            tags="child, launch",
+        )
+
+        assert "successfully" in result
+        self.mock_zettel_service.create_project_note.assert_called_with(
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            outcome=None,
+            deadline=None,
+            area_id="area123",
+            project_id="project999",
+            tags=["child", "launch"],
+            source=NoteSource.TRANSCRIPT,
+        )
+
+    def test_create_subproject_tool_rejects_invalid_parent(self):
+        """pzk_create_subproject should validate the parent project note."""
+        create_subproject_func = self.registered_tools["pzk_create_subproject"]
+        self.mock_zettel_service.get_note.return_value = None
+
+        result = create_subproject_func(
+            parent_project_id="missing-project",
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            source="transcript",
+        )
+
+        assert "is not a valid project note" in result
+        self.mock_zettel_service.create_project_note.assert_not_called()
+
+    def test_create_subproject_tool_strips_parent_project_id(self):
+        """pzk_create_subproject should normalize parent_project_id before lookup."""
+        mock_project = MagicMock()
+        mock_project.id = "project123"
+        mock_parent = MagicMock()
+        mock_parent.note_type = NoteType.PROJECT
+        mock_parent.area_id = "area123"
+        self.mock_zettel_service.create_project_note.return_value = mock_project
+        self.mock_zettel_service.get_note.return_value = mock_parent
+
+        create_subproject_func = self.registered_tools["pzk_create_subproject"]
+        result = create_subproject_func(
+            parent_project_id="  project999  ",
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            source="transcript",
+        )
+
+        assert "successfully" in result
+        self.mock_zettel_service.get_note.assert_called_with("project999")
+        self.mock_zettel_service.create_project_note.assert_called_with(
+            title="Launch slice",
+            content="Ship one slice of the larger effort.",
+            outcome=None,
+            deadline=None,
+            area_id="area123",
+            project_id="project999",
+            tags=[],
             source=NoteSource.TRANSCRIPT,
         )
 
@@ -375,6 +492,47 @@ class TestMcpServer:
             area_id="area456",
         )
 
+    def test_update_note_tool_uses_parent_project_id_alias(self):
+        """pzk_update_note should map parent_project_id to project_id broadly."""
+        mock_note = MagicMock()
+        mock_note.id = "note123"
+        mock_note.note_type = NoteType.PERMANENT
+        self.mock_zettel_service.get_note.return_value = mock_note
+        self.mock_zettel_service.update_note.return_value = mock_note
+
+        update_note_func = self.registered_tools["pzk_update_note"]
+        result = update_note_func(
+            note_id="note123",
+            parent_project_id="project123",
+        )
+
+        assert "updated successfully" in result
+        self.mock_zettel_service.update_note.assert_called_with(
+            note_id="note123",
+            title=None,
+            content=None,
+            note_type=None,
+            tags=None,
+            project_id="project123",
+        )
+
+    def test_update_note_tool_rejects_conflicting_parent_and_project_ids(self):
+        """pzk_update_note should reject conflicting routing aliases."""
+        mock_note = MagicMock()
+        mock_note.id = "note123"
+        mock_note.note_type = NoteType.PERMANENT
+        self.mock_zettel_service.get_note.return_value = mock_note
+
+        update_note_func = self.registered_tools["pzk_update_note"]
+        result = update_note_func(
+            note_id="note123",
+            project_id="project123",
+            parent_project_id="project456",
+        )
+
+        assert "must match" in result
+        self.mock_zettel_service.update_note.assert_not_called()
+
     def test_update_note_tool_clears_project_id_with_empty_string(self):
         """pzk_update_note clears project routing when given an empty string."""
         mock_note = MagicMock()
@@ -384,6 +542,27 @@ class TestMcpServer:
 
         update_note_func = self.registered_tools["pzk_update_note"]
         result = update_note_func(note_id="note123", project_id="")
+
+        assert "updated successfully" in result
+        self.mock_zettel_service.update_note.assert_called_with(
+            note_id="note123",
+            title=None,
+            content=None,
+            note_type=None,
+            tags=None,
+            project_id=None,
+        )
+
+    def test_update_note_tool_clears_parent_project_id_with_empty_string(self):
+        """pzk_update_note clears a project parent when given an empty parent_project_id."""
+        mock_note = MagicMock()
+        mock_note.id = "note123"
+        mock_note.note_type = NoteType.PROJECT
+        self.mock_zettel_service.get_note.return_value = mock_note
+        self.mock_zettel_service.update_note.return_value = mock_note
+
+        update_note_func = self.registered_tools["pzk_update_note"]
+        result = update_note_func(note_id="note123", parent_project_id="")
 
         assert "updated successfully" in result
         self.mock_zettel_service.update_note.assert_called_with(
@@ -874,6 +1053,39 @@ class TestMcpServer:
             "task001", project_id="project999", priority=3
         )
 
+    def test_update_task_accepts_parent_project_id_alias(self):
+        """pzk_update_task should accept parent_project_id as a clearer alias."""
+        mock_task = MagicMock()
+        mock_task.note_type = NoteType.TASK
+        mock_task.recurrence_rule = None
+        self.mock_zettel_service.get_note.return_value = mock_task
+        self.mock_zettel_service.update_task.return_value = mock_task
+
+        fn = self.registered_tools["pzk_update_task"]
+        result = fn(task_id="task001", parent_project_id="project999", priority=3)
+
+        assert "updated successfully" in result
+        self.mock_zettel_service.update_task.assert_called_once_with(
+            "task001", project_id="project999", priority=3
+        )
+
+    def test_update_task_rejects_conflicting_parent_and_project_ids(self):
+        """pzk_update_task should reject conflicting routing aliases."""
+        mock_task = MagicMock()
+        mock_task.note_type = NoteType.TASK
+        mock_task.recurrence_rule = None
+        self.mock_zettel_service.get_note.return_value = mock_task
+
+        fn = self.registered_tools["pzk_update_task"]
+        result = fn(
+            task_id="task001",
+            project_id="project123",
+            parent_project_id="project999",
+        )
+
+        assert "must match" in result
+        self.mock_zettel_service.update_task.assert_not_called()
+
     def test_get_tasks_tool_formats_results_and_parses_filters(self):
         """pzk_get_tasks should parse filters and render matching tasks."""
         ready_task = MagicMock()
@@ -998,8 +1210,8 @@ class TestMcpServer:
 
         assert result == "No reminders due today."
 
-    def test_get_project_tool_lists_notes_and_linked_projects(self):
-        """pzk_get_project should include task previews, notes, and linked projects."""
+    def test_get_project_tool_lists_parent_subprojects_and_notes(self):
+        """pzk_get_project should separate hierarchy context from routed notes."""
         mock_project = MagicMock()
         mock_project.id = "project123"
         mock_project.note_type = NoteType.PROJECT
@@ -1029,10 +1241,14 @@ class TestMcpServer:
         linked_note.id = "note123"
         linked_note.title = "Working Notes"
         linked_note.note_type = NoteType.PERMANENT
-        linked_project = MagicMock()
-        linked_project.id = "project999"
-        linked_project.title = "Parent Project"
-        linked_project.note_type = NoteType.PROJECT
+        parent_project = MagicMock()
+        parent_project.id = "project999"
+        parent_project.title = "Parent Project"
+        parent_project.note_type = NoteType.PROJECT
+        subproject = MagicMock()
+        subproject.id = "project777"
+        subproject.title = "Beta rollout"
+        subproject.note_type = NoteType.PROJECT
 
         self.mock_zettel_service.get_note.return_value = mock_project
         self.mock_zettel_service.get_project_tasks.return_value = [
@@ -1041,7 +1257,8 @@ class TestMcpServer:
             active_task,
         ]
         self.mock_zettel_service.get_project_notes.return_value = [linked_note]
-        self.mock_zettel_service.get_linked_projects.return_value = [linked_project]
+        self.mock_zettel_service.get_parent_project.return_value = parent_project
+        self.mock_zettel_service.get_subprojects.return_value = [subproject]
 
         fn = self.registered_tools["pzk_get_project"]
         result = fn(project_id="project123")
@@ -1051,10 +1268,13 @@ class TestMcpServer:
         assert "[active] Ship beta (ID: task111) - P4, due 2026-04-24" in result
         assert "[ready] Write release notes (ID: task222) - P2" in result
         assert "Archive spec" not in result
+        assert "Parent Project:" in result
+        assert "Parent Project (ID: project999)" in result
+        assert "Subprojects:" in result
+        assert "Beta rollout (ID: project777)" in result
         assert "Notes:" in result
         assert "Working Notes (ID: note123, type: permanent)" in result
-        assert "Linked Projects:" in result
-        assert "Parent Project (ID: project999, type: project)" in result
+        assert "Linked Projects:" not in result
 
     def test_get_project_notes_tool_formats_note_context_and_respects_limit(self):
         """pzk_get_project_notes should render full note context for project-scoped notes."""

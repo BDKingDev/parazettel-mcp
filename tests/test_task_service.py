@@ -454,6 +454,72 @@ def test_create_project_note_requires_area(zettel_service):
         zettel_service.create_project_note("Launch feature", "Ship by end of quarter.")
 
 
+def test_create_subproject_inherits_parent_area_and_exposes_hierarchy(
+    zettel_service, area
+):
+    """Subprojects should inherit the parent area and appear in hierarchy helpers."""
+    parent = zettel_service.create_project_note(
+        "Parent Project", "Own the broader initiative.", area_id=area.id
+    )
+
+    child = zettel_service.create_project_note(
+        "Child Project", "Own one implementation slice.", project_id=parent.id
+    )
+
+    stored_child = zettel_service.get_note(child.id)
+
+    assert child.note_type == NoteType.PROJECT
+    assert child.project_id == parent.id
+    assert child.area_id == area.id
+    assert stored_child is not None
+    child_links = {(link.target_id, link.link_type) for link in stored_child.links}
+    assert (area.id, LinkType.PART_OF) in child_links
+    assert (parent.id, LinkType.PART_OF) in child_links
+
+    parent_project = zettel_service.get_parent_project(child.id)
+    subprojects = zettel_service.get_subprojects(parent.id)
+
+    assert parent_project is not None
+    assert parent_project.id == parent.id
+    assert [note.id for note in subprojects] == [child.id]
+
+
+def test_create_subproject_rejects_conflicting_area(zettel_service, area):
+    """Subprojects cannot override the parent project's area_id."""
+    other_area = zettel_service.create_area_note(
+        title="Personal", content="Personal responsibilities."
+    )
+    parent = zettel_service.create_project_note(
+        "Parent Project", "Own the broader initiative.", area_id=area.id
+    )
+
+    with pytest.raises(ValueError, match="does not match project"):
+        zettel_service.create_project_note(
+            "Child Project",
+            "Own one implementation slice.",
+            area_id=other_area.id,
+            project_id=parent.id,
+        )
+
+
+def test_create_subproject_requires_valid_parent_project(zettel_service, area):
+    """Subprojects must point at an existing project note."""
+    with pytest.raises(ValueError, match="not found"):
+        zettel_service.create_project_note(
+            "Child Project", "Own one implementation slice.", project_id="missing-project"
+        )
+
+    area_note = zettel_service.create_area_note(
+        title="Personal", content="Personal responsibilities."
+    )
+    with pytest.raises(ValueError, match="is not a project"):
+        zettel_service.create_project_note(
+            "Child Project",
+            "Own one implementation slice.",
+            project_id=area_note.id,
+        )
+
+
 def test_get_project_tasks(zettel_service, area):
     """get_project_tasks() returns tasks linked to the project."""
     p = zettel_service.create_project_note("Project Y", ".", area_id=area.id)
@@ -487,6 +553,9 @@ def test_get_project_notes_returns_routed_non_task_notes(zettel_service, area):
         project_id=other_project.id,
         source=NoteSource.TRANSCRIPT,
     )
+    zettel_service.create_project_note(
+        "Child Project", ".", project_id=project.id, area_id=area.id
+    )
 
     notes = zettel_service.get_project_notes(project.id)
 
@@ -496,9 +565,10 @@ def test_get_project_notes_returns_routed_non_task_notes(zettel_service, area):
 def test_get_linked_projects_returns_part_of_neighbors(zettel_service, area):
     """Linked-project retrieval should surface project-to-project PART_OF/HAS_PART edges only."""
     parent = zettel_service.create_project_note("Parent Project", ".", area_id=area.id)
-    child = zettel_service.create_project_note("Child Project", ".", area_id=area.id)
+    child = zettel_service.create_project_note(
+        "Child Project", ".", project_id=parent.id
+    )
     sibling = zettel_service.create_project_note("Sibling Project", ".", area_id=area.id)
-    zettel_service.create_link(child.id, parent.id, LinkType.PART_OF, bidirectional=True)
     zettel_service.create_link(sibling.id, parent.id, LinkType.REFERENCE, bidirectional=True)
 
     child_links = zettel_service.get_linked_projects(child.id)

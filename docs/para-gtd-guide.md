@@ -69,6 +69,19 @@ pzk_create_project
   deadline: "2026-06-01"
 ```
 
+For subprojects, use `pzk_create_subproject` when you want the hierarchy to be explicit:
+
+```text
+pzk_create_subproject
+  parent_project_id: <project_id>
+  title: "Three-run weekly cadence"
+  content: "Create a focused subproject for the weekly training schedule."
+  source: "transcript"
+  outcome: "A repeatable weekly 5K training plan"
+```
+
+Advanced callers can also use `pzk_create_project` with `parent_project_id: <project_id>`. In both cases, the subproject inherits the parent project's `area_id` automatically.
+
 ### 3. Create tasks linked to the project
 
 ```text
@@ -97,7 +110,7 @@ pzk_create_note
 
 Non-area notes must include either `area_id` or `project_id`. If you provide `project_id`, the note inherits the project's `area_id` automatically.
 
-Use `pzk_get_project` when you want a quick project summary with task counts, next tasks, routed note titles, and linked projects. Use `pzk_get_project_notes` when you want the full bodies of all notes routed to the project as working context.
+Use `pzk_get_project` when you want a quick project summary with task counts, next tasks, parent-project context, direct subprojects, and routed note titles. Use `pzk_get_project_notes` when you want the full bodies of all non-task, non-project notes routed to the project as working context.
 
 ---
 

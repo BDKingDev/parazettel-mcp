@@ -24,8 +24,8 @@ The result is one unified vault where knowledge notes and action items share the
 - WAL-mode SQLite with in-memory LRU cache for performance
 - Knowledge notes must be routed to an `area_id` directly or inherit one from `project_id`
 - Tasks with status lifecycle, priorities, energy levels, GTD contexts, and due dates
-- Projects linked to areas via the PARA hierarchy
-- Project views include task summaries, routed notes, and linked projects
+- Projects linked to areas with optional subprojects via the PARA hierarchy
+- Project views include task summaries, routed notes, parent-project context, and direct subprojects
 - Today view and reminder surfacing
 - Recurring tasks that auto-spawn the next instance on completion
 - Obsidian-style wiki-link aliases like `[[id|Title]]` are normalized on read and rebuild
@@ -129,9 +129,10 @@ All tools are prefixed `pzk_`.
 | `pzk_create_area` | Create an area note with optional review cadence |
 | `pzk_get_area` | Get an area with linked projects and task counts |
 | `pzk_list_areas` | List all areas |
-| `pzk_create_project` | Create a project linked to an area with an explicit source |
+| `pzk_create_project` | Create a top-level project or a subproject with `parent_project_id` |
+| `pzk_create_subproject` | Create a subproject under an existing parent project |
 | `pzk_list_projects` | List active projects sorted by deadline |
-| `pzk_get_project` | Get a project summary with task counts, next tasks, routed notes, and linked projects |
+| `pzk_get_project` | Get a project summary with task counts, next tasks, routed notes, parent project, and subprojects |
 | `pzk_get_project_notes` | Get full routed note context for a project |
 | `pzk_get_project_tasks` | Get all tasks for a project |
 

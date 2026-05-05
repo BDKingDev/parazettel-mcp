@@ -131,6 +131,31 @@ class ZettelService:
             note, _ = self.create_link(note.id, parent_id, LinkType.PART_OF, bidirectional=True)
         return note
 
+    def _sync_project_area_links(
+        self, note_id: str, previous_area_id: Optional[str], area_id: Optional[str]
+    ) -> Note:
+        """Synchronize REFERENCE/PART_OF area links for project notes after routing changes."""
+        note = self.repository.get(note_id)
+        if not note:
+            raise ValueError(f"Note with ID {note_id} not found")
+
+        if previous_area_id and previous_area_id != area_id:
+            note.remove_link(previous_area_id, LinkType.REFERENCE)
+            note.remove_link(previous_area_id, LinkType.PART_OF)
+            note = self.repository.update(note)
+            previous_area = self.repository.get(previous_area_id)
+            if previous_area:
+                previous_area.remove_link(note.id, LinkType.HAS_PART)
+                self.repository.update(previous_area)
+
+        if area_id and previous_area_id != area_id:
+            note.add_link(area_id, LinkType.REFERENCE)
+            note.add_link(area_id, LinkType.PART_OF)
+            note = self.repository.update(note)
+            self._ensure_parent_has_part_link(area_id, note.id)
+
+        return note
+
     def create_note(
         self,
         title: str,
@@ -215,6 +240,7 @@ class ZettelService:
             raise ValueError(f"Note with ID {note_id} not found")
         title_changed = title is not None and title != note.title
         previous_project_id = note.project_id
+        previous_area_id = note.area_id
 
         # Update fields
         if title is not None:
@@ -239,6 +265,29 @@ class ZettelService:
                 raise ValueError("Area notes cannot belong to a project")
             note.project_id = None
             note.area_id = note.id
+        elif note.note_type == NoteType.PROJECT:
+            if note.project_id:
+                project = self._get_project_for_routing(note.project_id)
+                if not project.area_id:
+                    raise ValueError(
+                        f"Project {note.project_id} does not have an area_id to inherit"
+                    )
+                if (
+                    area_id is not _UNSET
+                    and note.area_id
+                    and note.area_id != project.area_id
+                ):
+                    raise ValueError(
+                        f"area_id {note.area_id} does not match project "
+                        f"{note.project_id} area_id {project.area_id}"
+                    )
+                note.area_id = project.area_id
+            elif not note.area_id:
+                raise ValueError(
+                    "Projects must be associated with an area (area_id required)"
+                )
+            else:
+                self._get_area_for_routing(note.area_id)
         else:
             if note.area_id:
                 self._get_area_for_routing(note.area_id)
@@ -248,7 +297,11 @@ class ZettelService:
                     raise ValueError(
                         f"Project {note.project_id} does not have an area_id to inherit"
                     )
-                if note.area_id and note.area_id != project.area_id:
+                if (
+                    area_id is not _UNSET
+                    and note.area_id
+                    and note.area_id != project.area_id
+                ):
                     raise ValueError(
                         f"area_id {note.area_id} does not match project "
                         f"{note.project_id} area_id {project.area_id}"
@@ -259,6 +312,10 @@ class ZettelService:
 
         # Save to repository
         note = self.repository.update(note)
+        if note.note_type == NoteType.PROJECT:
+            note = self._sync_project_area_links(
+                note.id, previous_area_id, note.area_id
+            )
         note = self._sync_part_of_link(
             note.id, previous_project_id, note.project_id
         )
@@ -742,10 +799,27 @@ class ZettelService:
         outcome: Optional[str] = None,
         deadline: Optional[datetime.date] = None,
         area_id: Optional[str] = None,
+        project_id: Optional[str] = None,
         tags: Optional[List[str]] = None,
         source: NoteSource = NoteSource.MANUAL,
     ) -> Note:
-        """Create a PROJECT-type note linked to an area."""
+        """Create a PROJECT-type note.
+
+        Top-level projects require an ``area_id``. Subprojects pass a parent project
+        through ``project_id`` and inherit that parent project's ``area_id``.
+        """
+        if project_id:
+            parent_project = self._get_project_for_routing(project_id)
+            if not parent_project.area_id:
+                raise ValueError(
+                    f"Project {project_id} does not have an area_id to inherit"
+                )
+            if area_id and area_id != parent_project.area_id:
+                raise ValueError(
+                    f"area_id {area_id} does not match project "
+                    f"{project_id} area_id {parent_project.area_id}"
+                )
+            area_id = parent_project.area_id
         if not area_id:
             raise ValueError(
                 "Projects must be associated with an area (area_id required)"
@@ -761,13 +835,38 @@ class ZettelService:
             tags=[Tag(name=t) for t in (tags or [])],
             metadata=metadata,
             due_date=deadline,
+            project_id=project_id,
             area_id=area_id,
             source=source,
         )
         project = self._seed_routing_links(project, parent_id=area_id)
+        if project_id:
+            project.add_link(project_id, LinkType.PART_OF)
         project = self.repository.create(project)
         self._ensure_parent_has_part_link(area_id, project.id)
+        self._ensure_parent_has_part_link(project_id, project.id)
         return project
+
+    def get_parent_project(self, project_id: str) -> Optional[Note]:
+        """Return the direct parent project for a project, if any."""
+        project = self._get_project_for_routing(project_id)
+        if not project.project_id:
+            return None
+        parent = self.repository.get(project.project_id)
+        if parent and parent.note_type == NoteType.PROJECT:
+            return parent
+        return None
+
+    def get_subprojects(self, project_id: str) -> List[Note]:
+        """Return direct child projects routed to the given project."""
+        self._get_project_for_routing(project_id)
+        notes = self.repository.search(project_id=project_id)
+        subprojects = [
+            note
+            for note in notes
+            if note.id != project_id and note.note_type == NoteType.PROJECT
+        ]
+        return sorted(subprojects, key=lambda note: note.title.lower())
 
     def get_project_tasks(
         self, project_id: str, status: Optional[NoteStatus] = None

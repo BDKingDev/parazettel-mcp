@@ -88,7 +88,7 @@ Areas (1):
 
 ### `pzk_create_project`
 
-Creates a project linked to an area.
+Creates a top-level project linked to an area, or a subproject linked to a parent project.
 
 **Call:**
 
@@ -103,10 +103,46 @@ Creates a project linked to an area.
 }
 ```
 
+To create a subproject through the same tool, pass `parent_project_id` instead of a top-level `area_id`. The project will inherit the parent project's `area_id` automatically.
+
+```json
+{
+  "title": "Project note retrieval",
+  "content": "Add project-scoped context retrieval.",
+  "source": "transcript",
+  "parent_project_id": "{PARENT_PROJECT_ID}",
+  "outcome": "Dedicated project context tool"
+}
+```
+
 **Expected output:**
 
 ```
 Project created successfully with ID: {PROJECT_ID}
+```
+
+---
+
+### `pzk_create_subproject`
+
+Creates a subproject under an existing parent project. This is the clearer user-facing path when you already know the parent project.
+
+**Call:**
+
+```json
+{
+  "parent_project_id": "{PARENT_PROJECT_ID}",
+  "title": "Project note retrieval",
+  "content": "Add project-scoped context retrieval.",
+  "source": "transcript",
+  "outcome": "Dedicated project context tool"
+}
+```
+
+**Expected output:**
+
+```
+Subproject created successfully with ID: {SUBPROJECT_ID}
 ```
 
 ---
@@ -139,7 +175,7 @@ Projects (1):
 
 ### `pzk_get_project`
 
-Returns a project with task status summary, next-task preview, routed notes, and linked projects.
+Returns a project with task status summary, next-task preview, parent-project context, direct subprojects, and routed notes.
 
 **Call:**
 
@@ -160,10 +196,13 @@ Tasks: 0 total
 Next Tasks:
 - None
 
-Notes:
+Parent Project:
+- Parent initiative (ID: {PARENT_PROJECT_ID})
+
+Subprojects:
 - None
 
-Linked Projects:
+Notes:
 - None
 
 # Parazettel MCP
@@ -375,7 +414,7 @@ Tasks for project {PROJECT_ID} (1):
 
 ### `pzk_get_project_notes`
 
-Returns the full note context for non-task notes routed to a specific project. Use this after `pzk_get_project` when you need the actual note bodies, not just note titles.
+Returns the full note context for non-task notes routed to a specific project. Use this after `pzk_get_project` when you need the actual note bodies, not just note titles. Subprojects are excluded from this output.
 
 **Call:**
 
@@ -505,7 +544,7 @@ Passing `tags` replaces the task's existing tags with the provided list.
 ```json
 {
   "task_id": "{TASK_ID}",
-  "project_id": "{NEW_PROJECT_ID}"
+  "parent_project_id": "{NEW_PROJECT_ID}"
 }
 ```
 
@@ -602,6 +641,15 @@ Updates an existing note's content, metadata, and project/area routing. A title-
   "title": "Atomic notes are the foundation of a durable Zettelkasten",
   "tags": "zettelkasten,methodology,atomicity,core-principle",
   "project_id": "{PROJECT_ID}"
+}
+```
+
+Use `parent_project_id` when you want to express project routing in parent-project terms:
+
+```json
+{
+  "note_id": "{NOTE_ID}",
+  "parent_project_id": "{PARENT_PROJECT_ID}"
 }
 ```
 
@@ -992,18 +1040,20 @@ Change in note count: 0
 | `pzk_create_area` | title, content | cadence, tags |
 | `pzk_get_area` | area\_id | — |
 | `pzk_list_areas` | — | limit |
-| `pzk_create_project` | title, content, source, area\_id | outcome, deadline, tags |
+| `pzk_create_project` | title, content, source, area\_id or parent\_project\_id | outcome, deadline, tags |
+| `pzk_create_subproject` | parent\_project\_id, title, content, source | outcome, deadline, tags |
 | `pzk_list_projects` | — | include\_done, limit |
 | `pzk_get_project` | project\_id | — |
+| `pzk_get_project_notes` | project\_id | limit |
 | `pzk_get_project_tasks` | project\_id | status, limit |
 | `pzk_create_task` | title, content, project\_id | status, due\_date, priority, energy\_level, context, remind\_at, recurrence\_rule |
-| `pzk_update_task` | task\_id | project\_id, due\_date, priority, status, remind\_at, estimated\_minutes, recurrence\_rule, tags |
+| `pzk_update_task` | task\_id | project\_id, parent\_project\_id, due\_date, priority, status, remind\_at, estimated\_minutes, recurrence\_rule, tags |
 | `pzk_get_tasks` | — | status, project\_id, due\_date, overdue\_only, priority, limit |
 | `pzk_get_todays_tasks` | — | include\_overdue |
 | `pzk_get_reminders` | — | limit |
 | `pzk_create_note` | title, content | note\_type, source, area\_id, project\_id, tags |
 | `pzk_get_note` | identifier | — |
-| `pzk_update_note` | note\_id | title, content, note\_type, tags, status, project\_id, area\_id |
+| `pzk_update_note` | note\_id | title, content, note\_type, tags, status, project\_id, parent\_project\_id, area\_id |
 | `pzk_delete_note` | note\_id | — |
 | `pzk_create_link` | source\_id, target\_id | link\_type, description, bidirectional |
 | `pzk_remove_link` | source\_id, target\_id | bidirectional |
