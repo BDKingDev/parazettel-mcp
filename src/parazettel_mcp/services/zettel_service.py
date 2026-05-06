@@ -474,9 +474,9 @@ class ZettelService:
         """Backward-compatible alias for project routing validation."""
         return self._get_project_for_routing(project_id)
 
-    def rebuild_index(self) -> None:
+    def rebuild_index(self) -> Optional[Path]:
         """Rebuild the graph index from files."""
-        self.repository.rebuild_index()
+        return self.repository.rebuild_index()
 
     def export_note(self, note_id: str, format: str = "markdown") -> str:
         """Export a note in the specified format."""

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parazettel-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "A Zettelkasten + GTD/PARA knowledge and action management MCP server"
 authors = [
     {name = "Peter J. Herrel", email = "peterherrel@protonmail.com"}

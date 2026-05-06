@@ -2,6 +2,7 @@
 
 import shutil
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -641,11 +642,13 @@ def test_rebuild_index_repopulates_graph(note_repository):
     """rebuild_index() should clear and re-import all notes from markdown files."""
     saved = note_repository.create(Note(title="Rebuild Test", content="Rebuild content."))
 
-    note_repository.rebuild_index()
+    backup_path = note_repository.rebuild_index()
 
     result = note_repository.get(saved.id)
     assert result is not None
     assert result.title == "Rebuild Test"
+    assert backup_path is not None
+    assert backup_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -656,9 +659,23 @@ def test_rebuild_index_repopulates_graph(note_repository):
 def test_graph_db_initialized(note_repository):
     """Graph database should be initialised after repository construction."""
     conn = note_repository._get_conn()
-    result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
-    count = result.get_next()[0]
+    try:
+        result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
+        count = result.get_next()[0]
+    finally:
+        conn.close()
     assert count == 0  # empty repository has no notes
+
+
+def test_connection_helper_closes_graph_connection(note_repository):
+    """_connection() should close the underlying Kuzu connection."""
+    fake_conn = MagicMock()
+
+    with patch.object(note_repository, "_get_conn", return_value=fake_conn):
+        with note_repository._connection() as conn:
+            assert conn is fake_conn
+
+    fake_conn.close.assert_called_once()
 
 
 def test_repository_close_allows_reopen_same_graph_path():

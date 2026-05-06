@@ -7,8 +7,12 @@ from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
-# Load the repo-root .env so config paths are stable regardless of launch cwd.
-load_dotenv(Path(__file__).parent.parent.parent / ".env")
+# Prefer the repo-root .env when present, otherwise fall back to normal cwd lookup.
+_REPO_ENV_PATH = Path(__file__).parent.parent.parent / ".env"
+if _REPO_ENV_PATH.exists():
+    load_dotenv(_REPO_ENV_PATH)
+else:
+    load_dotenv()
 
 
 class ZettelkastenConfig(BaseModel):

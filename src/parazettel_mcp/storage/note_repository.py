@@ -18,8 +18,9 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 import frontmatter
 import kuzu
@@ -208,14 +209,22 @@ class NoteRepository(Repository[Note]):
         self._closed = True
 
     def _get_conn(self) -> kuzu.Connection:
-        """Create a new Kuzu connection for a single operation.
+        """Create a low-level Kuzu connection.
 
         Kuzu connections are not thread-safe, so one connection is created per
-        repository operation.  This is the standard Kuzu pattern for concurrent
-        access: multiple ``Connection`` objects share the same underlying
-        ``Database`` which manages concurrency at the storage layer.
+        repository operation. Callers are responsible for closing the returned
+        connection. Internal repository methods should prefer ``_connection()``.
         """
         return kuzu.Connection(self.db)
+
+    @contextmanager
+    def _connection(self) -> Iterator[kuzu.Connection]:
+        """Yield a Kuzu connection and always close it afterwards."""
+        conn = self._get_conn()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _build_tmp_path(self, file_path: Path) -> Path:
         suffix = f".{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
@@ -253,14 +262,69 @@ class NoteRepository(Repository[Note]):
 
     def rebuild_index_if_needed(self) -> None:
         """Rebuild the graph index from files when the ID sets diverge."""
-        conn = self._get_conn()
-        id_result = conn.execute("MATCH (n:Note) RETURN n.id")
-        db_ids = set(_result_first_column(id_result))
+        with self._connection() as conn:
+            id_result = conn.execute("MATCH (n:Note) RETURN n.id")
+            db_ids = set(_result_first_column(id_result))
         file_stems = {p.stem for p in self.notes_dir.glob("*.md")}
         if db_ids != file_stems:
             self.rebuild_index()
 
-    def rebuild_index(self) -> None:
+    def _build_graph_backup_path(self) -> Path:
+        """Return a timestamped backup path for the graph DB file."""
+        timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup_path = self.graph_db_path.with_name(
+            f"{self.graph_db_path.name}.{timestamp}.bak"
+        )
+        counter = 1
+        while backup_path.exists() or backup_path.with_name(
+            f"{backup_path.name}.wal"
+        ).exists():
+            backup_path = self.graph_db_path.with_name(
+                f"{self.graph_db_path.name}.{timestamp}.{counter}.bak"
+            )
+            counter += 1
+        return backup_path
+
+    def _create_graph_backup(self) -> Optional[Path]:
+        """Create a logical snapshot backup of the current graph before rebuild."""
+        graph_db_path = self.graph_db_path
+        if not graph_db_path.exists():
+            return None
+
+        backup_path = self._build_graph_backup_path()
+        backup_db = init_graph_db(backup_path)
+        backup_conn = kuzu.Connection(backup_db)
+        try:
+            backup_conn.execute("MATCH (n:Note) DETACH DELETE n")
+            backup_conn.execute("MATCH (t:Tag) DETACH DELETE t")
+
+            with self._connection() as conn:
+                id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
+                ids = _result_first_column(id_result)
+                notes = self._fetch_notes_by_ids(conn, ids)
+
+            for note in notes:
+                self._index_note_nodes_only(note, backup_conn)
+            for note in notes:
+                self._index_note_relations(note, backup_conn)
+        finally:
+            backup_conn.close()
+            close_graph_db(backup_path)
+
+        logger.info("Created graph database backup before reindex: %s", backup_path)
+        return backup_path
+
+    def _parse_rebuild_note(self, file_path: Path) -> Optional[Note]:
+        """Parse one markdown file for rebuild, logging and skipping failures."""
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return self._parse_note_from_markdown(content)
+        except Exception as e:
+            logger.error("Error processing file %s: %s", file_path, e)
+            return None
+
+    def rebuild_index(self) -> Optional[Path]:
         """Rebuild the graph index from all markdown files.
 
         Uses a two-pass strategy:
@@ -270,31 +334,28 @@ class NoteRepository(Repository[Note]):
         This guarantees that LINKS_TO edges are created even when the source
         note appears before the target note in filesystem order.
         """
-        conn = self._get_conn()
-        conn.execute("MATCH (n:Note) DETACH DELETE n")
-        conn.execute("MATCH (t:Tag) DETACH DELETE t")
-
+        backup_path = self._create_graph_backup()
         note_files = list(self.notes_dir.glob("*.md"))
-        notes: List[Note] = []
-        for file_path in note_files:
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                note = self._parse_note_from_markdown(content)
-                notes.append(note)
-            except Exception as e:
-                logger.error("Error processing file %s: %s", file_path, e)
 
-        # Pass 1: create all Note nodes and Tags (no relationships yet)
-        batch_size = 100
-        for i in range(0, len(notes), batch_size):
-            for note in notes[i : i + batch_size]:
+        with self._connection() as conn:
+            conn.execute("MATCH (n:Note) DETACH DELETE n")
+            conn.execute("MATCH (t:Tag) DETACH DELETE t")
+
+            # Pass 1: create all Note nodes and Tags (no relationships yet)
+            for file_path in note_files:
+                note = self._parse_rebuild_note(file_path)
+                if note is None:
+                    continue
                 self._index_note_nodes_only(note, conn)
 
-        # Pass 2: create all relationships
-        for i in range(0, len(notes), batch_size):
-            for note in notes[i : i + batch_size]:
+            # Pass 2: create all relationships
+            for file_path in note_files:
+                note = self._parse_rebuild_note(file_path)
+                if note is None:
+                    continue
                 self._index_note_relations(note, conn)
+
+        return backup_path
 
     def _index_note_nodes_only(self, note: Note, conn: kuzu.Connection) -> None:
         """Create or update only the Note node and Tag nodes (no edges)."""
@@ -608,15 +669,15 @@ class NoteRepository(Repository[Note]):
         if not target_ids:
             return {}
 
-        conn = self._get_conn()
-        result = conn.execute(
-            "MATCH (n:Note) WHERE n.id IN $ids RETURN n.id AS id, n.title AS title",
-            {"ids": list(target_ids)},
-        )
-        title_map: Dict[str, str] = {}
-        while result.has_next():
-            row = result.get_next()
-            title_map[row[0]] = row[1]
+        with self._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note) WHERE n.id IN $ids RETURN n.id AS id, n.title AS title",
+                {"ids": list(target_ids)},
+            )
+            title_map: Dict[str, str] = {}
+            while result.has_next():
+                row = result.get_next()
+                title_map[row[0]] = row[1]
         if note.id in target_ids:
             title_map[note.id] = note.title
         return title_map
@@ -664,98 +725,100 @@ class NoteRepository(Repository[Note]):
         self, note: Note, rendered_content: Optional[str] = None
     ) -> None:
         """Upsert a note and its tags/links into the graph database."""
-        conn = self._get_conn()
         content_for_db = (
             rendered_content if rendered_content is not None else note.content
         )
         params = self._note_params(note, content_for_db)
 
-        exists_result = conn.execute(
-            "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
-        )
-        node_exists = exists_result.get_num_tuples() > 0
+        with self._connection() as conn:
+            exists_result = conn.execute(
+                "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
+            )
+            node_exists = exists_result.get_num_tuples() > 0
 
-        if node_exists:
-            update_params = {k: v for k, v in params.items() if k != "created_at"}
-            conn.execute(
-                """
-                MATCH (n:Note {id: $id})
-                SET n.title = $title,
-                    n.content = $content,
-                    n.note_type = $note_type,
-                    n.status = $status,
-                    n.source = $source,
-                    n.due_date = $due_date,
-                    n.priority = $priority,
-                    n.recurrence_rule = $recurrence_rule,
-                    n.estimated_minutes = $estimated_minutes,
-                    n.remind_at = $remind_at,
-                    n.project_id = $project_id,
-                    n.area_id = $area_id,
-                    n.metadata_json = $metadata_json,
-                    n.updated_at = $updated_at
-                """,
-                update_params,
-            )
-            conn.execute(
-                "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r", {"id": note.id}
-            )
-            conn.execute(
-                "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r", {"id": note.id}
-            )
-        else:
-            conn.execute(
-                """
-                CREATE (:Note {
-                    id: $id,
-                    title: $title,
-                    content: $content,
-                    note_type: $note_type,
-                    status: $status,
-                    source: $source,
-                    due_date: $due_date,
-                    priority: $priority,
-                    recurrence_rule: $recurrence_rule,
-                    estimated_minutes: $estimated_minutes,
-                    remind_at: $remind_at,
-                    project_id: $project_id,
-                    area_id: $area_id,
-                    metadata_json: $metadata_json,
-                    created_at: $created_at,
-                    updated_at: $updated_at
-                })
-                """,
-                params,
-            )
+            if node_exists:
+                update_params = {k: v for k, v in params.items() if k != "created_at"}
+                conn.execute(
+                    """
+                    MATCH (n:Note {id: $id})
+                    SET n.title = $title,
+                        n.content = $content,
+                        n.note_type = $note_type,
+                        n.status = $status,
+                        n.source = $source,
+                        n.due_date = $due_date,
+                        n.priority = $priority,
+                        n.recurrence_rule = $recurrence_rule,
+                        n.estimated_minutes = $estimated_minutes,
+                        n.remind_at = $remind_at,
+                        n.project_id = $project_id,
+                        n.area_id = $area_id,
+                        n.metadata_json = $metadata_json,
+                        n.updated_at = $updated_at
+                    """,
+                    update_params,
+                )
+                conn.execute(
+                    "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r",
+                    {"id": note.id},
+                )
+                conn.execute(
+                    "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r",
+                    {"id": note.id},
+                )
+            else:
+                conn.execute(
+                    """
+                    CREATE (:Note {
+                        id: $id,
+                        title: $title,
+                        content: $content,
+                        note_type: $note_type,
+                        status: $status,
+                        source: $source,
+                        due_date: $due_date,
+                        priority: $priority,
+                        recurrence_rule: $recurrence_rule,
+                        estimated_minutes: $estimated_minutes,
+                        remind_at: $remind_at,
+                        project_id: $project_id,
+                        area_id: $area_id,
+                        metadata_json: $metadata_json,
+                        created_at: $created_at,
+                        updated_at: $updated_at
+                    })
+                    """,
+                    params,
+                )
 
-        for tag in note.tags:
-            conn.execute("MERGE (:Tag {name: $name})", {"name": tag.name})
-            conn.execute(
-                """
-                MATCH (n:Note {id: $note_id}), (t:Tag {name: $tag_name})
-                CREATE (n)-[:HAS_TAG]->(t)
-                """,
-                {"note_id": note.id, "tag_name": tag.name},
-            )
+            for tag in note.tags:
+                conn.execute("MERGE (:Tag {name: $name})", {"name": tag.name})
+                conn.execute(
+                    """
+                    MATCH (n:Note {id: $note_id}), (t:Tag {name: $tag_name})
+                    CREATE (n)-[:HAS_TAG]->(t)
+                    """,
+                    {"note_id": note.id, "tag_name": tag.name},
+                )
 
-        for link in note.links:
-            conn.execute(
-                """
-                MATCH (s:Note {id: $source_id}), (t:Note {id: $target_id})
-                CREATE (s)-[:LINKS_TO {
-                    link_type: $link_type,
-                    description: $description,
-                    created_at: $created_at
-                }]->(t)
-                """,
-                {
-                    "source_id": link.source_id,
-                    "target_id": link.target_id,
-                    "link_type": link.link_type.value,
-                    "description": link.description,
-                    "created_at": link.created_at,
-                },
-            )
+            for link in note.links:
+                conn.execute(
+                    """
+                    MATCH (s:Note {id: $source_id}), (t:Note {id: $target_id})
+                    CREATE (s)-[:LINKS_TO {
+                        link_type: $link_type,
+                        description: $description,
+                        created_at: $created_at
+                    }]->(t)
+                    """,
+                    {
+                        "source_id": link.source_id,
+                        "target_id": link.target_id,
+                        "link_type": link.link_type.value,
+                        "description": link.description,
+                        "created_at": link.created_at,
+                    },
+                )
 
     def _fetch_notes_by_ids(
         self, conn: kuzu.Connection, ids: List[str]
@@ -923,20 +986,21 @@ class NoteRepository(Repository[Note]):
 
     def get_by_title(self, title: str) -> Optional[Note]:
         """Get a note by exact title (graph-indexed lookup)."""
-        conn = self._get_conn()
-        result = conn.execute(
-            "MATCH (n:Note {title: $title}) RETURN n.id AS id", {"title": title}
-        )
-        if result.get_num_tuples() == 0:
-            return None
-        return self.get(result.get_next()[0])
+        with self._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note {title: $title}) RETURN n.id AS id", {"title": title}
+            )
+            if result.get_num_tuples() == 0:
+                return None
+            note_id = result.get_next()[0]
+        return self.get(note_id)
 
     def get_all(self) -> List[Note]:
         """Return all notes, reconstructed from the graph index."""
-        conn = self._get_conn()
-        id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
-        ids = _result_first_column(id_result)
-        return self._fetch_notes_by_ids(conn, ids)
+        with self._connection() as conn:
+            id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
+            ids = _result_first_column(id_result)
+            return self._fetch_notes_by_ids(conn, ids)
 
     def update(self, note: Note) -> Note:
         """Update a note."""
@@ -1044,8 +1108,8 @@ class NoteRepository(Repository[Note]):
                 existing_links_source=source_note,
             )
 
-        conn = self._get_conn()
-        conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": id})
+        with self._connection() as conn:
+            conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": id})
 
     def search(self, **kwargs: Any) -> List[Note]:
         """Search for notes based on criteria.
@@ -1057,90 +1121,90 @@ class NoteRepository(Repository[Note]):
         status, source, due_date_before, due_date_after, priority,
         remind_at_before, remind_at_after, project_id, area_id
         """
-        conn = self._get_conn()
-        candidate_ids = self._candidate_ids_from_text_filters(conn, kwargs)
-        if candidate_ids == []:
-            return []
+        with self._connection() as conn:
+            candidate_ids = self._candidate_ids_from_text_filters(conn, kwargs)
+            if candidate_ids == []:
+                return []
 
-        match_clauses = ["MATCH (n:Note)"]
-        where_parts: List[str] = []
-        params: Dict[str, Any] = {}
+            match_clauses = ["MATCH (n:Note)"]
+            where_parts: List[str] = []
+            params: Dict[str, Any] = {}
 
-        if "tag" in kwargs:
-            match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag {name: $tag})")
-            params["tag"] = kwargs["tag"]
-        elif "tags" in kwargs:
-            tag_names = kwargs["tags"]
-            if isinstance(tag_names, list):
-                match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag)")
-                where_parts.append("zt.name IN $tags")
-                params["tags"] = tag_names
+            if "tag" in kwargs:
+                match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag {name: $tag})")
+                params["tag"] = kwargs["tag"]
+            elif "tags" in kwargs:
+                tag_names = kwargs["tags"]
+                if isinstance(tag_names, list):
+                    match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag)")
+                    where_parts.append("zt.name IN $tags")
+                    params["tags"] = tag_names
 
-        if "linked_to" in kwargs:
-            match_clauses.append(
-                "MATCH (n)-[:LINKS_TO]->(lt_target:Note {id: $linked_to})"
-            )
-            params["linked_to"] = kwargs["linked_to"]
+            if "linked_to" in kwargs:
+                match_clauses.append(
+                    "MATCH (n)-[:LINKS_TO]->(lt_target:Note {id: $linked_to})"
+                )
+                params["linked_to"] = kwargs["linked_to"]
 
-        if "linked_from" in kwargs:
-            match_clauses.append(
-                "MATCH (lf_source:Note {id: $linked_from})-[:LINKS_TO]->(n)"
-            )
-            params["linked_from"] = kwargs["linked_from"]
+            if "linked_from" in kwargs:
+                match_clauses.append(
+                    "MATCH (lf_source:Note {id: $linked_from})-[:LINKS_TO]->(n)"
+                )
+                params["linked_from"] = kwargs["linked_from"]
 
-        if candidate_ids is not None:
-            where_parts.append("n.id IN $candidate_ids")
-            params["candidate_ids"] = candidate_ids
+            if candidate_ids is not None:
+                where_parts.append("n.id IN $candidate_ids")
+                params["candidate_ids"] = candidate_ids
 
-        _scalar: Dict[str, str] = {
-            "note_type": "n.note_type = $note_type",
-            "status": "n.status = $status",
-            "source": "n.source = $source",
-            "priority": "n.priority = $priority",
-            "project_id": "n.project_id = $project_id",
-            "area_id": "n.area_id = $area_id",
-        }
-        for kwarg, clause in _scalar.items():
-            if kwarg in kwargs:
-                where_parts.append(clause)
-                v = kwargs[kwarg]
-                params[kwarg] = v.value if hasattr(v, "value") else v
+            _scalar: Dict[str, str] = {
+                "note_type": "n.note_type = $note_type",
+                "status": "n.status = $status",
+                "source": "n.source = $source",
+                "priority": "n.priority = $priority",
+                "project_id": "n.project_id = $project_id",
+                "area_id": "n.area_id = $area_id",
+            }
+            for kwarg, clause in _scalar.items():
+                if kwarg in kwargs:
+                    where_parts.append(clause)
+                    v = kwargs[kwarg]
+                    params[kwarg] = v.value if hasattr(v, "value") else v
 
-        _ts: Dict[str, str] = {
-            "created_after": "n.created_at >= $created_after",
-            "created_before": "n.created_at <= $created_before",
-            "updated_after": "n.updated_at >= $updated_after",
-            "updated_before": "n.updated_at <= $updated_before",
-        }
-        for kwarg, clause in _ts.items():
-            if kwarg in kwargs:
-                where_parts.append(clause)
-                params[kwarg] = kwargs[kwarg]
+            _ts: Dict[str, str] = {
+                "created_after": "n.created_at >= $created_after",
+                "created_before": "n.created_at <= $created_before",
+                "updated_after": "n.updated_at >= $updated_after",
+                "updated_before": "n.updated_at <= $updated_before",
+            }
+            for kwarg, clause in _ts.items():
+                if kwarg in kwargs:
+                    where_parts.append(clause)
+                    params[kwarg] = kwargs[kwarg]
 
-        _date: Dict[str, str] = {
-            "due_date_before": "n.due_date <= $due_date_before",
-            "due_date_after": "n.due_date >= $due_date_after",
-            "remind_at_before": "n.remind_at <= $remind_at_before",
-            "remind_at_after": "n.remind_at >= $remind_at_after",
-        }
-        for kwarg, clause in _date.items():
-            if kwarg in kwargs:
-                where_parts.append(clause)
-                v = kwargs[kwarg]
-                params[kwarg] = v.isoformat() if hasattr(v, "isoformat") else v
+            _date: Dict[str, str] = {
+                "due_date_before": "n.due_date <= $due_date_before",
+                "due_date_after": "n.due_date >= $due_date_after",
+                "remind_at_before": "n.remind_at <= $remind_at_before",
+                "remind_at_after": "n.remind_at >= $remind_at_after",
+            }
+            for kwarg, clause in _date.items():
+                if kwarg in kwargs:
+                    where_parts.append(clause)
+                    v = kwargs[kwarg]
+                    params[kwarg] = v.isoformat() if hasattr(v, "isoformat") else v
 
-        query_parts = ["\n".join(match_clauses)]
-        if where_parts:
-            query_parts.append("WHERE " + " AND ".join(where_parts))
-        query_parts.append("RETURN DISTINCT n.id AS id")
+            query_parts = ["\n".join(match_clauses)]
+            if where_parts:
+                query_parts.append("WHERE " + " AND ".join(where_parts))
+            query_parts.append("RETURN DISTINCT n.id AS id")
 
-        result = conn.execute("\n".join(query_parts), params)
-        ids = _result_first_column(result)
-        if candidate_ids is not None:
-            id_set = set(ids)
-            ids = [note_id for note_id in candidate_ids if note_id in id_set]
+            result = conn.execute("\n".join(query_parts), params)
+            ids = _result_first_column(result)
+            if candidate_ids is not None:
+                id_set = set(ids)
+                ids = [note_id for note_id in candidate_ids if note_id in id_set]
 
-        return self._fetch_notes_by_ids(conn, ids)
+            return self._fetch_notes_by_ids(conn, ids)
 
     def find_by_tag(self, tag: Union[str, Tag]) -> List[Note]:
         """Find notes by tag."""
@@ -1151,105 +1215,113 @@ class NoteRepository(Repository[Note]):
         self, note_id: str, direction: str = "outgoing"
     ) -> List[Note]:
         """Find notes linked to/from the given note."""
-        conn = self._get_conn()
+        with self._connection() as conn:
+            if direction == "outgoing":
+                result = conn.execute(
+                    "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
+                    "RETURN DISTINCT t.id AS id",
+                    {"id": note_id},
+                )
+                ids = _result_first_column(result)
+            elif direction == "incoming":
+                result = conn.execute(
+                    "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
+                    "RETURN DISTINCT s.id AS id",
+                    {"id": note_id},
+                )
+                ids = _result_first_column(result)
+            elif direction == "both":
+                out_result = conn.execute(
+                    "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
+                    "RETURN DISTINCT t.id AS id",
+                    {"id": note_id},
+                )
+                in_result = conn.execute(
+                    "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
+                    "RETURN DISTINCT s.id AS id",
+                    {"id": note_id},
+                )
+                ids_set: Set[str] = set(_result_first_column(out_result))
+                ids_set.update(_result_first_column(in_result))
+                ids_set.discard(note_id)
+                ids = list(ids_set)
+            else:
+                raise ValueError(
+                    f"Invalid direction: {direction}. "
+                    "Use 'outgoing', 'incoming', or 'both'"
+                )
 
-        if direction == "outgoing":
-            result = conn.execute(
-                "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
-                "RETURN DISTINCT t.id AS id",
-                {"id": note_id},
-            )
-            ids = _result_first_column(result)
-        elif direction == "incoming":
-            result = conn.execute(
-                "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
-                "RETURN DISTINCT s.id AS id",
-                {"id": note_id},
-            )
-            ids = _result_first_column(result)
-        elif direction == "both":
-            out_result = conn.execute(
-                "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
-                "RETURN DISTINCT t.id AS id",
-                {"id": note_id},
-            )
-            in_result = conn.execute(
-                "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
-                "RETURN DISTINCT s.id AS id",
-                {"id": note_id},
-            )
-            ids_set: Set[str] = set(_result_first_column(out_result))
-            ids_set.update(_result_first_column(in_result))
-            ids_set.discard(note_id)
-            ids = list(ids_set)
-        else:
-            raise ValueError(
-                f"Invalid direction: {direction}. "
-                "Use 'outgoing', 'incoming', or 'both'"
-            )
-
-        return self._fetch_notes_by_ids(conn, ids)
+            return self._fetch_notes_by_ids(conn, ids)
 
     def get_all_tags(self) -> List[Tag]:
         """Return all tags stored in the graph."""
-        conn = self._get_conn()
-        result = conn.execute("MATCH (t:Tag) RETURN t.name AS name")
-        return [Tag(name=name) for name in _result_first_column(result)]
+        with self._connection() as conn:
+            result = conn.execute("MATCH (t:Tag) RETURN t.name AS name")
+            return [Tag(name=name) for name in _result_first_column(result)]
 
     def get_link(
         self, source_id: str, target_id: str, link_type: str
     ) -> Optional[Dict[str, Any]]:
         """Return the stored properties of a specific directed link, or None."""
-        conn = self._get_conn()
-        result = conn.execute(
-            """
-            MATCH (s:Note {id: $source_id})
-                  -[r:LINKS_TO {link_type: $link_type}]->
-                  (t:Note {id: $target_id})
-            RETURN r.created_at AS created_at
-            """,
-            {
-                "source_id": source_id,
-                "target_id": target_id,
-                "link_type": link_type,
-            },
-        )
-        if result.get_num_tuples() == 0:
-            return None
-        return {"created_at": result.get_next()[0]}
+        with self._connection() as conn:
+            result = conn.execute(
+                """
+                MATCH (s:Note {id: $source_id})
+                      -[r:LINKS_TO {link_type: $link_type}]->
+                      (t:Note {id: $target_id})
+                RETURN r.created_at AS created_at
+                """,
+                {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "link_type": link_type,
+                },
+            )
+            if result.get_num_tuples() == 0:
+                return None
+            return {"created_at": result.get_next()[0]}
 
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""
-        conn = self._get_conn()
-        all_ids = set(_result_first_column(conn.execute("MATCH (n:Note) RETURN n.id AS id")))
-        linked = set(_result_first_column(
-            conn.execute("MATCH (n:Note)-[:LINKS_TO]->(:Note) RETURN DISTINCT n.id AS id")
-        ))
-        linked.update(_result_first_column(
-            conn.execute("MATCH (:Note)-[:LINKS_TO]->(n:Note) RETURN DISTINCT n.id AS id")
-        ))
-        return list(all_ids - linked)
+        with self._connection() as conn:
+            all_ids = set(
+                _result_first_column(conn.execute("MATCH (n:Note) RETURN n.id AS id"))
+            )
+            linked = set(
+                _result_first_column(
+                    conn.execute(
+                        "MATCH (n:Note)-[:LINKS_TO]->(:Note) RETURN DISTINCT n.id AS id"
+                    )
+                )
+            )
+            linked.update(
+                _result_first_column(
+                    conn.execute(
+                        "MATCH (:Note)-[:LINKS_TO]->(n:Note) RETURN DISTINCT n.id AS id"
+                    )
+                )
+            )
+            return list(all_ids - linked)
 
     def get_connection_counts(self, limit: int = 10) -> List[Tuple[str, int]]:
         """Return (note_id, connection_count) for the most-connected notes."""
-        conn = self._get_conn()
+        with self._connection() as conn:
+            out_result = conn.execute(
+                "MATCH (n:Note)-[:LINKS_TO]->(:Note) "
+                "RETURN n.id AS id, count(*) AS cnt"
+            )
+            in_result = conn.execute(
+                "MATCH (:Note)-[:LINKS_TO]->(n:Note) "
+                "RETURN n.id AS id, count(*) AS cnt"
+            )
 
-        out_result = conn.execute(
-            "MATCH (n:Note)-[:LINKS_TO]->(:Note) "
-            "RETURN n.id AS id, count(*) AS cnt"
-        )
-        in_result = conn.execute(
-            "MATCH (:Note)-[:LINKS_TO]->(n:Note) "
-            "RETURN n.id AS id, count(*) AS cnt"
-        )
+            degree: Dict[str, int] = {}
+            while out_result.has_next():
+                row = out_result.get_next()
+                degree[row[0]] = degree.get(row[0], 0) + row[1]
+            while in_result.has_next():
+                row = in_result.get_next()
+                degree[row[0]] = degree.get(row[0], 0) + row[1]
 
-        degree: Dict[str, int] = {}
-        while out_result.has_next():
-            row = out_result.get_next()
-            degree[row[0]] = degree.get(row[0], 0) + row[1]
-        while in_result.has_next():
-            row = in_result.get_next()
-            degree[row[0]] = degree.get(row[0], 0) + row[1]
-
-        ranked = sorted(degree.items(), key=lambda x: x[1], reverse=True)
-        return ranked[:limit]
+            ranked = sorted(degree.items(), key=lambda x: x[1], reverse=True)
+            return ranked[:limit]
