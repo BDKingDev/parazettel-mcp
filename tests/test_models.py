@@ -121,6 +121,7 @@ class TestNoteModel:
         assert "markdown" in markdown
         assert "Reference link" in markdown
         assert "target123" in markdown
+        assert "- [reference] [[target123]] Reference link" in markdown
 
 
 class TestLinkModel:

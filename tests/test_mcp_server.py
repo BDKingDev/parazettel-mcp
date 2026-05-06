@@ -951,6 +951,19 @@ class TestMcpServer:
             source=NoteSource.MANUAL,
         )
 
+    def test_create_task_rejects_invalid_priority(self):
+        """pzk_create_task should reject priorities outside the supported 1-4 range."""
+        create_task_func = self.registered_tools["pzk_create_task"]
+        result = create_task_func(
+            title="Weekly review",
+            content="Review projects and notes.",
+            project_id="project123",
+            priority=5,
+        )
+
+        assert result == "Invalid priority: use 1 (low) to 4 (critical)."
+        self.mock_zettel_service.create_task.assert_not_called()
+
     def test_update_task_tool_registered(self):
         """pzk_update_task tool should be registered."""
         assert "pzk_update_task" in self.registered_tools
@@ -1006,6 +1019,18 @@ class TestMcpServer:
         result = fn(task_id="task001", status="flying")
 
         assert "Invalid status" in result
+        self.mock_zettel_service.update_task.assert_not_called()
+
+    def test_update_task_rejects_invalid_priority(self):
+        """pzk_update_task should reject priorities outside the supported 1-4 range."""
+        mock_task = MagicMock()
+        mock_task.note_type = NoteType.TASK
+        self.mock_zettel_service.get_note.return_value = mock_task
+
+        fn = self.registered_tools["pzk_update_task"]
+        result = fn(task_id="task001", priority=0)
+
+        assert result == "Invalid priority: use 1 (low) to 4 (critical)."
         self.mock_zettel_service.update_task.assert_not_called()
 
     def test_update_task_routes_status_through_service(self):
@@ -1377,6 +1402,43 @@ class TestMcpServer:
         assert "Builds on the concept" in result
         assert "Back-reference" in result
 
+    def test_get_linked_notes_fetches_source_note_once_for_multiple_results(self):
+        """pzk_get_linked_notes should not re-fetch the source note for each linked note."""
+        source_note = MagicMock()
+        first_outgoing = MagicMock()
+        first_outgoing.target_id = "target456"
+        first_outgoing.link_type = LinkType.EXTENDS
+        first_outgoing.description = None
+        second_outgoing = MagicMock()
+        second_outgoing.target_id = "target789"
+        second_outgoing.link_type = LinkType.SUPPORTS
+        second_outgoing.description = None
+        source_note.links = [first_outgoing, second_outgoing]
+
+        first_linked = MagicMock()
+        first_linked.id = "target456"
+        first_linked.title = "First Target"
+        first_linked.tags = []
+        first_linked.links = []
+
+        second_linked = MagicMock()
+        second_linked.id = "target789"
+        second_linked.title = "Second Target"
+        second_linked.tags = []
+        second_linked.links = []
+
+        self.mock_zettel_service.get_linked_notes.return_value = [
+            first_linked,
+            second_linked,
+        ]
+        self.mock_zettel_service.get_note.return_value = source_note
+
+        fn = self.registered_tools["pzk_get_linked_notes"]
+        result = fn(note_id="source123", direction="outgoing")
+
+        assert "Found 2 outgoing linked notes for source123" in result
+        self.mock_zettel_service.get_note.assert_called_once_with("source123")
+
     def test_get_all_tags_tool_sorts_results_alphabetically(self):
         """pzk_get_all_tags sorts tags case-insensitively before formatting."""
         zeta = MagicMock()
@@ -1627,9 +1689,9 @@ class TestMcpServer:
         # Test IOError handling
         io_error = IOError("File not found")
         result = self.server.format_error_response(io_error)
-        assert "Error: File not found" in result
+        assert "Unable to access the requested resource. Error ID:" in result
 
         # Test general exception handling
         general_error = Exception("Something went wrong")
         result = self.server.format_error_response(general_error)
-        assert "Error: Something went wrong" in result
+        assert "An unexpected error occurred. Error ID:" in result
