@@ -811,6 +811,82 @@ class NoteRepository(Repository[Note]):
             notes.append(_db_dict_to_note(nd, tags, links))
         return notes
 
+    def _query_fts_index(
+        self,
+        conn: kuzu.Connection,
+        index_name: str,
+        query: str,
+        *,
+        conjunctive: bool = False,
+    ) -> List[str]:
+        """Return note IDs from a full-text search query ordered by score."""
+        normalized_query = query.strip()
+        if not normalized_query:
+            return []
+
+        query_sql = (
+            "CALL QUERY_FTS_INDEX("
+            f"'Note', '{index_name}', $query"
+        )
+        if conjunctive:
+            query_sql += ", conjunctive := true"
+        query_sql += ") RETURN node.id AS id, score ORDER BY score DESC"
+
+        result = conn.execute(
+            query_sql,
+            {"query": normalized_query},
+        )
+        return _result_first_column(result)
+
+    def _intersect_ordered_id_lists(self, ordered_id_lists: List[List[str]]) -> List[str]:
+        """Intersect ordered ID lists while preserving the first list's order."""
+        if not ordered_id_lists:
+            return []
+
+        common_ids = set(ordered_id_lists[0])
+        for ids in ordered_id_lists[1:]:
+            common_ids &= set(ids)
+
+        seen: Set[str] = set()
+        ordered_common_ids: List[str] = []
+        for note_id in ordered_id_lists[0]:
+            if note_id in common_ids and note_id not in seen:
+                ordered_common_ids.append(note_id)
+                seen.add(note_id)
+        return ordered_common_ids
+
+    def _candidate_ids_from_text_filters(
+        self, conn: kuzu.Connection, kwargs: Dict[str, Any]
+    ) -> Optional[List[str]]:
+        """Return FTS candidate IDs for any text-oriented filters in *kwargs*."""
+        ordered_id_lists: List[List[str]] = []
+
+        text_query = kwargs.get("text")
+        if isinstance(text_query, str):
+            ordered_id_lists.append(
+                self._query_fts_index(conn, "note_text_fts", text_query)
+            )
+
+        title_query = kwargs.get("title")
+        if isinstance(title_query, str):
+            ordered_id_lists.append(
+                self._query_fts_index(
+                    conn, "note_title_fts", title_query, conjunctive=True
+                )
+            )
+
+        content_query = kwargs.get("content")
+        if isinstance(content_query, str):
+            ordered_id_lists.append(
+                self._query_fts_index(
+                    conn, "note_content_fts", content_query, conjunctive=True
+                )
+            )
+
+        if not ordered_id_lists:
+            return None
+        return self._intersect_ordered_id_lists(ordered_id_lists)
+
     def create(self, note: Note) -> Note:
         """Create a new note."""
         if not note.id:
@@ -981,6 +1057,11 @@ class NoteRepository(Repository[Note]):
         status, source, due_date_before, due_date_after, priority,
         remind_at_before, remind_at_after, project_id, area_id
         """
+        conn = self._get_conn()
+        candidate_ids = self._candidate_ids_from_text_filters(conn, kwargs)
+        if candidate_ids == []:
+            return []
+
         match_clauses = ["MATCH (n:Note)"]
         where_parts: List[str] = []
         params: Dict[str, Any] = {}
@@ -1007,19 +1088,9 @@ class NoteRepository(Repository[Note]):
             )
             params["linked_from"] = kwargs["linked_from"]
 
-        if "text" in kwargs:
-            where_parts.append(
-                "(LOWER(n.content) CONTAINS $text_lower OR LOWER(n.title) CONTAINS $text_lower)"
-            )
-            params["text_lower"] = kwargs["text"].lower()
-
-        if "content" in kwargs:
-            where_parts.append("LOWER(n.content) CONTAINS $content_lower")
-            params["content_lower"] = kwargs["content"].lower()
-
-        if "title" in kwargs:
-            where_parts.append("LOWER(n.title) CONTAINS $title_lower")
-            params["title_lower"] = kwargs["title"].lower()
+        if candidate_ids is not None:
+            where_parts.append("n.id IN $candidate_ids")
+            params["candidate_ids"] = candidate_ids
 
         _scalar: Dict[str, str] = {
             "note_type": "n.note_type = $note_type",
@@ -1063,9 +1134,11 @@ class NoteRepository(Repository[Note]):
             query_parts.append("WHERE " + " AND ".join(where_parts))
         query_parts.append("RETURN DISTINCT n.id AS id")
 
-        conn = self._get_conn()
         result = conn.execute("\n".join(query_parts), params)
         ids = _result_first_column(result)
+        if candidate_ids is not None:
+            id_set = set(ids)
+            ids = [note_id for note_id in candidate_ids if note_id in id_set]
 
         return self._fetch_notes_by_ids(conn, ids)
 

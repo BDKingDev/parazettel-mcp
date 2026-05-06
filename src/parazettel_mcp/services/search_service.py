@@ -98,6 +98,12 @@ class SearchService:
                         matched_terms.add(term)
 
             # Add to results if score is positive
+            if score == 0:
+                # Repository prefiltering may surface valid FTS matches even when
+                # the old substring heuristics do not. Keep those candidates.
+                score = 0.1
+                matched_context = f"FTS: {note.title}"
+
             if score > 0:
                 results.append(
                     SearchResult(
@@ -258,6 +264,12 @@ class SearchService:
                     if term in content_lower:
                         score += 0.2
                         matched_terms.add(term)
+
+                if score == 0:
+                    # Repository prefiltering may surface valid FTS matches even
+                    # when the old substring heuristics do not.
+                    score = 0.1
+                    matched_context = f"FTS: {note.title}"
 
                 # Add to results if score is positive
                 if score > 0:

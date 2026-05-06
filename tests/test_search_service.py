@@ -51,12 +51,10 @@ class TestSearchService:
         # Create search service
         search_service = SearchService(zettel_service)
 
-        # Test tag search instead which is more reliable
-        python_results = zettel_service.get_notes_by_tag("python")
-        assert len(python_results) == 2
-        python_ids = {note.id for note in python_results}
-        assert note1.id in python_ids
-        assert note2.id in python_ids
+        python_results = search_service.search_by_text("python")
+        python_ids = {result.note.id for result in python_results}
+        assert python_ids == {note1.id, note2.id}
+        assert note3.id not in python_ids
 
     def test_search_by_text_returns_empty_for_blank_query(self):
         """search_by_text() should short-circuit blank queries."""
@@ -115,6 +113,21 @@ class TestSearchService:
 
         assert [result.note.id for result in results] == ["python-note"]
         mock_repository.search.assert_called_once_with(text="python")
+
+    def test_search_by_text_keeps_fts_only_candidates(self, zettel_service):
+        """FTS-only matches should not be dropped by substring-only scoring heuristics."""
+        note = zettel_service.create_note(
+            title="Tooling Overview",
+            content="Policies libraries decisions and planning support analysis.",
+            tags=["tooling"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_by_text("library")
+
+        assert [result.note.id for result in results] == [note.id]
+        assert results[0].score == pytest.approx(0.1)
+        assert results[0].matched_context == "FTS: Tooling Overview"
 
     def test_search_by_tag(self, zettel_service):
         """Test searching for notes by tags."""
@@ -436,6 +449,22 @@ class TestSearchService:
             area_id="area456",
             text="python",
         )
+
+    def test_search_combined_keeps_fts_only_candidates(self, zettel_service):
+        """Combined search should preserve valid FTS matches after repository prefiltering."""
+        note = zettel_service.create_note(
+            title="Tooling Overview",
+            content="Policies libraries decisions and planning support analysis.",
+            note_type=NoteType.PERMANENT,
+            tags=["tooling"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_combined(text="library", tags=["tooling"])
+
+        assert [result.note.id for result in results] == [note.id]
+        assert results[0].score == pytest.approx(0.1)
+        assert results[0].matched_context == "FTS: Tooling Overview"
 
     def test_search_combined_filters_non_task_notes_by_project(self, zettel_service):
         """Combined search should honor project_id for non-task notes as well."""

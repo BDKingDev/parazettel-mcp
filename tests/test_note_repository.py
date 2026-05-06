@@ -208,6 +208,25 @@ def test_search_notes(note_repository):
     assert {note.id for note in programming_notes} == {saved_note1.id, saved_note2.id}
 
 
+def test_search_uses_fts_for_stemming_and_field_specific_queries(note_repository):
+    """FTS-backed search should improve recall without blurring title/content filters."""
+    note = Note(
+        title="Tooling Overview",
+        content="Policies libraries decisions and planning support analysis.",
+        note_type=NoteType.PERMANENT,
+        tags=[Tag(name="tooling")],
+    )
+    saved_note = note_repository.create(note)
+
+    text_results = note_repository.search(text="library")
+    assert [result.id for result in text_results] == [saved_note.id]
+
+    content_results = note_repository.search(content="library")
+    assert [result.id for result in content_results] == [saved_note.id]
+
+    assert note_repository.search(title="library") == []
+
+
 def test_note_linking(note_repository):
     """Test creating links between notes."""
     # Create test notes

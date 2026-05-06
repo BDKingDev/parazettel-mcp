@@ -23,6 +23,11 @@ import kuzu
 
 _DB_CACHE_LOCK = threading.Lock()
 _DB_CACHE: Dict[str, Tuple[kuzu.Database, int]] = {}
+_NOTE_FTS_INDEXES = {
+    "note_text_fts": ["title", "content"],
+    "note_title_fts": ["title"],
+    "note_content_fts": ["content"],
+}
 
 
 def _db_cache_key(db_path: Path) -> str:
@@ -80,6 +85,29 @@ def close_graph_db(db_path: Path) -> None:
     db.close()
 
 
+def _ensure_fts_indexes(conn: kuzu.Connection) -> None:
+    """Ensure the note full-text indexes exist."""
+    conn.execute("INSTALL FTS")
+    conn.execute("LOAD FTS")
+
+    index_result = conn.execute("CALL SHOW_INDEXES() RETURN *")
+    existing_indexes = set()
+    while index_result.has_next():
+        table_name, index_name, index_type, *_ = index_result.get_next()
+        if table_name == "Note" and index_type == "FTS":
+            existing_indexes.add(index_name)
+
+    for index_name, properties in _NOTE_FTS_INDEXES.items():
+        if index_name in existing_indexes:
+            continue
+        property_literals = ", ".join(f"'{property_name}'" for property_name in properties)
+        conn.execute(
+            "CALL CREATE_FTS_INDEX("
+            f"'Note', '{index_name}', [{property_literals}]"
+            ")"
+        )
+
+
 def _create_schema(conn: kuzu.Connection) -> None:
     """Ensure all node and relationship tables exist (idempotent)."""
     conn.execute(
@@ -128,3 +156,4 @@ def _create_schema(conn: kuzu.Connection) -> None:
         )
         """
     )
+    _ensure_fts_indexes(conn)
