@@ -27,6 +27,12 @@ def parse_args():
         default=os.environ.get("PARAZETTEL_GRAPH_DB_PATH"),
     )
     parser.add_argument(
+        "--database-path",
+        help="Deprecated alias for the graph DB path. Legacy *.db values map to a sibling graph.kuzu path.",
+        type=str,
+        default=os.environ.get("PARAZETTEL_DATABASE_PATH"),
+    )
+    parser.add_argument(
         "--log-level",
         help="Logging level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -41,6 +47,12 @@ def update_config(args):
         config.notes_dir = Path(args.notes_dir)
     if args.graph_db_path:
         config.graph_db_path = Path(args.graph_db_path)
+    elif getattr(args, "database_path", None):
+        legacy_path = Path(args.database_path)
+        if legacy_path.suffix == ".db":
+            config.graph_db_path = legacy_path.with_name("graph.kuzu")
+        else:
+            config.graph_db_path = legacy_path
 
 
 def main():

@@ -678,6 +678,14 @@ def test_connection_helper_closes_graph_connection(note_repository):
     fake_conn.close.assert_called_once()
 
 
+def test_closed_repository_rejects_new_connections(note_repository):
+    """Closed repositories should fail fast instead of creating new Kuzu handles."""
+    note_repository.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        note_repository._get_conn()
+
+
 def test_repository_close_allows_reopen_same_graph_path():
     """Closing a repository should release the graph path for a fresh reopen."""
     test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
@@ -781,9 +789,12 @@ def test_create_uses_graph_db_without_creating_legacy_sqlite():
         assert graph_db_path.exists()
         assert not legacy_db_path.exists()
 
-        conn = repository._get_conn()
-        result = conn.execute("MATCH (n:Note {id: $id}) RETURN count(n) AS cnt", {"id": saved.id})
-        assert result.get_next()[0] == 1
+        with repository._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note {id: $id}) RETURN count(n) AS cnt",
+                {"id": saved.id},
+            )
+            assert result.get_next()[0] == 1
     finally:
         if repository is not None:
             repository.close()
@@ -920,8 +931,8 @@ def test_rebuild_index_if_needed_detects_extra_file(note_repository):
     note = Note(title="Extra File Test", content="Exists on disk only.")
     saved = note_repository.create(note)
     # Manually delete from graph DB but leave file
-    conn = note_repository._get_conn()
-    conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": saved.id})
+    with note_repository._connection() as conn:
+        conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": saved.id})
     # Should detect mismatch and rebuild (DB re-indexed from file)
     note_repository.rebuild_index_if_needed()
     result = note_repository.get(saved.id)

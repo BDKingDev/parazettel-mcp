@@ -49,6 +49,7 @@ _NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
+_GRAPH_BATCH_SIZE = 100
 
 _NOTE_SELECT = (
     "n.id AS id, n.title AS title, n.content AS content, n.note_type AS note_type, "
@@ -195,7 +196,7 @@ class NoteRepository(Repository[Note]):
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
         self.graph_db_path = config.get_graph_db_path()
-        self.db = init_graph_db(self.graph_db_path)
+        self.db: Optional[kuzu.Database] = init_graph_db(self.graph_db_path)
         self.file_lock = threading.RLock()
         self._closed = False
 
@@ -206,6 +207,7 @@ class NoteRepository(Repository[Note]):
         if self._closed:
             return
         close_graph_db(self.graph_db_path)
+        self.db = None
         self._closed = True
 
     def _get_conn(self) -> kuzu.Connection:
@@ -215,6 +217,8 @@ class NoteRepository(Repository[Note]):
         repository operation. Callers are responsible for closing the returned
         connection. Internal repository methods should prefer ``_connection()``.
         """
+        if self._closed or self.db is None:
+            raise RuntimeError("NoteRepository is closed")
         return kuzu.Connection(self.db)
 
     @contextmanager
@@ -301,12 +305,14 @@ class NoteRepository(Repository[Note]):
             with self._connection() as conn:
                 id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
                 ids = _result_first_column(id_result)
-                notes = self._fetch_notes_by_ids(conn, ids)
-
-            for note in notes:
-                self._index_note_nodes_only(note, backup_conn)
-            for note in notes:
-                self._index_note_relations(note, backup_conn)
+                for i in range(0, len(ids), _GRAPH_BATCH_SIZE):
+                    batch = self._fetch_notes_by_ids(
+                        conn, ids[i : i + _GRAPH_BATCH_SIZE]
+                    )
+                    for note in batch:
+                        self._index_note_nodes_only(note, backup_conn)
+                    for note in batch:
+                        self._index_note_relations(note, backup_conn)
         finally:
             backup_conn.close()
             close_graph_db(backup_path)

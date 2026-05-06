@@ -38,6 +38,7 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     """parse_args should use Parazettel env vars as defaults."""
     monkeypatch.setenv("PARAZETTEL_NOTES_DIR", "env-notes")
     monkeypatch.setenv("PARAZETTEL_GRAPH_DB_PATH", "env-graph.kuzu")
+    monkeypatch.setenv("PARAZETTEL_DATABASE_PATH", "env-legacy.db")
     monkeypatch.setenv("PARAZETTEL_LOG_LEVEL", "DEBUG")
     monkeypatch.setattr(sys, "argv", ["parazettel"])
 
@@ -45,6 +46,7 @@ def test_parse_args_reads_env_defaults(monkeypatch):
 
     assert args.notes_dir == "env-notes"
     assert args.graph_db_path == "env-graph.kuzu"
+    assert args.database_path == "env-legacy.db"
     assert args.log_level == "DEBUG"
 
 
@@ -53,6 +55,7 @@ def test_update_config_updates_paths():
     args = argparse.Namespace(
         notes_dir="custom-notes",
         graph_db_path="custom-graph.kuzu",
+        database_path=None,
         log_level="INFO",
     )
 
@@ -60,6 +63,22 @@ def test_update_config_updates_paths():
 
     assert str(config.notes_dir) == "custom-notes"
     assert str(config.graph_db_path) == "custom-graph.kuzu"
+
+
+def test_update_config_accepts_legacy_database_path_alias():
+    """update_config should translate legacy --database-path values to graph.kuzu."""
+    args = argparse.Namespace(
+        notes_dir=None,
+        graph_db_path=None,
+        database_path="custom-db/parazettel.db",
+        log_level="INFO",
+    )
+
+    main_module.update_config(args)
+
+    assert str(config.graph_db_path).replace("\\", "/").endswith(
+        "custom-db/graph.kuzu"
+    )
 
 
 def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
