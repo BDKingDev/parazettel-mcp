@@ -667,6 +667,17 @@ def test_graph_db_initialized(note_repository):
     assert count == 0  # empty repository has no notes
 
 
+def test_fetch_notes_by_ids_preserves_requested_order(note_repository):
+    """Low-level graph reconstruction should preserve the caller's ID order."""
+    first = note_repository.create(Note(title="First Ordered", content="First body"))
+    second = note_repository.create(Note(title="Second Ordered", content="Second body"))
+
+    with note_repository._connection() as conn:
+        ordered = note_repository._fetch_notes_by_ids(conn, [second.id, first.id])
+
+    assert [note.id for note in ordered] == [second.id, first.id]
+
+
 def test_connection_helper_closes_graph_connection(note_repository):
     """_connection() should close the underlying Kuzu connection."""
     fake_conn = MagicMock()
@@ -938,6 +949,47 @@ def test_rebuild_index_if_needed_detects_extra_file(note_repository):
     result = note_repository.get(saved.id)
     assert result is not None
     assert result.title == "Extra File Test"
+
+
+def test_parse_note_from_markdown_deduplicates_duplicate_tags(note_repository):
+    """Duplicate tags in frontmatter should collapse to first-seen unique tags."""
+    parsed = note_repository._parse_note_from_markdown(
+        "---\n"
+        "id: dup-tags\n"
+        "title: Duplicate Tags\n"
+        "type: permanent\n"
+        "tags: alpha, beta, alpha\n"
+        "created: 2026-01-01T00:00:00\n"
+        "updated: 2026-01-01T00:00:00\n"
+        "---\n"
+        "# Duplicate Tags\n\n"
+        "Body\n"
+    )
+
+    assert [tag.name for tag in parsed.tags] == ["alpha", "beta"]
+
+
+def test_parse_note_from_markdown_deduplicates_duplicate_links(note_repository):
+    """Duplicate link lines should not produce duplicate outgoing link records."""
+    parsed = note_repository._parse_note_from_markdown(
+        "---\n"
+        "id: dup-links\n"
+        "title: Duplicate Links\n"
+        "type: permanent\n"
+        "tags: test\n"
+        "created: 2026-01-01T00:00:00\n"
+        "updated: 2026-01-01T00:00:00\n"
+        "---\n"
+        "# Duplicate Links\n\n"
+        "Body\n\n"
+        "## Links\n"
+        "- reference [[target-1]] First description\n"
+        "- reference [[target-1]] Second description\n"
+    )
+
+    assert len(parsed.links) == 1
+    assert parsed.links[0].target_id == "target-1"
+    assert parsed.links[0].link_type == LinkType.REFERENCE
 
 
 def test_metadata_round_trips_through_search(note_repository):

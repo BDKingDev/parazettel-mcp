@@ -80,6 +80,18 @@ def _cache_put(path_str: str, mtime_ns: int, note: Note) -> None:
             _NOTE_CACHE.popitem(last=False)
 
 
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    """Return values without duplicates while preserving first-seen order."""
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
 def _cache_evict(path_str: str) -> None:
     """Remove all cache entries for a given file path (any mtime)."""
     with _NOTE_CACHE_LOCK:
@@ -486,9 +498,11 @@ class NoteRepository(Repository[Note]):
             tag_names = [str(t).strip() for t in tags_str if str(t).strip()]
         else:
             tag_names = []
+        tag_names = _dedupe_preserve_order(tag_names)
         tags = [Tag(name=name) for name in tag_names]
 
         links: List[Link] = []
+        seen_link_keys: Set[Tuple[str, LinkType]] = set()
         links_section = False
         for line in post.content.split("\n"):
             line = line.strip()
@@ -516,6 +530,10 @@ class NoteRepository(Repository[Note]):
                             link_type = LinkType(link_type_str)
                         except ValueError:
                             link_type = LinkType.REFERENCE
+                        link_key = (target_id, link_type)
+                        if link_key in seen_link_keys:
+                            continue
+                        seen_link_keys.add(link_key)
                         links.append(
                             Link(
                                 source_id=note_id,
@@ -863,7 +881,7 @@ class NoteRepository(Repository[Note]):
             row = link_result.get_next()
             links_by_note[row[0]].append(row[1:])
 
-        notes = []
+        note_map: Dict[str, Note] = {}
         for nd in notes_data:
             note_id = nd["id"]
             tags = [Tag(name=name) for name in tags_by_note.get(note_id, [])]
@@ -877,8 +895,8 @@ class NoteRepository(Repository[Note]):
                 )
                 for row in links_by_note.get(note_id, [])
             ]
-            notes.append(_db_dict_to_note(nd, tags, links))
-        return notes
+            note_map[note_id] = _db_dict_to_note(nd, tags, links)
+        return [note_map[note_id] for note_id in ids if note_id in note_map]
 
     def _query_fts_index(
         self,

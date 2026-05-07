@@ -2,9 +2,10 @@
 """Migrate existing parazettel-mcp notes to the Kuzu graph database.
 
 This script scans a notes directory for markdown files that follow the
-parazettel frontmatter schema and imports them into a new Kuzu graph database.
-It is safe to run multiple times – existing nodes are updated in place and
-relationships are rebuilt without duplicates.
+parazettel frontmatter schema and imports them into a Kuzu graph database.
+Re-running against an existing target graph updates/imports current notes, but
+it does not prune stale nodes for deleted source files. Use a fresh target
+graph path when you need a clean one-shot migration result.
 
 Usage
 -----
@@ -101,6 +102,13 @@ def migrate(notes_dir: Path, graph_db_path: Path, dry_run: bool = False) -> None
     else:
         logger.info("Initialising graph database at %s …", graph_db_path)
         graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+        if graph_db_path.exists():
+            logger.warning(
+                "Target graph DB already exists at %s. Existing notes will be updated, "
+                "but stale nodes for deleted source files are not pruned. Use a fresh "
+                "graph DB path for a clean import.",
+                graph_db_path,
+            )
 
     repo = _build_repo_helpers(notes_dir)
 
