@@ -20,8 +20,8 @@ The result is one unified vault where knowledge notes and action items share the
 - Link notes with typed semantic relationships and inverse-link handling
 - Tag notes for categorical organisation
 - Search notes by content, tags, type, status, project, area, and more
-- Dual storage: Markdown files (source of truth) + SQLite index (fast queries)
-- WAL-mode SQLite with in-memory LRU cache for performance
+- Dual storage: Markdown files (source of truth) + Kuzu graph index (fast queries and traversals)
+- Graph-backed search, link traversal, and PARA/GTD routing queries
 - Knowledge notes must be routed to an `area_id` directly or inherit one from `project_id`
 - Tasks with status lifecycle, priorities, energy levels, GTD contexts, and due dates
 - Projects linked to areas with optional subprojects via the PARA hierarchy
@@ -110,7 +110,7 @@ All tools are prefixed `pzk_`.
 | `pzk_find_central_notes` | Find most-connected notes |
 | `pzk_find_orphaned_notes` | Find notes with no connections |
 | `pzk_list_notes_by_date` | List notes by creation or update date |
-| `pzk_rebuild_index` | Rebuild the SQLite index from Markdown files |
+| `pzk_rebuild_index` | Rebuild the Kuzu graph index from Markdown files |
 
 ### Task management
 
@@ -141,13 +141,13 @@ All tools are prefixed `pzk_`.
 ## Storage Architecture
 
 1. **Markdown files** — source of truth. Human-readable, version-controllable, directly editable. Each note is `{id}.md` with YAML frontmatter.
-2. **SQLite database** — indexing layer. WAL mode with in-memory LRU cache. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
+2. **Kuzu graph database** — indexing and traversal layer. Used for search, link traversal, and PARA/GTD routing queries. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
 
-> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped `.bak` of the SQLite database before clearing and rebuilding tables.
+> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped logical snapshot backup of the graph database before clearing and rebuilding it.
 >
 > **Obsidian aliases:** piped wiki links like `[[20260322T181907454570000|Habits and Habit Creation]]` are normalized to the underlying note ID during reads and index rebuilds.
 
-> **WAL sidecars:** Two small files (`.db-wal`, `.db-shm`) appear alongside the database while it is open. They are cleaned up automatically on shutdown and can be ignored.
+> **Compatibility:** `PARAZETTEL_DATABASE_PATH` and `--database-path` are still accepted for migration and legacy launchers, but the primary runtime path is `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`.
 
 ---
 
@@ -174,7 +174,7 @@ Add to your Claude Desktop MCP configuration:
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/parazettel-mcp/data/notes",
-        "PARAZETTEL_DATABASE_PATH": "/absolute/path/to/parazettel-mcp/data/db/parazettel.db",
+        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/graph.kuzu",
         "PARAZETTEL_LOG_LEVEL": "INFO"
       }
     }
@@ -190,13 +190,25 @@ Add the same entry to `~/.claude.json` under `mcpServers`.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set paths as needed. All paths can also be passed as environment variables or CLI flags:
+Copy `.env.example` to `.env` and set paths as needed. The primary runtime storage path is `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`. Caller or current-working-directory `.env` values are loaded first, and the repo-root `.env` fills in any missing values.
 
 ```bash
 python -m parazettel_mcp.main \
   --notes-dir ./data/notes \
-  --database-path ./data/db/parazettel.db
+  --graph-db-path ./data/db/graph.kuzu
 ```
+
+Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path for compatibility.
+
+If you are migrating an existing vault from SQLite to Kuzu, use:
+
+```bash
+python scripts/migrate_to_graphdb.py \
+  --notes-dir ./data/notes \
+  --graph-db-path ./data/db/graph.kuzu
+```
+
+Rerunning the migration against an existing target updates current notes and links, but it does not prune stale graph nodes for source files that were deleted later. For a clean one-shot migration, use a fresh target path.
 
 ---
 

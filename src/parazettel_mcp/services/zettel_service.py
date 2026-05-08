@@ -475,9 +475,8 @@ class ZettelService:
         return self._get_project_for_routing(project_id)
 
     def rebuild_index(self) -> Optional[Path]:
-        """Rebuild the database index from files."""
-        self.repository.rebuild_index()
-        return self.repository.last_rebuild_backup_path
+        """Rebuild the graph index from files."""
+        return self.repository.rebuild_index()
 
     def export_note(self, note_id: str, format: str = "markdown") -> str:
         """Export a note in the specified format."""

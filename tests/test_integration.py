@@ -32,22 +32,22 @@ class TestIntegration:
         workspace_tmp_root = Path(__file__).resolve().parents[1] / ".tmp" / "test-integration"
         workspace_tmp_root.mkdir(parents=True, exist_ok=True)
 
-        # Create explicit workspace-local directories so SQLite runs on a path
-        # that remains writable throughout the test on Windows.
+        # Create explicit workspace-local directories so the graph DB runs on a
+        # writable path throughout the test.
         self.test_root = workspace_tmp_root / uuid4().hex
         self.notes_dir = self.test_root / "notes"
         self.db_dir = self.test_root / "db"
         self.notes_dir.mkdir(parents=True, exist_ok=True)
         self.db_dir.mkdir(parents=True, exist_ok=True)
-        self.database_path = self.db_dir / "test_zettelkasten.db"
+        self.graph_db_path = self.db_dir / "test_graph.kuzu"
 
         # Save original config values
         self.original_notes_dir = config.notes_dir
-        self.original_database_path = config.database_path
+        self.original_graph_db_path = config.graph_db_path
 
         # Update config for tests
         config.notes_dir = self.notes_dir
-        config.database_path = self.database_path
+        config.graph_db_path = self.graph_db_path
 
         # Create services
         self.zettel_service = ZettelService()
@@ -72,20 +72,14 @@ class TestIntegration:
 
         yield
 
+        if getattr(self, "server", None) is not None:
+            self.server.close()
+        if getattr(self, "zettel_service", None) is not None:
+            self.zettel_service.close()
+
         # Restore original config
         config.notes_dir = self.original_notes_dir
-        config.database_path = self.original_database_path
-
-        # Dispose repository engines so Windows can release the SQLite files.
-        disposed = set()
-        for repo in (
-            getattr(self.zettel_service, "repository", None),
-            getattr(getattr(self.server, "zettel_service", None), "repository", None),
-        ):
-            engine = getattr(repo, "engine", None)
-            if engine is not None and id(engine) not in disposed:
-                engine.dispose()
-                disposed.add(id(engine))
+        config.graph_db_path = self.original_graph_db_path
 
         # Clean up test directories
         shutil.rmtree(self.test_root, ignore_errors=True)

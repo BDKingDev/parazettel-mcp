@@ -1,14 +1,19 @@
 """Tests for the NoteRepository class."""
 
+import shutil
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.db_models import DBLink
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
-from parazettel_mcp.storage.note_repository import _coerce_datetime, _normalize_wiki_target
+from parazettel_mcp.storage.note_repository import (
+    NoteRepository,
+    _coerce_datetime,
+    _normalize_wiki_target,
+)
 
 
 def test_create_note(note_repository):
@@ -188,6 +193,11 @@ def test_search_notes(note_repository):
     assert len(javascript_notes) == 1
     assert javascript_notes[0].id == saved_note2.id
 
+    # Search by broad text across title/content
+    text_notes = note_repository.search(text="javascript")
+    assert len(text_notes) == 1
+    assert text_notes[0].id == saved_note2.id
+
     # Search by note_type
     structure_notes = note_repository.search(note_type=NoteType.STRUCTURE)
     assert len(structure_notes) == 1
@@ -197,6 +207,25 @@ def test_search_notes(note_repository):
     programming_notes = note_repository.find_by_tag("programming")
     assert len(programming_notes) == 2
     assert {note.id for note in programming_notes} == {saved_note1.id, saved_note2.id}
+
+
+def test_search_uses_fts_for_stemming_and_field_specific_queries(note_repository):
+    """FTS-backed search should improve recall without blurring title/content filters."""
+    note = Note(
+        title="Tooling Overview",
+        content="Policies libraries decisions and planning support analysis.",
+        note_type=NoteType.PERMANENT,
+        tags=[Tag(name="tooling")],
+    )
+    saved_note = note_repository.create(note)
+
+    text_results = note_repository.search(text="library")
+    assert [result.id for result in text_results] == [saved_note.id]
+
+    content_results = note_repository.search(content="library")
+    assert [result.id for result in content_results] == [saved_note.id]
+
+    assert note_repository.search(title="library") == []
 
 
 def test_note_linking(note_repository):
@@ -594,45 +623,32 @@ def test_delete_preserves_remaining_link_created_at(note_repository):
     source.add_link(second_target.id, LinkType.REFERENCE)
     note_repository.update(source)
 
-    with note_repository.session_factory() as session:
-        original_link = session.scalar(
-            select(DBLink).where(
-                DBLink.source_id == source.id,
-                DBLink.target_id == second_target.id,
-                DBLink.link_type == LinkType.REFERENCE.value,
-            )
-        )
-        assert original_link is not None
-        original_created_at = original_link.created_at
+    original_link = note_repository.get_link(
+        source.id, second_target.id, LinkType.REFERENCE.value
+    )
+    assert original_link is not None
+    original_created_at = original_link["created_at"]
 
     note_repository.delete(first_target.id)
 
-    with note_repository.session_factory() as session:
-        refreshed_link = session.scalar(
-            select(DBLink).where(
-                DBLink.source_id == source.id,
-                DBLink.target_id == second_target.id,
-                DBLink.link_type == LinkType.REFERENCE.value,
-            )
-        )
-        assert refreshed_link is not None
-        assert refreshed_link.created_at == original_created_at
+    refreshed_link = note_repository.get_link(
+        source.id, second_target.id, LinkType.REFERENCE.value
+    )
+    assert refreshed_link is not None
+    assert refreshed_link["created_at"] == original_created_at
 
 
-def test_rebuild_index_creates_database_backup(note_repository):
-    """Rebuild should back up the SQLite database before clearing tables."""
-    saved = note_repository.create(Note(title="Backup Test", content="Backup content."))
-    db_path = config.get_absolute_path(config.database_path)
-    for backup_path in db_path.parent.glob(f"{db_path.name}.*.bak"):
-        backup_path.unlink()
+def test_rebuild_index_repopulates_graph(note_repository):
+    """rebuild_index() should clear and re-import all notes from markdown files."""
+    saved = note_repository.create(Note(title="Rebuild Test", content="Rebuild content."))
 
-    note_repository.rebuild_index()
-    backup_paths = list(db_path.parent.glob(f"{db_path.name}.*.bak"))
+    backup_path = note_repository.rebuild_index()
 
-    assert len(backup_paths) == 1
-    assert backup_paths[0] == note_repository.last_rebuild_backup_path
-    assert backup_paths[0].stat().st_size > 0
-    assert note_repository.get(saved.id) is not None
+    result = note_repository.get(saved.id)
+    assert result is not None
+    assert result.title == "Rebuild Test"
+    assert backup_path is not None
+    assert backup_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -640,13 +656,163 @@ def test_rebuild_index_creates_database_backup(note_repository):
 # ---------------------------------------------------------------------------
 
 
-def test_wal_mode_enabled(note_repository):
-    """Database should be set to WAL journal mode after init."""
-    from sqlalchemy import text
+def test_graph_db_initialized(note_repository):
+    """Graph database should be initialised after repository construction."""
+    conn = note_repository._get_conn()
+    try:
+        result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
+        count = result.get_next()[0]
+    finally:
+        conn.close()
+    assert count == 0  # empty repository has no notes
 
-    with note_repository.session_factory() as session:
-        row = session.execute(text("PRAGMA journal_mode")).fetchone()
-    assert row[0] == "wal"
+
+def test_fetch_notes_by_ids_preserves_requested_order(note_repository):
+    """Low-level graph reconstruction should preserve the caller's ID order."""
+    first = note_repository.create(Note(title="First Ordered", content="First body"))
+    second = note_repository.create(Note(title="Second Ordered", content="Second body"))
+
+    with note_repository._connection() as conn:
+        ordered = note_repository._fetch_notes_by_ids(conn, [second.id, first.id])
+
+    assert [note.id for note in ordered] == [second.id, first.id]
+
+
+def test_connection_helper_closes_graph_connection(note_repository):
+    """_connection() should close the underlying Kuzu connection."""
+    fake_conn = MagicMock()
+
+    with patch.object(note_repository, "_get_conn", return_value=fake_conn):
+        with note_repository._connection() as conn:
+            assert conn is fake_conn
+
+    fake_conn.close.assert_called_once()
+
+
+def test_closed_repository_rejects_new_connections(note_repository):
+    """Closed repositories should fail fast instead of creating new Kuzu handles."""
+    note_repository.close()
+
+    with pytest.raises(RuntimeError, match="closed"):
+        note_repository._get_conn()
+
+
+def test_repository_close_allows_reopen_same_graph_path():
+    """Closing a repository should release the graph path for a fresh reopen."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    first_repo = None
+    reopened_repo = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+
+        first_repo = NoteRepository(notes_dir=notes_dir)
+        saved = first_repo.create(Note(title="Reopen Test", content="Reopen body"))
+        first_repo.close()
+        first_repo = None
+
+        reopened_repo = NoteRepository(notes_dir=notes_dir)
+        reopened = reopened_repo.search(title="Reopen Test")
+        assert len(reopened) == 1
+        assert reopened[0].id == saved.id
+    finally:
+        if reopened_repo is not None:
+            reopened_repo.close()
+        if first_repo is not None:
+            first_repo.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_multiple_repositories_share_same_graph_path():
+    """Repositories for the same graph path should share the DB handle safely."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    first_repo = None
+    second_repo = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+
+        first_repo = NoteRepository(notes_dir=notes_dir)
+        second_repo = NoteRepository(notes_dir=notes_dir)
+
+        saved = first_repo.create(
+            Note(title="Shared Graph Note", content="Shared body")
+        )
+        results = second_repo.search(title="Shared Graph Note")
+        assert len(results) == 1
+        assert results[0].id == saved.id
+
+        first_repo.close()
+        first_repo = None
+
+        still_available = second_repo.search(title="Shared Graph Note")
+        assert len(still_available) == 1
+    finally:
+        if second_repo is not None:
+            second_repo.close()
+        if first_repo is not None:
+            first_repo.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_create_uses_graph_db_without_creating_legacy_sqlite():
+    """Repository writes should index into Kuzu without creating the legacy SQLite DB."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    legacy_db_path = test_root / "db" / "legacy-parazettel.db"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    original_database_path = config.database_path
+    repository = None
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+        config.database_path = legacy_db_path
+
+        repository = NoteRepository(notes_dir=notes_dir)
+        saved = repository.create(Note(title="Graph Write Test", content="Uses Kuzu"))
+
+        assert graph_db_path.exists()
+        assert not legacy_db_path.exists()
+
+        with repository._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note {id: $id}) RETURN count(n) AS cnt",
+                {"id": saved.id},
+            )
+            assert result.get_next()[0] == 1
+    finally:
+        if repository is not None:
+            repository.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        config.database_path = original_database_path
+        shutil.rmtree(test_root, ignore_errors=True)
 
 
 def test_create_leaves_no_tmp_file(note_repository):
@@ -775,24 +941,55 @@ def test_rebuild_index_if_needed_detects_extra_file(note_repository):
     """rebuild_index_if_needed() should trigger rebuild when a file exists but DB lacks it."""
     note = Note(title="Extra File Test", content="Exists on disk only.")
     saved = note_repository.create(note)
-    # Manually delete from DB but leave file
-    from sqlalchemy import text
-
-    with note_repository.session_factory() as session:
-        session.execute(
-            text("DELETE FROM links WHERE source_id = :id OR target_id = :id"),
-            {"id": saved.id},
-        )
-        session.execute(
-            text("DELETE FROM note_tags WHERE note_id = :id"), {"id": saved.id}
-        )
-        session.execute(text("DELETE FROM notes WHERE id = :id"), {"id": saved.id})
-        session.commit()
+    # Manually delete from graph DB but leave file
+    with note_repository._connection() as conn:
+        conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": saved.id})
     # Should detect mismatch and rebuild (DB re-indexed from file)
     note_repository.rebuild_index_if_needed()
     result = note_repository.get(saved.id)
     assert result is not None
     assert result.title == "Extra File Test"
+
+
+def test_parse_note_from_markdown_deduplicates_duplicate_tags(note_repository):
+    """Duplicate tags in frontmatter should collapse to first-seen unique tags."""
+    parsed = note_repository._parse_note_from_markdown(
+        "---\n"
+        "id: dup-tags\n"
+        "title: Duplicate Tags\n"
+        "type: permanent\n"
+        "tags: alpha, beta, alpha\n"
+        "created: 2026-01-01T00:00:00\n"
+        "updated: 2026-01-01T00:00:00\n"
+        "---\n"
+        "# Duplicate Tags\n\n"
+        "Body\n"
+    )
+
+    assert [tag.name for tag in parsed.tags] == ["alpha", "beta"]
+
+
+def test_parse_note_from_markdown_deduplicates_duplicate_links(note_repository):
+    """Duplicate link lines should not produce duplicate outgoing link records."""
+    parsed = note_repository._parse_note_from_markdown(
+        "---\n"
+        "id: dup-links\n"
+        "title: Duplicate Links\n"
+        "type: permanent\n"
+        "tags: test\n"
+        "created: 2026-01-01T00:00:00\n"
+        "updated: 2026-01-01T00:00:00\n"
+        "---\n"
+        "# Duplicate Links\n\n"
+        "Body\n\n"
+        "## Links\n"
+        "- reference [[target-1]] First description\n"
+        "- reference [[target-1]] Second description\n"
+    )
+
+    assert len(parsed.links) == 1
+    assert parsed.links[0].target_id == "target-1"
+    assert parsed.links[0].link_type == LinkType.REFERENCE
 
 
 def test_metadata_round_trips_through_search(note_repository):

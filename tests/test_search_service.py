@@ -51,20 +51,19 @@ class TestSearchService:
         # Create search service
         search_service = SearchService(zettel_service)
 
-        # Test tag search instead which is more reliable
-        python_results = zettel_service.get_notes_by_tag("python")
-        assert len(python_results) == 2
-        python_ids = {note.id for note in python_results}
-        assert note1.id in python_ids
-        assert note2.id in python_ids
+        python_results = search_service.search_by_text("python")
+        python_ids = {result.note.id for result in python_results}
+        assert python_ids == {note1.id, note2.id}
+        assert note3.id not in python_ids
 
     def test_search_by_text_returns_empty_for_blank_query(self):
         """search_by_text() should short-circuit blank queries."""
         mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = MagicMock()
         search_service = SearchService(mock_zettel_service)
 
         assert search_service.search_by_text("") == []
-        mock_zettel_service.get_all_notes.assert_not_called()
+        mock_zettel_service.repository.search.assert_not_called()
 
     def test_search_by_text_respects_title_and_content_flags(self):
         """search_by_text() should honor include_title/include_content toggles."""
@@ -79,7 +78,11 @@ class TestSearchService:
             content="The keyword python appears in this body text.",
         )
         mock_zettel_service = MagicMock()
-        mock_zettel_service.get_all_notes.return_value = [title_match, content_match]
+        mock_zettel_service.repository = MagicMock()
+        mock_zettel_service.repository.search.side_effect = [
+            [title_match],
+            [content_match],
+        ]
         search_service = SearchService(mock_zettel_service)
 
         title_results = search_service.search_by_text("python", include_content=False)
@@ -90,6 +93,41 @@ class TestSearchService:
         assert [result.note.id for result in content_results] == ["content-note"]
         assert content_results[0].matched_context.startswith("Content: ...")
         assert "python appears" in content_results[0].matched_context.lower()
+        mock_zettel_service.repository.search.assert_any_call(title="python")
+        mock_zettel_service.repository.search.assert_any_call(content="python")
+
+    def test_search_by_text_prefilters_candidates_via_repository(self):
+        """search_by_text() should use the graph-backed repository prefilter."""
+        matching_note = SimpleNamespace(
+            id="python-note",
+            title="Python note",
+            content="Python shows up in this content.",
+        )
+        mock_repository = MagicMock()
+        mock_repository.search.return_value = [matching_note]
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_by_text("python")
+
+        assert [result.note.id for result in results] == ["python-note"]
+        mock_repository.search.assert_called_once_with(text="python")
+
+    def test_search_by_text_keeps_fts_only_candidates(self, zettel_service):
+        """FTS-only matches should not be dropped by substring-only scoring heuristics."""
+        note = zettel_service.create_note(
+            title="Tooling Overview",
+            content="Policies libraries decisions and planning support analysis.",
+            tags=["tooling"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_by_text("library")
+
+        assert [result.note.id for result in results] == [note.id]
+        assert results[0].score == pytest.approx(0.1)
+        assert results[0].matched_context == "FTS: Tooling Overview"
 
     def test_search_by_tag(self, zettel_service):
         """Test searching for notes by tags."""
@@ -387,6 +425,46 @@ class TestSearchService:
             created_after=start_date,
             created_before=end_date,
         )
+
+    def test_search_combined_prefilters_text_in_repository_query(self):
+        """search_combined() should include text in the graph-backed prefilter."""
+        note = SimpleNamespace(id="note-1", title="Python", content="Python body")
+        mock_repository = MagicMock()
+        mock_repository.search.return_value = [note]
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_combined(
+            text="python",
+            tags=["python"],
+            project_id="project123",
+            area_id="area456",
+        )
+
+        assert [result.note.id for result in results] == ["note-1"]
+        mock_repository.search.assert_called_once_with(
+            tags=["python"],
+            project_id="project123",
+            area_id="area456",
+            text="python",
+        )
+
+    def test_search_combined_keeps_fts_only_candidates(self, zettel_service):
+        """Combined search should preserve valid FTS matches after repository prefiltering."""
+        note = zettel_service.create_note(
+            title="Tooling Overview",
+            content="Policies libraries decisions and planning support analysis.",
+            note_type=NoteType.PERMANENT,
+            tags=["tooling"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_combined(text="library", tags=["tooling"])
+
+        assert [result.note.id for result in results] == [note.id]
+        assert results[0].score == pytest.approx(0.1)
+        assert results[0].matched_context == "FTS: Tooling Overview"
 
     def test_search_combined_filters_non_task_notes_by_project(self, zettel_service):
         """Combined search should honor project_id for non-task notes as well."""

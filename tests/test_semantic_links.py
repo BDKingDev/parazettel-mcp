@@ -654,7 +654,7 @@ Test content for parsing links from markdown.
 
         # Create MCP server
         server = ZettelkastenMcpServer()
-        server.zettel_service.repository.engine.dispose()
+        server.close()
         server.zettel_service = zettel_service
 
         # Access the tool function directly as a method of the server
@@ -687,7 +687,7 @@ Test content for parsing links from markdown.
 
         # Create MCP server with mocked functions
         server = ZettelkastenMcpServer()
-        server.zettel_service.repository.engine.dispose()
+        server.close()
         server.zettel_service = zettel_service  # Use our test zettel_service
 
         # Call the tool function directly as a method of the server

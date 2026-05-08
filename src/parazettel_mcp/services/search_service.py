@@ -4,10 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
-from sqlalchemy import func, or_, select, text
-from sqlalchemy.orm import joinedload
-
-from parazettel_mcp.models.db_models import DBLink, DBNote
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
 from parazettel_mcp.services.zettel_service import ZettelService
 
@@ -34,6 +30,20 @@ class SearchService:
         # Initialize the zettel service if it hasn't been initialized
         self.zettel_service.initialize()
 
+    def _get_text_candidates(
+        self, query: str, *, include_content: bool, include_title: bool
+    ) -> List[Note]:
+        """Use the repository to prefilter text-search candidates."""
+        if not include_content and not include_title:
+            return []
+
+        repository = self.zettel_service.repository
+        if include_content and include_title:
+            return repository.search(text=query)
+        if include_title:
+            return repository.search(title=query)
+        return repository.search(content=query)
+
     def search_by_text(
         self, query: str, include_content: bool = True, include_title: bool = True
     ) -> List[SearchResult]:
@@ -45,8 +55,10 @@ class SearchService:
         query = query.lower()
         query_terms = set(query.split())
 
-        # Get all notes
-        all_notes = self.zettel_service.get_all_notes()
+        # Use the graph index to narrow the candidate set before scoring in Python.
+        all_notes = self._get_text_candidates(
+            query, include_content=include_content, include_title=include_title
+        )
         results = []
 
         for note in all_notes:
@@ -86,6 +98,12 @@ class SearchService:
                         matched_terms.add(term)
 
             # Add to results if score is positive
+            if score == 0:
+                # Repository prefiltering may surface valid FTS matches even when
+                # the old substring heuristics do not. Keep those candidates.
+                score = 0.1
+                matched_context = f"FTS: {note.title}"
+
             if score > 0:
                 results.append(
                     SearchResult(
@@ -120,87 +138,25 @@ class SearchService:
 
     def find_orphaned_notes(self) -> List[Note]:
         """Find notes with no incoming or outgoing links."""
-        orphans = []
-
-        with self.zettel_service.repository.session_factory() as session:
-            # Subquery for notes with links
-            notes_with_links = (
-                select(DBNote.id)
-                .outerjoin(
-                    DBLink,
-                    or_(DBNote.id == DBLink.source_id, DBNote.id == DBLink.target_id),
-                )
-                .where(or_(DBLink.source_id != None, DBLink.target_id != None))
-                .subquery()
-            )
-
-            # Query for notes without links
-            query = (
-                select(DBNote)
-                .options(
-                    joinedload(DBNote.tags),
-                    joinedload(DBNote.outgoing_links),
-                    joinedload(DBNote.incoming_links),
-                )
-                .where(DBNote.id.not_in(select(notes_with_links)))
-            )
-
-            result = session.execute(query)
-            orphaned_db_notes = result.unique().scalars().all()
-
-            # Convert DB notes to model Notes
-            for db_note in orphaned_db_notes:
-                note = self.zettel_service.get_note(db_note.id)
-                if note:
-                    orphans.append(note)
-
-        return orphans
+        repo = self.zettel_service.repository
+        orphan_ids = repo.find_orphaned_note_ids()
+        notes = []
+        for note_id in orphan_ids:
+            note = self.zettel_service.get_note(note_id)
+            if note:
+                notes.append(note)
+        return notes
 
     def find_central_notes(self, limit: int = 10) -> List[Tuple[Note, int]]:
         """Find notes with the most connections (incoming + outgoing links)."""
+        repo = self.zettel_service.repository
+        counts = repo.get_connection_counts(limit=limit)
         note_connections = []
-        # Direct database query to count connections for all notes at once
-        with self.zettel_service.repository.session_factory() as session:
-            # Use a CTE for better readability and performance
-            query = text(
-                """
-            WITH outgoing AS (
-                SELECT source_id as note_id, COUNT(*) as outgoing_count 
-                FROM links 
-                GROUP BY source_id
-            ),
-            incoming AS (
-                SELECT target_id as note_id, COUNT(*) as incoming_count 
-                FROM links 
-                GROUP BY target_id
-            )
-            SELECT n.id,
-                COALESCE(o.outgoing_count, 0) as outgoing,
-                COALESCE(i.incoming_count, 0) as incoming,
-                (COALESCE(o.outgoing_count, 0) + COALESCE(i.incoming_count, 0)) as total
-            FROM notes n
-            LEFT JOIN outgoing o ON n.id = o.note_id
-            LEFT JOIN incoming i ON n.id = i.note_id
-            WHERE (COALESCE(o.outgoing_count, 0) + COALESCE(i.incoming_count, 0)) > 0
-            ORDER BY total DESC
-            LIMIT :limit
-            """
-            )
-
-            results = session.execute(query, {"limit": limit}).all()
-
-            # Process results
-            for note_id, outgoing_count, incoming_count, total_connections in results:
-                total_connections = outgoing_count + incoming_count
-                if total_connections > 0:  # Only include notes with connections
-                    note = self.zettel_service.get_note(note_id)
-                    if note:
-                        note_connections.append((note, total_connections))
-
-        # Sort by total connections (descending)
+        for note_id, total in counts:
+            note = self.zettel_service.get_note(note_id)
+            if note:
+                note_connections.append((note, total))
         note_connections.sort(key=lambda x: x[1], reverse=True)
-
-        # Return top N notes
         return note_connections[:limit]
 
     def find_notes_by_date_range(
@@ -263,6 +219,8 @@ class SearchService:
             search_kwargs["created_after"] = start_date
         if end_date:
             search_kwargs["created_before"] = end_date
+        if text:
+            search_kwargs["text"] = text
 
         all_notes = self.zettel_service.repository.search(**search_kwargs)
 
@@ -306,6 +264,12 @@ class SearchService:
                     if term in content_lower:
                         score += 0.2
                         matched_terms.add(term)
+
+                if score == 0:
+                    # Repository prefiltering may surface valid FTS matches even
+                    # when the old substring heuristics do not.
+                    score = 0.1
+                    matched_context = f"FTS: {note.title}"
 
                 # Add to results if score is positive
                 if score > 0:

@@ -11,6 +11,8 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
 )
+from parazettel_mcp.services.zettel_service import ZettelService
+from parazettel_mcp.storage.note_repository import NoteRepository
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -482,6 +484,38 @@ def test_create_subproject_inherits_parent_area_and_exposes_hierarchy(
     assert parent_project is not None
     assert parent_project.id == parent.id
     assert [note.id for note in subprojects] == [child.id]
+
+
+def test_subproject_hierarchy_survives_graph_rebuild(
+    zettel_service, area, test_config
+):
+    """Subproject routing should survive a graph rebuild and fresh reopen."""
+    parent = zettel_service.create_project_note(
+        "Parent Project", "Own the broader initiative.", area_id=area.id
+    )
+    child = zettel_service.create_project_note(
+        "Child Project", "Own one implementation slice.", project_id=parent.id
+    )
+
+    zettel_service.rebuild_index()
+
+    fresh_repository = NoteRepository(notes_dir=test_config.notes_dir)
+    fresh_service = ZettelService(repository=fresh_repository)
+    try:
+        rebuilt_child = fresh_service.get_note(child.id)
+        parent_project = fresh_service.get_parent_project(child.id)
+        subprojects = fresh_service.get_subprojects(parent.id)
+        project_notes = fresh_service.get_project_notes(parent.id)
+
+        assert rebuilt_child is not None
+        assert rebuilt_child.project_id == parent.id
+        assert rebuilt_child.area_id == area.id
+        assert parent_project is not None
+        assert parent_project.id == parent.id
+        assert [note.id for note in subprojects] == [child.id]
+        assert project_notes == []
+    finally:
+        fresh_service.close()
 
 
 def test_create_subproject_rejects_conflicting_area(zettel_service, area):

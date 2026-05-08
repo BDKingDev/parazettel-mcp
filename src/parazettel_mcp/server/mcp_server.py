@@ -6,8 +6,6 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
-from sqlalchemy import exc as sqlalchemy_exc
-
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (
     LinkType,
@@ -68,13 +66,11 @@ class ZettelkastenMcpServer:
         elif isinstance(error, (IOError, OSError)):
             # File system errors - don't expose paths or detailed error messages
             logger.error(f"File system error [{error_id}]: {str(error)}", exc_info=True)
-            # return f"Unable to access the requested resource. Error ID: {error_id}"
-            return f"Error: {str(error)}"
+            return f"Unable to access the requested resource. Error ID: {error_id}"
         else:
             # Unexpected errors - log with full stack trace but return generic message
             logger.error(f"Unexpected error [{error_id}]: {str(error)}", exc_info=True)
-            # return f"An unexpected error occurred. Error ID: {error_id}"
-            return f"Error: {str(error)}"
+            return f"An unexpected error occurred. Error ID: {error_id}"
 
     @staticmethod
     def _format_note_result(note: Note) -> str:
@@ -498,7 +494,7 @@ class ZettelkastenMcpServer:
                     return f"Bidirectional link created between {source_id} and {target_id}"
                 else:
                     return f"Link created from {source_id} to {target_id}"
-            except (Exception, sqlalchemy_exc.IntegrityError) as e:
+            except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
                     return f"A link of this type already exists between these notes. Try a different link type."
                 return self.format_error_response(e)
@@ -623,6 +619,9 @@ class ZettelkastenMcpServer:
                 )
                 if not linked_notes:
                     return f"No {direction} links found for note {note_id}."
+                source_note = None
+                if direction in ["outgoing", "both"]:
+                    source_note = self.zettel_service.get_note(str(note_id))
                 # Format results
                 output = f"Found {len(linked_notes)} {direction} linked notes for {note_id}:\n\n"
                 for i, note in enumerate(linked_notes, 1):
@@ -634,7 +633,6 @@ class ZettelkastenMcpServer:
                     # Try to determine link type
                     if direction in ["outgoing", "both"]:
                         # Check source note's outgoing links
-                        source_note = self.zettel_service.get_note(str(note_id))
                         if source_note:
                             for link in source_note.links:
                                 if str(link.target_id) == str(
@@ -943,6 +941,8 @@ class ZettelkastenMcpServer:
                     note_source = NoteSource(source.lower())
                 except ValueError:
                     return f"Invalid source: {source}. Valid: {', '.join(s.value for s in NoteSource)}"
+                if priority is not None and priority not in {1, 2, 3, 4}:
+                    return "Invalid priority: use 1 (low) to 4 (critical)."
                 parsed_due = None
                 if due_date:
                     try:
@@ -1040,6 +1040,8 @@ class ZettelkastenMcpServer:
                         new_status = NoteStatus(status.lower())
                     except ValueError:
                         return f"Invalid status: {status}. Valid: {', '.join(s.value for s in NoteStatus)}"
+                if priority is not None and priority not in {1, 2, 3, 4}:
+                    return "Invalid priority: use 1 (low) to 4 (critical)."
                 parsed_due = None
                 if due_date is not None:
                     try:

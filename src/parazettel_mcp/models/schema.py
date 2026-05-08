@@ -293,7 +293,7 @@ class Note(BaseModel):
         if self.links:
             links_str = "\n".join(
                 [
-                    f"- [{link.link_type}] [[{link.target_id}]] {link.description or ''}"
+                    f"- [{link.link_type.value}] [[{link.target_id}]] {link.description or ''}"
                     for link in self.links
                 ]
             )
