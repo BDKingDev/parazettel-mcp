@@ -164,7 +164,7 @@ uv sync --extra dev
 
 ### Connecting to Claude Desktop
 
-Add to your Claude Desktop MCP configuration:
+For a single chat or development-only direct run, add this to your Claude Desktop MCP configuration:
 
 ```json
 {
@@ -182,6 +182,36 @@ Add to your Claude Desktop MCP configuration:
 }
 ```
 
+For multi-chat use, run one shared local daemon and point stdio MCP launches at that daemon:
+
+```bash
+python -m parazettel_mcp.main \
+  --run-daemon \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+Then configure the MCP entry to proxy through it:
+
+```json
+{
+  "mcpServers": {
+    "parazettel": {
+      "command": "/absolute/path/to/parazettel-mcp/.venv/bin/python",
+      "args": ["-m", "parazettel_mcp.main"],
+      "env": {
+        "PARAZETTEL_NOTES_DIR": "/absolute/path/to/parazettel-mcp/data/notes",
+        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/graph.kuzu",
+        "PARAZETTEL_BACKEND_MODE": "daemon",
+        "PARAZETTEL_DAEMON_HOST": "127.0.0.1",
+        "PARAZETTEL_DAEMON_PORT": "8766",
+        "PARAZETTEL_LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
+```
+
 ### Connecting to Claude Code (CLI)
 
 Add the same entry to `~/.claude.json` under `mcpServers`.
@@ -192,10 +222,39 @@ Add the same entry to `~/.claude.json` under `mcpServers`.
 
 Copy `.env.example` to `.env` and set paths as needed. The primary runtime storage path is `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`. Caller or current-working-directory `.env` values are loaded first, and the repo-root `.env` fills in any missing values.
 
+Key runtime settings:
+
+- `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`: primary Kuzu graph path
+- `PARAZETTEL_BACKEND_MODE` / `--backend-mode`: `direct` or `daemon`
+- `PARAZETTEL_DAEMON_HOST` / `--daemon-host`: local daemon bind/connect host
+- `PARAZETTEL_DAEMON_PORT` / `--daemon-port`: local daemon bind/connect port
+- `PARAZETTEL_MCP_TRANSPORT` / `--transport`: MCP transport, `stdio` or `sse`
+
 ```bash
 python -m parazettel_mcp.main \
   --notes-dir ./data/notes \
-  --graph-db-path ./data/db/graph.kuzu
+  --graph-db-path ./data/db/graph.kuzu \
+  --backend-mode direct
+```
+
+To run the shared daemon:
+
+```bash
+python -m parazettel_mcp.main \
+  --run-daemon \
+  --notes-dir ./data/notes \
+  --graph-db-path ./data/db/graph.kuzu \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+To run the MCP facade against that daemon:
+
+```bash
+python -m parazettel_mcp.main \
+  --backend-mode daemon \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
 ```
 
 Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path for compatibility.
