@@ -11,6 +11,7 @@ import pytest
 
 import parazettel_mcp.main as main_module
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.client import DaemonUnavailableError
 
 
 @pytest.fixture
@@ -292,3 +293,119 @@ def test_main_runs_daemon_when_requested(monkeypatch, workspace_temp_dir):
     daemon_factory.assert_called_once_with("127.0.0.1", 8766)
     daemon.serve_forever.assert_called_once_with()
     daemon.shutdown.assert_called_once_with()
+
+
+def test_main_daemon_backend_autostarts_daemon_when_unavailable(
+    monkeypatch, workspace_temp_dir
+):
+    """Daemon-backed MCP startup should launch the daemon if health is unavailable."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+    )
+    setup_logging = MagicMock()
+    server = MagicMock()
+    server_factory = MagicMock(return_value=server)
+    daemon_client = MagicMock()
+    daemon_client.health.side_effect = [
+        DaemonUnavailableError("down"),
+        {"ok": True},
+    ]
+    popen = MagicMock()
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", setup_logging)
+    monkeypatch.setattr(main_module, "ZettelkastenMcpServer", server_factory)
+    monkeypatch.setattr(main_module, "DaemonRpcClient", lambda base_url: daemon_client)
+    monkeypatch.setattr(main_module, "_spawn_daemon_process", lambda _args: popen)
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+
+    main_module.main()
+
+    assert daemon_client.health.call_count == 2
+    server_factory.assert_called_once_with()
+    server.run.assert_called_once_with("stdio")
+    server.close.assert_called_once_with()
+
+
+def test_main_daemon_backend_skips_spawn_when_daemon_is_healthy(
+    monkeypatch, workspace_temp_dir
+):
+    """Daemon-backed MCP startup should not spawn another daemon if health passes."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+    )
+    setup_logging = MagicMock()
+    server = MagicMock()
+    server_factory = MagicMock(return_value=server)
+    daemon_client = MagicMock()
+    daemon_client.health.return_value = {"ok": True}
+    spawn = MagicMock()
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", setup_logging)
+    monkeypatch.setattr(main_module, "ZettelkastenMcpServer", server_factory)
+    monkeypatch.setattr(main_module, "DaemonRpcClient", lambda base_url: daemon_client)
+    monkeypatch.setattr(main_module, "_spawn_daemon_process", spawn)
+
+    main_module.main()
+
+    spawn.assert_not_called()
+    daemon_client.health.assert_called_once_with()
+    server.run.assert_called_once_with("stdio")
+
+
+def test_main_exits_when_daemon_backend_cannot_start(
+    monkeypatch, workspace_temp_dir
+):
+    """Daemon-backed MCP startup should fail clearly if the daemon never comes up."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+    )
+    setup_logging = MagicMock()
+    daemon_client = MagicMock()
+    daemon_client.health.side_effect = DaemonUnavailableError("down")
+    spawn = MagicMock()
+    ticks = iter([0.0, 0.0, 11.0])
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", setup_logging)
+    monkeypatch.setattr(main_module, "DaemonRpcClient", lambda base_url: daemon_client)
+    monkeypatch.setattr(main_module, "_spawn_daemon_process", spawn)
+    monkeypatch.setattr(main_module.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main_module.time, "time", lambda: next(ticks))
+
+    with pytest.raises(SystemExit) as excinfo:
+        main_module.main()
+
+    assert excinfo.value.code == 1
+    spawn.assert_called_once()

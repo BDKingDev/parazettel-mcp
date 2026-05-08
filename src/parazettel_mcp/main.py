@@ -3,13 +3,19 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
 from parazettel_mcp.utils import setup_logging
+
+_DAEMON_START_TIMEOUT_SECONDS = 10.0
+_DAEMON_HEALTH_POLL_INTERVAL_SECONDS = 0.25
 
 
 def parse_args():
@@ -103,6 +109,75 @@ def update_config(args):
     config.daemon_port = args.daemon_port
 
 
+def _build_daemon_command(args: argparse.Namespace) -> list[str]:
+    """Build the detached daemon launch command matching the current config."""
+    command = [
+        sys.executable,
+        "-m",
+        "parazettel_mcp.main",
+        "--run-daemon",
+        "--notes-dir",
+        str(config.notes_dir),
+        "--graph-db-path",
+        str(config.graph_db_path),
+        "--log-level",
+        args.log_level,
+        "--daemon-host",
+        config.daemon_host,
+        "--daemon-port",
+        str(config.daemon_port),
+    ]
+    return command
+
+
+def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:
+    """Start the daemon in the background without blocking the MCP facade."""
+    kwargs: dict[str, object] = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        kwargs["creationflags"] = creationflags
+        kwargs["startupinfo"] = startupinfo
+    return subprocess.Popen(_build_daemon_command(args), **kwargs)
+
+
+def _wait_for_daemon_ready(client: DaemonRpcClient, timeout_seconds: float) -> None:
+    """Poll the daemon health endpoint until it becomes ready or times out."""
+    deadline = time.time() + timeout_seconds
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        try:
+            client.health()
+            return
+        except DaemonUnavailableError as exc:
+            last_error = exc
+            time.sleep(_DAEMON_HEALTH_POLL_INTERVAL_SECONDS)
+    if last_error is not None:
+        raise last_error
+
+
+def ensure_daemon_running(args: argparse.Namespace) -> None:
+    """Ensure the configured daemon is available, auto-starting it if needed."""
+    client = DaemonRpcClient(config.get_daemon_base_url())
+    try:
+        client.health()
+        return
+    except DaemonUnavailableError:
+        pass
+
+    _spawn_daemon_process(args)
+    _wait_for_daemon_ready(client, _DAEMON_START_TIMEOUT_SECONDS)
+
+
 def main():
     """Run the Zettelkasten MCP server."""
     args = parse_args()
@@ -129,6 +204,8 @@ def main():
             )
             daemon.serve_forever()
         else:
+            if config.backend_mode == "daemon":
+                ensure_daemon_running(args)
             logger.info("Starting Zettelkasten MCP server")
             server = ZettelkastenMcpServer()
             server.run(config.server_transport)

@@ -91,7 +91,9 @@ Use this for a single chat window or simple local development:
 
 ### Shared daemon mode
 
-1. Start one daemon:
+By default, daemon-backed MCP launches now auto-start the local daemon if it is not already running. Manual startup is only needed if you want explicit process control.
+
+1. Optional manual daemon startup:
 
 ```bash
 python -m parazettel_mcp.main \
@@ -155,7 +157,7 @@ You are probably still running in `direct` mode. Switch to shared daemon mode so
 
 ### `Parazettel daemon is unavailable`
 
-The MCP facade is configured for daemon mode but the daemon process is not running or is on the wrong host/port.
+The MCP facade is configured for daemon mode but could not reach or auto-start the daemon. Check host/port settings and whether another local process is already occupying the daemon port.
 
 ### `Could not set lock on file ... graph.kuzu`
 

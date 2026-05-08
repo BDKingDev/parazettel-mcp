@@ -182,7 +182,7 @@ For a single chat or development-only direct run, add this to your Claude Deskto
 }
 ```
 
-For multi-chat use, run one shared local daemon and point stdio MCP launches at that daemon:
+For multi-chat use, Parazettel can run one shared local daemon and point stdio MCP launches at that daemon. In normal daemon mode, the MCP facade now auto-starts the daemon if it is missing, so manual startup is optional.
 
 ```bash
 python -m parazettel_mcp.main \
@@ -237,7 +237,7 @@ python -m parazettel_mcp.main \
   --backend-mode direct
 ```
 
-To run the shared daemon:
+To run the shared daemon manually:
 
 ```bash
 python -m parazettel_mcp.main \
@@ -258,6 +258,8 @@ python -m parazettel_mcp.main \
 ```
 
 Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path for compatibility.
+
+In daemon mode, stdio MCP launches will first try the daemon health endpoint. If the daemon is not already running, Parazettel auto-starts it in the background and then connects to it. Manual daemon startup is still available when you want explicit process control.
 
 If you are migrating an existing vault from SQLite to Kuzu, use:
 

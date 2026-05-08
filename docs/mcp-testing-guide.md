@@ -11,7 +11,7 @@ Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each
 Pick the runtime mode you want to validate:
 
 - **Direct mode**: simplest for isolated local testing, but only one write-enabled process should own `graph.kuzu`.
-- **Daemon mode**: recommended for validating real multi-chat behavior. Start one local daemon, then point MCP clients at it with `PARAZETTEL_BACKEND_MODE=daemon`.
+- **Daemon mode**: recommended for validating real multi-chat behavior. MCP launches in daemon mode now auto-start the local daemon if needed, but you can still start it manually when you want explicit control.
 
 Example shared-daemon startup:
 

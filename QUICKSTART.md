@@ -35,7 +35,7 @@ export PARAZETTEL_DAEMON_PORT="8766"
 
 ## 4. Start the Shared Daemon
 
-If you want multiple chat windows, start this once:
+If you want multiple chat windows, daemon mode is recommended. In normal use the MCP facade now auto-starts the daemon if needed, so this manual startup is optional:
 
 ```bash
 python -m parazettel_mcp.main \
