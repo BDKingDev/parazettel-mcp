@@ -1017,7 +1017,7 @@ Returns notes *updated* on or after the start date, sorted by `updated_at`. Usef
 
 ### `pzk_rebuild_index`
 
-Rebuilds the SQLite index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped `.bak` backup of the SQLite database is created before the rebuild starts.
+Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped logical snapshot backup of the current graph database is created before the rebuild starts.
 
 **Call:** *(no parameters)*
 
@@ -1025,9 +1025,12 @@ Rebuilds the SQLite index from the Markdown files on disk. Use after manually ed
 
 ```
 Database index rebuilt successfully.
+Backup created: {BACKUP_PATH}
 Notes processed: N
 Change in note count: 0
 ```
+
+If the graph database file did not exist yet, the backup line will report that no backup was created.
 
 `Change in note count` will be non-zero only if `.md` files were added or removed outside the MCP server.
 

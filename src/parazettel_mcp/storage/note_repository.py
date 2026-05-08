@@ -1308,44 +1308,36 @@ class NoteRepository(Repository[Note]):
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""
         with self._connection() as conn:
-            all_ids = set(
-                _result_first_column(conn.execute("MATCH (n:Note) RETURN n.id AS id"))
+            result = conn.execute(
+                "MATCH (n:Note) "
+                "OPTIONAL MATCH (n)-[:LINKS_TO]->(out:Note) "
+                "WITH n, count(DISTINCT out) AS outgoing "
+                "OPTIONAL MATCH (incoming:Note)-[:LINKS_TO]->(n) "
+                "WITH n, outgoing, count(DISTINCT incoming) AS incoming "
+                "WHERE outgoing = 0 AND incoming = 0 "
+                "RETURN n.id AS id"
             )
-            linked = set(
-                _result_first_column(
-                    conn.execute(
-                        "MATCH (n:Note)-[:LINKS_TO]->(:Note) RETURN DISTINCT n.id AS id"
-                    )
-                )
-            )
-            linked.update(
-                _result_first_column(
-                    conn.execute(
-                        "MATCH (:Note)-[:LINKS_TO]->(n:Note) RETURN DISTINCT n.id AS id"
-                    )
-                )
-            )
-            return list(all_ids - linked)
+            return _result_first_column(result)
 
     def get_connection_counts(self, limit: int = 10) -> List[Tuple[str, int]]:
         """Return (note_id, connection_count) for the most-connected notes."""
         with self._connection() as conn:
-            out_result = conn.execute(
-                "MATCH (n:Note)-[:LINKS_TO]->(:Note) "
-                "RETURN n.id AS id, count(*) AS cnt"
-            )
-            in_result = conn.execute(
-                "MATCH (:Note)-[:LINKS_TO]->(n:Note) "
-                "RETURN n.id AS id, count(*) AS cnt"
+            result = conn.execute(
+                "MATCH (n:Note) "
+                "OPTIONAL MATCH (n)-[:LINKS_TO]->(out:Note) "
+                "WITH n, count(DISTINCT out) AS outgoing "
+                "OPTIONAL MATCH (incoming:Note)-[:LINKS_TO]->(n) "
+                "WITH n, outgoing, count(DISTINCT incoming) AS incoming "
+                "WITH n.id AS id, outgoing + incoming AS cnt "
+                "WHERE cnt > 0 "
+                "RETURN id, cnt "
+                "ORDER BY cnt DESC, id ASC "
+                "LIMIT $limit",
+                {"limit": limit},
             )
 
-            degree: Dict[str, int] = {}
-            while out_result.has_next():
-                row = out_result.get_next()
-                degree[row[0]] = degree.get(row[0], 0) + row[1]
-            while in_result.has_next():
-                row = in_result.get_next()
-                degree[row[0]] = degree.get(row[0], 0) + row[1]
-
-            ranked = sorted(degree.items(), key=lambda x: x[1], reverse=True)
-            return ranked[:limit]
+            ranked: List[Tuple[str, int]] = []
+            while result.has_next():
+                row = result.get_next()
+                ranked.append((row[0], row[1]))
+            return ranked
