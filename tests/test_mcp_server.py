@@ -70,6 +70,12 @@ class TestMcpServer:
         assert self.mock_zettel_service.initialize.called
         assert self.mock_search_service.initialize.called
 
+    def test_run_passes_transport_through_to_fastmcp(self):
+        """run() should pass the requested transport to FastMCP."""
+        self.server.run("sse")
+
+        self.mock_mcp.run.assert_called_once_with(transport="sse")
+
     def test_create_note_tool(self):
         """Test the pzk_create_note tool."""
         # Check the tool is registered

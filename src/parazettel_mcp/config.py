@@ -42,6 +42,15 @@ class ZettelkastenConfig(BaseModel):
         default=os.getenv("PARAZETTEL_SERVER_NAME", "parazettel")
     )
     server_version: str = Field(default="0.5.0")
+    server_transport: str = Field(
+        default=os.getenv("PARAZETTEL_MCP_TRANSPORT", "stdio")
+    )
+    server_host: str = Field(
+        default=os.getenv("PARAZETTEL_MCP_HOST", "127.0.0.1")
+    )
+    server_port: int = Field(
+        default=int(os.getenv("PARAZETTEL_MCP_PORT", "8765"))
+    )
     # Date format for ID generation (using ISO format for timestamps)
     id_date_format: str = Field(default="%Y%m%dT%H%M%S")
     # Default note template

@@ -27,7 +27,12 @@ class ZettelkastenMcpServer:
 
     def __init__(self):
         """Initialize the MCP server."""
-        self.mcp = FastMCP(config.server_name, version=config.server_version)
+        self.mcp = FastMCP(
+            config.server_name,
+            version=config.server_version,
+            host=config.server_host,
+            port=config.server_port,
+        )
         # Services
         self.zettel_service = ZettelService()
         self.search_service = SearchService(self.zettel_service)
@@ -1593,6 +1598,6 @@ class ZettelkastenMcpServer:
         # Currently, we don't define prompts for the Zettelkasten server
         pass
 
-    def run(self) -> None:
+    def run(self, transport: str = "stdio") -> None:
         """Run the MCP server."""
-        self.mcp.run()
+        self.mcp.run(transport=transport)

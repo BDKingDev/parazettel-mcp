@@ -29,9 +29,15 @@ def restore_config():
     """Restore global config mutations made by main/update_config tests."""
     original_notes_dir = config.notes_dir
     original_graph_db_path = config.graph_db_path
+    original_server_transport = config.server_transport
+    original_server_host = config.server_host
+    original_server_port = config.server_port
     yield
     config.notes_dir = original_notes_dir
     config.graph_db_path = original_graph_db_path
+    config.server_transport = original_server_transport
+    config.server_host = original_server_host
+    config.server_port = original_server_port
 
 
 def test_parse_args_reads_env_defaults(monkeypatch):
@@ -40,6 +46,9 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     monkeypatch.setenv("PARAZETTEL_GRAPH_DB_PATH", "env-graph.kuzu")
     monkeypatch.setenv("PARAZETTEL_DATABASE_PATH", "env-legacy.db")
     monkeypatch.setenv("PARAZETTEL_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("PARAZETTEL_MCP_TRANSPORT", "sse")
+    monkeypatch.setenv("PARAZETTEL_MCP_HOST", "0.0.0.0")
+    monkeypatch.setenv("PARAZETTEL_MCP_PORT", "9001")
     monkeypatch.setattr(sys, "argv", ["parazettel"])
 
     args = main_module.parse_args()
@@ -48,6 +57,9 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     assert args.graph_db_path == "env-graph.kuzu"
     assert args.database_path == "env-legacy.db"
     assert args.log_level == "DEBUG"
+    assert args.transport == "sse"
+    assert args.host == "0.0.0.0"
+    assert args.port == 9001
 
 
 def test_update_config_updates_paths():
@@ -57,12 +69,18 @@ def test_update_config_updates_paths():
         graph_db_path="custom-graph.kuzu",
         database_path=None,
         log_level="INFO",
+        transport="sse",
+        host="0.0.0.0",
+        port=9100,
     )
 
     main_module.update_config(args)
 
     assert str(config.notes_dir) == "custom-notes"
     assert str(config.graph_db_path) == "custom-graph.kuzu"
+    assert config.server_transport == "sse"
+    assert config.server_host == "0.0.0.0"
+    assert config.server_port == 9100
 
 
 def test_update_config_accepts_legacy_database_path_alias():
@@ -72,6 +90,9 @@ def test_update_config_accepts_legacy_database_path_alias():
         graph_db_path=None,
         database_path="custom-db/parazettel.db",
         log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
     )
 
     main_module.update_config(args)
@@ -79,6 +100,25 @@ def test_update_config_accepts_legacy_database_path_alias():
     assert str(config.graph_db_path).replace("\\", "/").endswith(
         "custom-db/graph.kuzu"
     )
+
+
+def test_update_config_accepts_sse_transport_settings():
+    """update_config should persist SSE transport host/port settings."""
+    args = argparse.Namespace(
+        notes_dir=None,
+        graph_db_path=None,
+        database_path=None,
+        log_level="INFO",
+        transport="sse",
+        host="127.0.0.1",
+        port=8766,
+    )
+
+    main_module.update_config(args)
+
+    assert config.server_transport == "sse"
+    assert config.server_host == "127.0.0.1"
+    assert config.server_port == 8766
 
 
 def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
@@ -89,6 +129,9 @@ def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
         notes_dir=str(notes_dir),
         graph_db_path=str(graph_db_path),
         log_level="DEBUG",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
     )
     server = MagicMock()
     setup_logging = MagicMock()
@@ -103,7 +146,7 @@ def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
     assert notes_dir.exists()
     setup_logging.assert_called_once_with("DEBUG")
     server_factory.assert_called_once_with()
-    server.run.assert_called_once_with()
+    server.run.assert_called_once_with("stdio")
     server.close.assert_called_once_with()
 
 
@@ -113,6 +156,9 @@ def test_main_exits_when_server_creation_fails(monkeypatch, workspace_temp_dir):
         notes_dir=str(workspace_temp_dir / "notes"),
         graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
         log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
     )
     setup_logging = MagicMock()
     server_factory = MagicMock(side_effect=RuntimeError("server init failed"))
@@ -135,6 +181,9 @@ def test_main_closes_server_when_run_fails(monkeypatch, workspace_temp_dir):
         notes_dir=str(workspace_temp_dir / "notes"),
         graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
         log_level="WARNING",
+        transport="sse",
+        host="127.0.0.1",
+        port=8765,
     )
     server = MagicMock()
     server.run.side_effect = RuntimeError("run failed")
@@ -149,5 +198,5 @@ def test_main_closes_server_when_run_fails(monkeypatch, workspace_temp_dir):
         main_module.main()
 
     assert excinfo.value.code == 1
-    server.run.assert_called_once_with()
+    server.run.assert_called_once_with("sse")
     server.close.assert_called_once_with()

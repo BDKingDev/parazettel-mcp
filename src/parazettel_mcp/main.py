@@ -38,6 +38,24 @@ def parse_args():
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default=os.environ.get("PARAZETTEL_LOG_LEVEL", "INFO"),
     )
+    parser.add_argument(
+        "--transport",
+        help="MCP transport to use",
+        choices=["stdio", "sse"],
+        default=os.environ.get("PARAZETTEL_MCP_TRANSPORT", "stdio"),
+    )
+    parser.add_argument(
+        "--host",
+        help="Host to bind when using SSE transport",
+        type=str,
+        default=os.environ.get("PARAZETTEL_MCP_HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--port",
+        help="Port to bind when using SSE transport",
+        type=int,
+        default=int(os.environ.get("PARAZETTEL_MCP_PORT", "8765")),
+    )
     return parser.parse_args()
 
 
@@ -53,6 +71,9 @@ def update_config(args):
             config.graph_db_path = legacy_path.with_name("graph.kuzu")
         else:
             config.graph_db_path = legacy_path
+    config.server_transport = args.transport
+    config.server_host = args.host
+    config.server_port = args.port
 
 
 def main():
@@ -74,7 +95,7 @@ def main():
     try:
         logger.info("Starting Zettelkasten MCP server")
         server = ZettelkastenMcpServer()
-        server.run()
+        server.run(config.server_transport)
     except Exception as e:
         logger.error(f"Error running server: {e}")
         sys.exit(1)
