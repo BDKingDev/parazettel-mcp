@@ -130,8 +130,32 @@ def _build_daemon_command(args: argparse.Namespace) -> list[str]:
     return command
 
 
+def _build_windows_daemon_bootstrap_command(
+    args: argparse.Namespace,
+) -> list[str]:
+    """Build a helper command that detaches the daemon from the MCP process tree."""
+    helper_code = (
+        "import subprocess, sys;"
+        "flags=("
+        "getattr(subprocess,'DETACHED_PROCESS',0)|"
+        "getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|"
+        "getattr(subprocess,'CREATE_NO_WINDOW',0)"
+        ");"
+        "subprocess.Popen("
+        "sys.argv[1:],"
+        "stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL,"
+        "stdin=subprocess.DEVNULL,"
+        "close_fds=True,"
+        "creationflags=flags"
+        ")"
+    )
+    return [sys.executable, "-c", helper_code, *_build_daemon_command(args)]
+
+
 def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:
     """Start the daemon in the background without blocking the MCP facade."""
+    command = _build_daemon_command(args)
     kwargs: dict[str, object] = {
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
@@ -139,6 +163,7 @@ def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:
         "close_fds": True,
     }
     if os.name == "nt":
+        command = _build_windows_daemon_bootstrap_command(args)
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -149,7 +174,7 @@ def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:
         startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         kwargs["creationflags"] = creationflags
         kwargs["startupinfo"] = startupinfo
-    return subprocess.Popen(_build_daemon_command(args), **kwargs)
+    return subprocess.Popen(command, **kwargs)
 
 
 def _wait_for_daemon_ready(client: DaemonRpcClient, timeout_seconds: float) -> None:

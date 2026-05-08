@@ -437,9 +437,16 @@ def test_spawn_daemon_process_hides_windows_console(monkeypatch):
 
     main_module._spawn_daemon_process(args)
 
+    assert captured["command"][0] == sys.executable
+    assert captured["command"][1] == "-c"
+    assert "--run-daemon" in captured["command"]
+    assert "parazettel_mcp.main" in captured["command"]
     creationflags = captured["kwargs"]["creationflags"]
     assert creationflags & getattr(main_module.subprocess, "DETACHED_PROCESS", 0)
     assert creationflags & getattr(
         main_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
     )
     assert creationflags & getattr(main_module.subprocess, "CREATE_NO_WINDOW", 0)
+    startupinfo = captured["kwargs"]["startupinfo"]
+    assert startupinfo.dwFlags & main_module.subprocess.STARTF_USESHOWWINDOW
+    assert startupinfo.wShowWindow == getattr(main_module.subprocess, "SW_HIDE", 0)
