@@ -1,8 +1,39 @@
 # MCP Testing Guide
 
-A complete walkthrough of all 26 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
+A complete walkthrough of all 30 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
 
 Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each creation call.
+
+---
+
+## Before You Start
+
+Pick the runtime mode you want to validate:
+
+- **Direct mode**: simplest for isolated local testing, but only one write-enabled process should own `graph.kuzu`.
+- **Daemon mode**: recommended for validating real multi-chat behavior. Start one local daemon, then point MCP clients at it with `PARAZETTEL_BACKEND_MODE=daemon`.
+
+Example shared-daemon startup:
+
+```bash
+python -m parazettel_mcp.main \
+  --run-daemon \
+  --notes-dir ./data/notes \
+  --graph-db-path ./data/db/graph.kuzu \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+Example daemon-backed MCP facade:
+
+```bash
+python -m parazettel_mcp.main \
+  --backend-mode daemon \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+For automated tests, continue using isolated temporary test data. Do not point integration tests at your real vault unless you intentionally want a live-vault check.
 
 ---
 
