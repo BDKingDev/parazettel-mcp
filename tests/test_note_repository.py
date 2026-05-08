@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from parazettel_mcp.config import config
+from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
 from parazettel_mcp.storage.note_repository import (
     NoteRepository,
@@ -775,6 +776,62 @@ def test_multiple_repositories_share_same_graph_path():
         shutil.rmtree(test_root, ignore_errors=True)
 
 
+def test_repository_falls_back_to_read_only_when_graph_db_locked(monkeypatch):
+    """A second process lock should degrade to read-only mode instead of failing init."""
+    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    notes_dir = test_root / "notes"
+    graph_db_path = test_root / "db" / "test_graph.kuzu"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_notes_dir = config.notes_dir
+    original_graph_db_path = config.graph_db_path
+    init_calls = []
+    close_calls = []
+    repository = None
+
+    def fake_init_graph_db(db_path: Path, read_only: bool = False):
+        init_calls.append((Path(db_path), read_only))
+        if not read_only:
+            raise RuntimeError(f"Could not set lock on file {db_path}")
+        return MagicMock(name="readonly_graph_db")
+
+    def fake_close_graph_db(db_path: Path, read_only: bool = False):
+        close_calls.append((Path(db_path), read_only))
+
+    try:
+        config.notes_dir = notes_dir
+        config.graph_db_path = graph_db_path
+        monkeypatch.setattr(
+            "parazettel_mcp.storage.note_repository.init_graph_db",
+            fake_init_graph_db,
+        )
+        monkeypatch.setattr(
+            "parazettel_mcp.storage.note_repository.close_graph_db",
+            fake_close_graph_db,
+        )
+        monkeypatch.setattr(
+            NoteRepository,
+            "rebuild_index_if_needed",
+            lambda self: pytest.fail("read-only fallback should skip rebuild checks"),
+        )
+
+        repository = NoteRepository(notes_dir=notes_dir)
+
+        assert repository.read_only is True
+        assert [read_only for _, read_only in init_calls] == [False, True]
+        assert init_calls[0][0].name == graph_db_path.name
+    finally:
+        if repository is not None:
+            repository.close()
+        config.notes_dir = original_notes_dir
+        config.graph_db_path = original_graph_db_path
+        shutil.rmtree(test_root, ignore_errors=True)
+
+    assert close_calls
+    assert close_calls[-1][1] is True
+
+
 def test_create_uses_graph_db_without_creating_legacy_sqlite():
     """Repository writes should index into Kuzu without creating the legacy SQLite DB."""
     test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
@@ -813,6 +870,22 @@ def test_create_uses_graph_db_without_creating_legacy_sqlite():
         config.graph_db_path = original_graph_db_path
         config.database_path = original_database_path
         shutil.rmtree(test_root, ignore_errors=True)
+
+
+def test_read_only_repository_rejects_create(note_repository):
+    """Mutating writes should fail fast in read-only graph mode."""
+    note_repository.read_only = True
+
+    with pytest.raises(GraphDatabaseReadOnlyError, match="read-only graph mode"):
+        note_repository.create(Note(title="Blocked Write", content="No writes"))
+
+
+def test_read_only_repository_rejects_rebuild(note_repository):
+    """Index rebuild should fail fast in read-only graph mode."""
+    note_repository.read_only = True
+
+    with pytest.raises(GraphDatabaseReadOnlyError, match="read-only graph mode"):
+        note_repository.rebuild_index()
 
 
 def test_create_leaves_no_tmp_file(note_repository):

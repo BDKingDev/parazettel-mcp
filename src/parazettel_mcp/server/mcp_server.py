@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 from parazettel_mcp.config import config
+from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import (
     LinkType,
     Note,
@@ -62,6 +63,10 @@ class ZettelkastenMcpServer:
         if isinstance(error, ValueError):
             # Domain validation errors - typically safe to show to users
             logger.error(f"Validation error [{error_id}]: {str(error)}")
+            return f"Error: {str(error)}"
+        elif isinstance(error, GraphDatabaseReadOnlyError):
+            # Read-only fallback errors are safe and actionable for users
+            logger.error(f"Read-only graph error [{error_id}]: {str(error)}")
             return f"Error: {str(error)}"
         elif isinstance(error, (IOError, OSError)):
             # File system errors - don't expose paths or detailed error messages

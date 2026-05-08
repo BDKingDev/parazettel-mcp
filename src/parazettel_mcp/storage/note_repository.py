@@ -26,7 +26,11 @@ import frontmatter
 import kuzu
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.graph_db import close_graph_db, init_graph_db
+from parazettel_mcp.models.graph_db import (
+    GraphDatabaseReadOnlyError,
+    close_graph_db,
+    init_graph_db,
+)
 from parazettel_mcp.models.schema import (
     Link,
     LinkType,
@@ -39,6 +43,12 @@ from parazettel_mcp.models.schema import (
 from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
+
+_GRAPH_LOCK_ERROR_MARKERS = (
+    "could not set lock on file",
+    "lock on file",
+    "resource temporarily unavailable",
+)
 
 # ---------------------------------------------------------------------------
 # Module-level LRU cache  {(path_str, mtime_ns): Note}
@@ -208,19 +218,47 @@ class NoteRepository(Repository[Note]):
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
         self.graph_db_path = config.get_graph_db_path()
-        self.db: Optional[kuzu.Database] = init_graph_db(self.graph_db_path)
+        self.read_only = False
+        self.db: Optional[kuzu.Database]
+        try:
+            self.db = init_graph_db(self.graph_db_path)
+        except Exception as exc:
+            if not self._is_graph_lock_error(exc):
+                raise
+            logger.warning(
+                "Graph DB at %s is already open elsewhere; falling back to read-only mode.",
+                self.graph_db_path,
+            )
+            self.db = init_graph_db(self.graph_db_path, read_only=True)
+            self.read_only = True
         self.file_lock = threading.RLock()
         self._closed = False
 
-        self.rebuild_index_if_needed()
+        if not self.read_only:
+            self.rebuild_index_if_needed()
 
     def close(self) -> None:
         """Release resources held by this repository."""
         if self._closed:
             return
-        close_graph_db(self.graph_db_path)
+        close_graph_db(self.graph_db_path, read_only=self.read_only)
         self.db = None
         self._closed = True
+
+    @staticmethod
+    def _is_graph_lock_error(exc: Exception) -> bool:
+        """Return True when an exception looks like a cross-process graph lock."""
+        message = str(exc).lower()
+        return any(marker in message for marker in _GRAPH_LOCK_ERROR_MARKERS)
+
+    def _assert_writable(self) -> None:
+        """Fail fast when a mutating operation is attempted in read-only mode."""
+        if self.read_only:
+            raise GraphDatabaseReadOnlyError(
+                "Parazettel is running in read-only graph mode because the database "
+                "is already open in another MCP session. Open only one write-enabled "
+                "chat at a time to create, update, delete, or rebuild notes."
+            )
 
     def _get_conn(self) -> kuzu.Connection:
         """Create a low-level Kuzu connection.
@@ -352,6 +390,7 @@ class NoteRepository(Repository[Note]):
         This guarantees that LINKS_TO edges are created even when the source
         note appears before the target note in filesystem order.
         """
+        self._assert_writable()
         backup_path = self._create_graph_backup()
         note_files = list(self.notes_dir.glob("*.md"))
 
@@ -976,6 +1015,7 @@ class NoteRepository(Repository[Note]):
 
     def create(self, note: Note) -> Note:
         """Create a new note."""
+        self._assert_writable()
         if not note.id:
             from parazettel_mcp.models.schema import generate_id
 
@@ -1028,6 +1068,7 @@ class NoteRepository(Repository[Note]):
 
     def update(self, note: Note) -> Note:
         """Update a note."""
+        self._assert_writable()
         return self._update_note(note)
 
     def update_preserving_updated_at(
@@ -1110,6 +1151,7 @@ class NoteRepository(Repository[Note]):
 
     def delete(self, id: str) -> None:
         """Delete a note by ID."""
+        self._assert_writable()
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             raise ValueError(f"Note with ID {id} does not exist")
