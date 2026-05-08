@@ -10,6 +10,7 @@ from typing import Any, Dict, Type
 from pydantic import BaseModel
 
 from parazettel_mcp.models.schema import Link, LinkType, Note, NoteSource, NoteStatus, NoteType, Tag
+from parazettel_mcp.services.search_service import SearchResult
 
 MODEL_REGISTRY: Dict[str, Type[BaseModel]] = {
     "Note": Note,
@@ -27,6 +28,16 @@ ENUM_REGISTRY: Dict[str, Type[Enum]] = {
 
 def encode_value(value: Any) -> Any:
     """Convert Python objects into JSON-safe tagged payloads."""
+    if isinstance(value, SearchResult):
+        return {
+            "__pz_type__": "search_result",
+            "data": {
+                "note": encode_value(value.note),
+                "score": value.score,
+                "matched_terms": sorted(value.matched_terms),
+                "matched_context": value.matched_context,
+            },
+        }
     if isinstance(value, BaseModel):
         return {
             "__pz_type__": "model",
@@ -76,4 +87,12 @@ def decode_value(value: Any) -> Any:
         return datetime.date.fromisoformat(value["value"])
     if marker == "tuple":
         return tuple(decode_value(item) for item in value["items"])
+    if marker == "search_result":
+        data = value["data"]
+        return SearchResult(
+            note=decode_value(data["note"]),
+            score=data["score"],
+            matched_terms=set(data["matched_terms"]),
+            matched_context=data["matched_context"],
+        )
     return {key: decode_value(item) for key, item in value.items()}

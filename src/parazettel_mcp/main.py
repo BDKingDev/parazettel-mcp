@@ -142,9 +142,11 @@ def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:
         creationflags = (
             getattr(subprocess, "DETACHED_PROCESS", 0)
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
         kwargs["creationflags"] = creationflags
         kwargs["startupinfo"] = startupinfo
     return subprocess.Popen(_build_daemon_command(args), **kwargs)

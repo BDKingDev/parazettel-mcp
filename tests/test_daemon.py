@@ -89,6 +89,33 @@ def test_daemon_client_round_trips_note_creation_and_lookup(daemon_server):
     assert fetched.title == "Daemon Created"
 
 
+def test_daemon_client_decodes_search_results(daemon_server):
+    """Search RPC results should decode back into SearchResult objects."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    area = _create_area(client)
+    created = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={
+            "title": "Daemon Search Decode",
+            "content": "Search through daemon-backed notes",
+            "note_type": NoteType.PERMANENT,
+            "source": NoteSource.MANUAL,
+            "area_id": area.id,
+        },
+    )
+
+    results = client.call(
+        "search_service",
+        "search_combined",
+        kwargs={"text": "Daemon Search Decode", "note_type": NoteType.PERMANENT},
+    )
+
+    assert results
+    assert results[0].note.id == created.id
+    assert results[0].score > 0
+
+
 def test_two_clients_share_one_daemon_without_db_lock(daemon_server):
     """Independent clients should observe shared writes through one daemon."""
     first = DaemonRpcClient(daemon_server.base_url)

@@ -409,3 +409,37 @@ def test_main_exits_when_daemon_backend_cannot_start(
 
     assert excinfo.value.code == 1
     spawn.assert_called_once()
+
+
+def test_spawn_daemon_process_hides_windows_console(monkeypatch):
+    """Windows daemon auto-start should use hidden detached process flags."""
+    args = argparse.Namespace(
+        notes_dir="notes",
+        graph_db_path="graph.kuzu",
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+    )
+    captured = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return MagicMock()
+
+    monkeypatch.setattr(main_module.subprocess, "Popen", fake_popen)
+
+    main_module._spawn_daemon_process(args)
+
+    creationflags = captured["kwargs"]["creationflags"]
+    assert creationflags & getattr(main_module.subprocess, "DETACHED_PROCESS", 0)
+    assert creationflags & getattr(
+        main_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    )
+    assert creationflags & getattr(main_module.subprocess, "CREATE_NO_WINDOW", 0)
