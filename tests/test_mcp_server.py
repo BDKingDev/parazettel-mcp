@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import LinkType, NoteSource, NoteStatus, NoteType
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
@@ -1697,6 +1698,11 @@ class TestMcpServer:
         read_only_error = GraphDatabaseReadOnlyError("Open only one write-enabled chat.")
         result = self.server.format_error_response(read_only_error)
         assert "Error: Open only one write-enabled chat." in result
+
+        # Test daemon-unavailable handling
+        daemon_error = DaemonUnavailableError("Parazettel daemon is unavailable.")
+        result = self.server.format_error_response(daemon_error)
+        assert "Error: Parazettel daemon is unavailable." in result
 
         # Test IOError handling
         io_error = IOError("File not found")

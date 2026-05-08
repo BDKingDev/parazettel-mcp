@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
 from parazettel_mcp.utils import setup_logging
 
@@ -56,6 +57,29 @@ def parse_args():
         type=int,
         default=int(os.environ.get("PARAZETTEL_MCP_PORT", "8765")),
     )
+    parser.add_argument(
+        "--backend-mode",
+        help="Backend mode for MCP tool execution",
+        choices=["direct", "daemon"],
+        default=os.environ.get("PARAZETTEL_BACKEND_MODE", "direct"),
+    )
+    parser.add_argument(
+        "--run-daemon",
+        help="Run the local Parazettel daemon instead of the MCP facade",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--daemon-host",
+        help="Host to bind the local Parazettel daemon",
+        type=str,
+        default=os.environ.get("PARAZETTEL_DAEMON_HOST", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--daemon-port",
+        help="Port to bind the local Parazettel daemon",
+        type=int,
+        default=int(os.environ.get("PARAZETTEL_DAEMON_PORT", "8766")),
+    )
     return parser.parse_args()
 
 
@@ -74,6 +98,9 @@ def update_config(args):
     config.server_transport = args.transport
     config.server_host = args.host
     config.server_port = args.port
+    config.backend_mode = args.backend_mode
+    config.daemon_host = args.daemon_host
+    config.daemon_port = args.daemon_port
 
 
 def main():
@@ -90,16 +117,27 @@ def main():
     graph_db_path = config.get_graph_db_path()
     logger.info(f"Using Kuzu graph database: {graph_db_path}")
 
-    # Create and run the MCP server
+    # Create and run the daemon or MCP facade
+    daemon = None
     server = None
     try:
-        logger.info("Starting Zettelkasten MCP server")
-        server = ZettelkastenMcpServer()
-        server.run(config.server_transport)
+        if args.run_daemon:
+            logger.info("Starting Parazettel daemon at %s", config.get_daemon_base_url())
+            daemon = ParazettelDaemonServer(
+                config.daemon_host,
+                config.daemon_port,
+            )
+            daemon.serve_forever()
+        else:
+            logger.info("Starting Zettelkasten MCP server")
+            server = ZettelkastenMcpServer()
+            server.run(config.server_transport)
     except Exception as e:
         logger.error(f"Error running server: {e}")
         sys.exit(1)
     finally:
+        if daemon is not None:
+            daemon.shutdown()
         if server is not None:
             server.close()
 

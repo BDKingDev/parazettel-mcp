@@ -32,12 +32,18 @@ def restore_config():
     original_server_transport = config.server_transport
     original_server_host = config.server_host
     original_server_port = config.server_port
+    original_backend_mode = config.backend_mode
+    original_daemon_host = config.daemon_host
+    original_daemon_port = config.daemon_port
     yield
     config.notes_dir = original_notes_dir
     config.graph_db_path = original_graph_db_path
     config.server_transport = original_server_transport
     config.server_host = original_server_host
     config.server_port = original_server_port
+    config.backend_mode = original_backend_mode
+    config.daemon_host = original_daemon_host
+    config.daemon_port = original_daemon_port
 
 
 def test_parse_args_reads_env_defaults(monkeypatch):
@@ -49,6 +55,9 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     monkeypatch.setenv("PARAZETTEL_MCP_TRANSPORT", "sse")
     monkeypatch.setenv("PARAZETTEL_MCP_HOST", "0.0.0.0")
     monkeypatch.setenv("PARAZETTEL_MCP_PORT", "9001")
+    monkeypatch.setenv("PARAZETTEL_BACKEND_MODE", "daemon")
+    monkeypatch.setenv("PARAZETTEL_DAEMON_HOST", "127.0.0.1")
+    monkeypatch.setenv("PARAZETTEL_DAEMON_PORT", "9101")
     monkeypatch.setattr(sys, "argv", ["parazettel"])
 
     args = main_module.parse_args()
@@ -60,6 +69,9 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     assert args.transport == "sse"
     assert args.host == "0.0.0.0"
     assert args.port == 9001
+    assert args.backend_mode == "daemon"
+    assert args.daemon_host == "127.0.0.1"
+    assert args.daemon_port == 9101
 
 
 def test_update_config_updates_paths():
@@ -72,6 +84,10 @@ def test_update_config_updates_paths():
         transport="sse",
         host="0.0.0.0",
         port=9100,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=9101,
     )
 
     main_module.update_config(args)
@@ -81,6 +97,9 @@ def test_update_config_updates_paths():
     assert config.server_transport == "sse"
     assert config.server_host == "0.0.0.0"
     assert config.server_port == 9100
+    assert config.backend_mode == "daemon"
+    assert config.daemon_host == "127.0.0.1"
+    assert config.daemon_port == 9101
 
 
 def test_update_config_accepts_legacy_database_path_alias():
@@ -93,6 +112,10 @@ def test_update_config_accepts_legacy_database_path_alias():
         transport="stdio",
         host="127.0.0.1",
         port=8765,
+        backend_mode="direct",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
     )
 
     main_module.update_config(args)
@@ -112,6 +135,10 @@ def test_update_config_accepts_sse_transport_settings():
         transport="sse",
         host="127.0.0.1",
         port=8766,
+        backend_mode="direct",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8767,
     )
 
     main_module.update_config(args)
@@ -119,6 +146,29 @@ def test_update_config_accepts_sse_transport_settings():
     assert config.server_transport == "sse"
     assert config.server_host == "127.0.0.1"
     assert config.server_port == 8766
+
+
+def test_update_config_accepts_daemon_settings():
+    """update_config should persist daemon backend host/port settings."""
+    args = argparse.Namespace(
+        notes_dir=None,
+        graph_db_path=None,
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8768,
+    )
+
+    main_module.update_config(args)
+
+    assert config.backend_mode == "daemon"
+    assert config.daemon_host == "127.0.0.1"
+    assert config.daemon_port == 8768
 
 
 def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
@@ -132,6 +182,10 @@ def test_main_initializes_and_runs_server(monkeypatch, workspace_temp_dir):
         transport="stdio",
         host="127.0.0.1",
         port=8765,
+        backend_mode="direct",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
     )
     server = MagicMock()
     setup_logging = MagicMock()
@@ -159,6 +213,10 @@ def test_main_exits_when_server_creation_fails(monkeypatch, workspace_temp_dir):
         transport="stdio",
         host="127.0.0.1",
         port=8765,
+        backend_mode="direct",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
     )
     setup_logging = MagicMock()
     server_factory = MagicMock(side_effect=RuntimeError("server init failed"))
@@ -184,6 +242,10 @@ def test_main_closes_server_when_run_fails(monkeypatch, workspace_temp_dir):
         transport="sse",
         host="127.0.0.1",
         port=8765,
+        backend_mode="direct",
+        run_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
     )
     server = MagicMock()
     server.run.side_effect = RuntimeError("run failed")
@@ -200,3 +262,33 @@ def test_main_closes_server_when_run_fails(monkeypatch, workspace_temp_dir):
     assert excinfo.value.code == 1
     server.run.assert_called_once_with("sse")
     server.close.assert_called_once_with()
+
+
+def test_main_runs_daemon_when_requested(monkeypatch, workspace_temp_dir):
+    """main should start the dedicated daemon instead of the MCP facade."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=True,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+    )
+    setup_logging = MagicMock()
+    daemon = MagicMock()
+    daemon_factory = MagicMock(return_value=daemon)
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", setup_logging)
+    monkeypatch.setattr(main_module, "ParazettelDaemonServer", daemon_factory)
+
+    main_module.main()
+
+    daemon_factory.assert_called_once_with("127.0.0.1", 8766)
+    daemon.serve_forever.assert_called_once_with()
+    daemon.shutdown.assert_called_once_with()

@@ -51,6 +51,15 @@ class ZettelkastenConfig(BaseModel):
     server_port: int = Field(
         default=int(os.getenv("PARAZETTEL_MCP_PORT", "8765"))
     )
+    backend_mode: str = Field(
+        default=os.getenv("PARAZETTEL_BACKEND_MODE", "direct")
+    )
+    daemon_host: str = Field(
+        default=os.getenv("PARAZETTEL_DAEMON_HOST", "127.0.0.1")
+    )
+    daemon_port: int = Field(
+        default=int(os.getenv("PARAZETTEL_DAEMON_PORT", "8766"))
+    )
     # Date format for ID generation (using ISO format for timestamps)
     id_date_format: str = Field(default="%Y%m%dT%H%M%S")
     # Default note template
@@ -88,6 +97,10 @@ class ZettelkastenConfig(BaseModel):
         db_path = self.get_absolute_path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path}"
+
+    def get_daemon_base_url(self) -> str:
+        """Get the localhost HTTP base URL for the Parazettel daemon."""
+        return f"http://{self.daemon_host}:{self.daemon_port}"
 
 
 # Create a global config instance

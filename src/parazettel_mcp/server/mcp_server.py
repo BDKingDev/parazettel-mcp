@@ -3,10 +3,15 @@
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.client import (
+    DaemonRpcClient,
+    DaemonUnavailableError,
+    RemoteServiceProxy,
+)
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import (
     LinkType,
@@ -22,6 +27,46 @@ from parazettel_mcp.services.zettel_service import ZettelService
 logger = logging.getLogger(__name__)
 
 
+class BackendBundle(Protocol):
+    """Service bundle contract for direct and daemon-backed MCP execution."""
+
+    zettel_service: Any
+    search_service: Any
+
+    def initialize(self) -> None: ...
+    def close(self) -> None: ...
+
+
+class DirectBackendBundle:
+    """Direct in-process service bundle."""
+
+    def __init__(self, zettel_service: ZettelService, search_service: SearchService):
+        self.zettel_service = zettel_service
+        self.search_service = search_service
+
+    def initialize(self) -> None:
+        self.zettel_service.initialize()
+        self.search_service.initialize()
+
+    def close(self) -> None:
+        self.zettel_service.close()
+
+
+class DaemonBackendBundle:
+    """Thin MCP bundle that proxies service calls through the local daemon."""
+
+    def __init__(self, base_url: str):
+        self.rpc_client = DaemonRpcClient(base_url)
+        self.zettel_service = RemoteServiceProxy(self.rpc_client, "zettel_service")
+        self.search_service = RemoteServiceProxy(self.rpc_client, "search_service")
+
+    def initialize(self) -> None:
+        self.rpc_client.health()
+
+    def close(self) -> None:
+        return None
+
+
 class ZettelkastenMcpServer:
     """MCP server for Zettelkasten."""
 
@@ -33,9 +78,9 @@ class ZettelkastenMcpServer:
             host=config.server_host,
             port=config.server_port,
         )
-        # Services
-        self.zettel_service = ZettelService()
-        self.search_service = SearchService(self.zettel_service)
+        self.backend = self._build_backend()
+        self.zettel_service = self.backend.zettel_service
+        self.search_service = self.backend.search_service
         # Initialize services
         self.initialize()
         # Register tools
@@ -43,15 +88,22 @@ class ZettelkastenMcpServer:
         self._register_resources()
         self._register_prompts()
 
+    def _build_backend(self) -> BackendBundle:
+        """Build direct or daemon-backed services based on config."""
+        if config.backend_mode == "daemon":
+            return DaemonBackendBundle(config.get_daemon_base_url())
+        zettel_service = ZettelService()
+        search_service = SearchService(zettel_service)
+        return DirectBackendBundle(zettel_service, search_service)
+
     def initialize(self) -> None:
         """Initialize services."""
-        self.zettel_service.initialize()
-        self.search_service.initialize()
+        self.backend.initialize()
         logger.info("Zettelkasten MCP server initialized")
 
     def close(self) -> None:
         """Release resources held by the MCP server."""
-        self.zettel_service.close()
+        self.backend.close()
 
     def format_error_response(self, error: Exception) -> str:
         """Format an error response in a consistent way.
@@ -68,6 +120,9 @@ class ZettelkastenMcpServer:
         if isinstance(error, ValueError):
             # Domain validation errors - typically safe to show to users
             logger.error(f"Validation error [{error_id}]: {str(error)}")
+            return f"Error: {str(error)}"
+        elif isinstance(error, DaemonUnavailableError):
+            logger.error(f"Daemon connectivity error [{error_id}]: {str(error)}")
             return f"Error: {str(error)}"
         elif isinstance(error, GraphDatabaseReadOnlyError):
             # Read-only fallback errors are safe and actionable for users
