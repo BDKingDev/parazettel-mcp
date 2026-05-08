@@ -109,10 +109,18 @@ def update_config(args):
     config.daemon_port = args.daemon_port
 
 
+def _get_windows_background_python() -> str:
+    """Prefer pythonw.exe for detached background launches on Windows."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if pythonw.exists():
+        return str(pythonw)
+    return sys.executable
+
+
 def _build_daemon_command(args: argparse.Namespace) -> list[str]:
     """Build the detached daemon launch command matching the current config."""
     command = [
-        sys.executable,
+        _get_windows_background_python() if os.name == "nt" else sys.executable,
         "-m",
         "parazettel_mcp.main",
         "--run-daemon",
@@ -150,7 +158,7 @@ def _build_windows_daemon_bootstrap_command(
         "creationflags=flags"
         ")"
     )
-    return [sys.executable, "-c", helper_code, *_build_daemon_command(args)]
+    return [_get_windows_background_python(), "-c", helper_code, *_build_daemon_command(args)]
 
 
 def _spawn_daemon_process(args: argparse.Namespace) -> subprocess.Popen:

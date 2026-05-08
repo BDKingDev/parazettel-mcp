@@ -433,14 +433,21 @@ def test_spawn_daemon_process_hides_windows_console(monkeypatch):
         captured["kwargs"] = kwargs
         return MagicMock()
 
+    fake_pythonw = "C:/tmp/fake-pythonw.exe"
+
     monkeypatch.setattr(main_module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(main_module.os, "name", "nt")
+    monkeypatch.setattr(
+        main_module, "_get_windows_background_python", lambda: fake_pythonw
+    )
 
     main_module._spawn_daemon_process(args)
 
-    assert captured["command"][0] == sys.executable
+    assert captured["command"][0] == fake_pythonw
     assert captured["command"][1] == "-c"
     assert "--run-daemon" in captured["command"]
     assert "parazettel_mcp.main" in captured["command"]
+    assert fake_pythonw in captured["command"]
     creationflags = captured["kwargs"]["creationflags"]
     assert creationflags & getattr(main_module.subprocess, "DETACHED_PROCESS", 0)
     assert creationflags & getattr(
