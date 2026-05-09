@@ -35,6 +35,10 @@ class DaemonRpcClient:
         """Fetch daemon health and status information."""
         return self._request_json("GET", "/health")
 
+    def shutdown(self) -> Dict[str, Any]:
+        """Ask the daemon to shut down cleanly."""
+        return self._request_json("POST", "/shutdown")
+
     def call(
         self,
         service: str,
@@ -84,7 +88,7 @@ class DaemonRpcClient:
             except json.JSONDecodeError:
                 raise RuntimeError(body or str(exc)) from exc
             self._raise_remote_error(payload.get("error", {}))
-        except error.URLError as exc:
+        except (error.URLError, OSError) as exc:
             raise DaemonUnavailableError(
                 "Parazettel daemon is unavailable. Start the local daemon or switch "
                 "back to direct mode."

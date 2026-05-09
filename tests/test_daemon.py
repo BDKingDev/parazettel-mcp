@@ -50,6 +50,7 @@ def test_daemon_health_reports_ready_state(daemon_server):
     assert health["mode"] == "daemon"
     assert health["graph_writable"] is True
     assert health["version"] == config.server_version
+    assert health["pid"] > 0
 
 
 def _create_area(client: DaemonRpcClient) -> Note:
@@ -116,6 +117,65 @@ def test_daemon_client_decodes_search_results(daemon_server):
     assert results[0].score > 0
 
 
+def test_daemon_client_can_rebuild_index(daemon_server):
+    """Rebuild RPC should succeed through the daemon and preserve notes."""
+    client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=30.0)
+    area = _create_area(client)
+    created = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={
+            "title": "Daemon Rebuild",
+            "content": "Survives a daemon rebuild",
+            "note_type": NoteType.PERMANENT,
+            "source": NoteSource.MANUAL,
+            "area_id": area.id,
+        },
+    )
+
+    backup_path = client.call("zettel_service", "rebuild_index")
+    fetched = client.call("zettel_service", "get_note", args=[created.id])
+
+    assert backup_path is not None
+    assert fetched is not None
+    assert fetched.id == created.id
+
+
+def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
+    """Maintenance-mode rebuilds should reject concurrent RPC calls cleanly."""
+    rebuild_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=5.0)
+    other_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=1.0)
+    started = threading.Event()
+    release = threading.Event()
+    result_holder = {}
+
+    def slow_rebuild():
+        started.set()
+        assert release.wait(timeout=5.0)
+        return None
+
+    monkeypatch.setattr(daemon_server.zettel_service, "rebuild_index", slow_rebuild)
+
+    thread = threading.Thread(
+        target=lambda: result_holder.setdefault(
+            "result", rebuild_client.call("zettel_service", "rebuild_index")
+        ),
+        daemon=True,
+    )
+    thread.start()
+    assert started.wait(timeout=5.0)
+
+    health = rebuild_client.health()
+    assert health["maintenance_reason"] == "rebuild_index"
+
+    with pytest.raises(RuntimeError, match="busy with rebuild_index"):
+        other_client.call("zettel_service", "get_all_tags")
+
+    release.set()
+    thread.join(timeout=5.0)
+    assert result_holder["result"] is None
+
+
 def test_two_clients_share_one_daemon_without_db_lock(daemon_server):
     """Independent clients should observe shared writes through one daemon."""
     first = DaemonRpcClient(daemon_server.base_url)
@@ -145,6 +205,61 @@ def test_daemon_client_reports_connection_failures_cleanly():
 
     with pytest.raises(DaemonUnavailableError, match="daemon is unavailable"):
         client.health()
+
+
+def test_daemon_shutdown_endpoint_stops_server(daemon_server):
+    """The daemon should expose a clean shutdown endpoint for lifecycle management."""
+    client = DaemonRpcClient(daemon_server.base_url)
+
+    response = client.shutdown()
+
+    assert response["ok"] is True
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            client.health()
+        except DaemonUnavailableError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("Daemon did not stop after shutdown request")
+
+
+def test_daemon_idle_timeout_stops_unused_server(test_config):
+    """Idle daemon instances should shut themselves down after the configured timeout."""
+    server = ParazettelDaemonServer("127.0.0.1", 0, idle_timeout_seconds=0.2)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            host, port = server.server_address
+            if port != 0:
+                break
+        except Exception:
+            pass
+        time.sleep(0.05)
+    else:
+        server.shutdown()
+        raise RuntimeError("Daemon server did not start in time")
+
+    client = DaemonRpcClient(server.base_url, timeout_seconds=0.2)
+    assert client.health()["ok"] is True
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            client.health()
+        except DaemonUnavailableError:
+            break
+        time.sleep(0.05)
+    else:
+        server.shutdown()
+        raise AssertionError("Idle daemon did not stop in time")
+
+    thread.join(timeout=5)
 
 
 def test_mcp_server_uses_daemon_backend_when_configured(
@@ -197,3 +312,55 @@ def test_mcp_server_uses_daemon_backend_when_configured(
             config.daemon_host = original_daemon_host
             config.daemon_port = original_daemon_port
             config.server_transport = original_transport
+
+
+def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch):
+    """Daemon-backed MCP should keep health checks short without starving RPC calls."""
+    original_backend_mode = config.backend_mode
+    original_daemon_host = config.daemon_host
+    original_daemon_port = config.daemon_port
+    original_transport = config.server_transport
+    original_rpc_timeout = config.daemon_rpc_timeout_seconds
+    client_calls = []
+    mock_mcp = MagicMock()
+
+    def fake_tool_decorator(*args, **kwargs):
+        def wrapper(func):
+            return func
+
+        return wrapper
+
+    mock_mcp.tool = fake_tool_decorator
+
+    class FakeClient:
+        def __init__(self, base_url: str, timeout_seconds: float = 5.0):
+            client_calls.append((base_url, timeout_seconds))
+
+        def health(self):
+            return {"ok": True}
+
+    config.backend_mode = "daemon"
+    config.daemon_host = "127.0.0.1"
+    config.daemon_port = 8766
+    config.server_transport = "stdio"
+    config.daemon_rpc_timeout_seconds = 123.0
+
+    monkeypatch.setattr(
+        "parazettel_mcp.server.mcp_server.FastMCP",
+        lambda *args, **kwargs: mock_mcp,
+    )
+    monkeypatch.setattr("parazettel_mcp.server.mcp_server.DaemonRpcClient", FakeClient)
+
+    server = ZettelkastenMcpServer()
+    try:
+        assert client_calls == [
+            ("http://127.0.0.1:8766", 5.0),
+            ("http://127.0.0.1:8766", 123.0),
+        ]
+    finally:
+        server.close()
+        config.backend_mode = original_backend_mode
+        config.daemon_host = original_daemon_host
+        config.daemon_port = original_daemon_port
+        config.server_transport = original_transport
+        config.daemon_rpc_timeout_seconds = original_rpc_timeout

@@ -143,7 +143,7 @@ All tools are prefixed `pzk_`.
 1. **Markdown files** — source of truth. Human-readable, version-controllable, directly editable. Each note is `{id}.md` with YAML frontmatter.
 2. **Kuzu graph database** — indexing and traversal layer. Used for search, link traversal, and PARA/GTD routing queries. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
 
-> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped logical snapshot backup of the graph database before clearing and rebuilding it.
+> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database before clearing and rebuilding it. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
 >
 > **Obsidian aliases:** piped wiki links like `[[20260322T181907454570000|Habits and Habit Creation]]` are normalized to the underlying note ID during reads and index rebuilds.
 
@@ -212,6 +212,23 @@ Then configure the MCP entry to proxy through it:
 }
 ```
 
+Daemon lifecycle commands:
+
+```bash
+# See whether the managed daemon is healthy and which PID it owns
+python -m parazettel_mcp.main --daemon-status
+
+# Stop the managed daemon cleanly
+python -m parazettel_mcp.main --stop-daemon
+```
+
+If you want the daemon to shut itself down after inactivity, set:
+
+- `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS`
+- or `--daemon-idle-timeout`
+
+An idle timeout is the safest approximation to “close the daemon once all sessions are gone,” because one chat closing should not kill the daemon while another chat is still using it.
+
 ### Connecting to Claude Code (CLI)
 
 Add the same entry to `~/.claude.json` under `mcpServers`.
@@ -228,6 +245,7 @@ Key runtime settings:
 - `PARAZETTEL_BACKEND_MODE` / `--backend-mode`: `direct` or `daemon`
 - `PARAZETTEL_DAEMON_HOST` / `--daemon-host`: local daemon bind/connect host
 - `PARAZETTEL_DAEMON_PORT` / `--daemon-port`: local daemon bind/connect port
+- `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` / `--daemon-idle-timeout`: optional idle shutdown window for the daemon
 - `PARAZETTEL_MCP_TRANSPORT` / `--transport`: MCP transport, `stdio` or `sse`
 
 ```bash
@@ -260,6 +278,13 @@ python -m parazettel_mcp.main \
 Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path for compatibility.
 
 In daemon mode, stdio MCP launches will first try the daemon health endpoint. If the daemon is not already running, Parazettel auto-starts it in the background and then connects to it. Manual daemon startup is still available when you want explicit process control.
+
+You can inspect or stop the managed daemon at any time:
+
+```bash
+python -m parazettel_mcp.main --daemon-status
+python -m parazettel_mcp.main --stop-daemon
+```
 
 If you are migrating an existing vault from SQLite to Kuzu, use:
 

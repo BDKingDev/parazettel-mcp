@@ -48,6 +48,7 @@ For shared-daemon mode, also configure:
 export PARAZETTEL_BACKEND_MODE="daemon"
 export PARAZETTEL_DAEMON_HOST="127.0.0.1"
 export PARAZETTEL_DAEMON_PORT="8766"
+export PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS="1800"
 ```
 
 Legacy compatibility:
@@ -127,6 +128,18 @@ python -m parazettel_mcp.main \
 
 This is the recommended setup when you want multiple chat windows to use Parazettel at the same time.
 
+Daemon lifecycle commands:
+
+```bash
+# Check whether the managed daemon is healthy and which PID it owns
+python -m parazettel_mcp.main --daemon-status
+
+# Stop the managed daemon cleanly
+python -m parazettel_mcp.main --stop-daemon
+```
+
+If you want the daemon to shut itself down when it has been unused for a while, keep `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` set to a non-zero value. That is safer than tying shutdown directly to one editor session closing.
+
 ## Step 6: Verify Installation
 
 Start your MCP client and verify the server is visible. Parazettel currently exposes `30` tools.
@@ -157,7 +170,7 @@ You are probably still running in `direct` mode. Switch to shared daemon mode so
 
 ### `Parazettel daemon is unavailable`
 
-The MCP facade is configured for daemon mode but could not reach or auto-start the daemon. Check host/port settings and whether another local process is already occupying the daemon port.
+The MCP facade is configured for daemon mode but could not reach or auto-start the daemon. Check host/port settings and whether another local process is already occupying the daemon port. `python -m parazettel_mcp.main --daemon-status` is the fastest way to verify the current daemon state.
 
 ### `Could not set lock on file ... graph.kuzu`
 

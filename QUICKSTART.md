@@ -31,6 +31,7 @@ For shared daemon mode:
 export PARAZETTEL_BACKEND_MODE="daemon"
 export PARAZETTEL_DAEMON_HOST="127.0.0.1"
 export PARAZETTEL_DAEMON_PORT="8766"
+export PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS="1800"
 ```
 
 ## 4. Start the Shared Daemon
@@ -95,6 +96,12 @@ python -m parazettel_mcp.main --backend-mode direct
 # Run daemon-backed MCP process manually
 python -m parazettel_mcp.main --backend-mode daemon --daemon-host 127.0.0.1 --daemon-port 8766
 
+# Check daemon status
+python -m parazettel_mcp.main --daemon-status
+
+# Stop the managed daemon
+python -m parazettel_mcp.main --stop-daemon
+
 # Migrate an old SQLite-era vault
 python scripts/migrate_to_graphdb.py --notes-dir ./data/notes --graph-db-path ./data/db/graph.kuzu
 ```
@@ -102,7 +109,7 @@ python scripts/migrate_to_graphdb.py --notes-dir ./data/notes --graph-db-path ./
 ## If Something Fails
 
 - `graph.kuzu` lock errors: you are likely using multiple direct processes; use daemon mode.
-- daemon unavailable: start the daemon or fix `PARAZETTEL_DAEMON_HOST` / `PARAZETTEL_DAEMON_PORT`.
+- daemon unavailable: start the daemon or fix `PARAZETTEL_DAEMON_HOST` / `PARAZETTEL_DAEMON_PORT`. `python -m parazettel_mcp.main --daemon-status` is the quickest check.
 - old `.db` paths: switch to `PARAZETTEL_GRAPH_DB_PATH`, though `PARAZETTEL_DATABASE_PATH` is still accepted for compatibility.
 
 ## Next Docs

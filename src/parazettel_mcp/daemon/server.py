@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Set
 
@@ -13,6 +16,12 @@ from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
 
 logger = logging.getLogger(__name__)
+_IDLE_POLL_INTERVAL_SECONDS = 1.0
+
+
+class DaemonBusyError(RuntimeError):
+    """Raised when the daemon is in maintenance mode and cannot serve a request."""
+
 
 ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
     "zettel_service": {
@@ -70,6 +79,7 @@ class ParazettelDaemonServer:
         *,
         zettel_service: Optional[ZettelService] = None,
         search_service: Optional[SearchService] = None,
+        idle_timeout_seconds: Optional[float] = None,
     ):
         self.host = host
         self.port = port
@@ -77,6 +87,17 @@ class ParazettelDaemonServer:
         self.search_service = search_service or SearchService(self.zettel_service)
         self._initialized = False
         self._httpd: Optional[ThreadingHTTPServer] = None
+        self._closed = False
+        self._last_activity = time.monotonic()
+        self._idle_timeout_seconds = (
+            idle_timeout_seconds
+            if idle_timeout_seconds is not None
+            else config.daemon_idle_timeout_seconds
+        )
+        self._shutdown_event = threading.Event()
+        self._idle_monitor_thread: Optional[threading.Thread] = None
+        self._maintenance_state_lock = threading.Lock()
+        self._maintenance_reason: Optional[str] = None
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -97,6 +118,35 @@ class ParazettelDaemonServer:
         self.search_service.initialize()
         self._initialized = True
 
+    def _mark_activity(self) -> None:
+        """Record the latest daemon activity time."""
+        self._last_activity = time.monotonic()
+
+    def _start_idle_monitor(self) -> None:
+        """Start background idle shutdown monitoring when configured."""
+        if self._idle_timeout_seconds <= 0 or self._idle_monitor_thread is not None:
+            return
+
+        def monitor() -> None:
+            while not self._shutdown_event.wait(_IDLE_POLL_INTERVAL_SECONDS):
+                if self._httpd is None:
+                    return
+                idle_for = time.monotonic() - self._last_activity
+                if idle_for >= self._idle_timeout_seconds:
+                    logger.info(
+                        "Shutting down Parazettel daemon after %.1fs of inactivity",
+                        idle_for,
+                    )
+                    self.shutdown()
+                    return
+
+        self._idle_monitor_thread = threading.Thread(
+            target=monitor,
+            name="parazettel-daemon-idle-monitor",
+            daemon=True,
+        )
+        self._idle_monitor_thread.start()
+
     def serve_forever(self) -> None:
         """Start the daemon HTTP server and block until shutdown."""
         self.initialize()
@@ -104,6 +154,10 @@ class ParazettelDaemonServer:
             (self.host, self.port),
             self._build_handler(),
         )
+        self._closed = False
+        self._shutdown_event.clear()
+        self._mark_activity()
+        self._start_idle_monitor()
         logger.info("Starting Parazettel daemon at %s", self.base_url)
         try:
             self._httpd.serve_forever()
@@ -112,6 +166,7 @@ class ParazettelDaemonServer:
 
     def shutdown(self) -> None:
         """Stop the running HTTP server."""
+        self._shutdown_event.set()
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
@@ -120,6 +175,9 @@ class ParazettelDaemonServer:
 
     def close(self) -> None:
         """Release daemon-owned services."""
+        if self._closed:
+            return
+        self._closed = True
         self.zettel_service.close()
 
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -135,12 +193,30 @@ class ParazettelDaemonServer:
                             "version": config.server_version,
                             "mode": "daemon",
                             "graph_writable": not daemon.zettel_service.repository.read_only,
+                            "pid": os.getpid(),
+                            "port": daemon.server_address[1],
+                            "idle_timeout_seconds": daemon._idle_timeout_seconds,
+                            "pid_file": str(config.get_daemon_pid_file()),
+                            "maintenance_reason": daemon._maintenance_reason,
                         },
                     )
                     return
                 self._send_json(404, {"ok": False, "error": {"type": "NotFound", "message": "Unknown path"}})
 
             def do_POST(self) -> None:
+                daemon._mark_activity()
+                if self.path == "/shutdown":
+                    self._send_json(
+                        200,
+                        {"ok": True, "message": "Shutting down Parazettel daemon."},
+                    )
+                    threading.Thread(
+                        target=daemon.shutdown,
+                        name="parazettel-daemon-shutdown",
+                        daemon=True,
+                    ).start()
+                    return
+
                 segments = self.path.strip("/").split("/")
                 if len(segments) != 3 or segments[0] != "rpc":
                     self._send_json(
@@ -171,6 +247,9 @@ class ParazettelDaemonServer:
                     result = daemon._invoke(service_name, method_name, args, kwargs)
                 except ValueError as exc:
                     self._send_error_json(400, exc)
+                    return
+                except DaemonBusyError as exc:
+                    self._send_error_json(503, exc)
                     return
                 except Exception as exc:  # noqa: BLE001
                     status = 400 if exc.__class__.__name__.endswith("Error") else 500
@@ -212,9 +291,35 @@ class ParazettelDaemonServer:
         args: list[Any],
         kwargs: Dict[str, Any],
     ) -> Any:
+        if method_name == "rebuild_index":
+            return self._invoke_with_maintenance_mode(
+                "rebuild_index",
+                lambda: self.zettel_service.rebuild_index(*args, **kwargs),
+            )
+        if self._maintenance_reason is not None:
+            raise DaemonBusyError(
+                f"Parazettel daemon is busy with {self._maintenance_reason}. "
+                "Try again after maintenance completes."
+            )
         service = {
             "zettel_service": self.zettel_service,
             "search_service": self.search_service,
         }[service_name]
         method = getattr(service, method_name)
         return method(*args, **kwargs)
+
+    def _invoke_with_maintenance_mode(
+        self, reason: str, callback: Any
+    ) -> Any:
+        with self._maintenance_state_lock:
+            if self._maintenance_reason is not None:
+                raise DaemonBusyError(
+                    f"Parazettel daemon is busy with {self._maintenance_reason}. "
+                    "Try again after maintenance completes."
+                )
+            self._maintenance_reason = reason
+        try:
+            return callback()
+        finally:
+            with self._maintenance_state_lock:
+                self._maintenance_reason = None

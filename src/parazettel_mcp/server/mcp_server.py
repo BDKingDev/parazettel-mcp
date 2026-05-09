@@ -26,6 +26,8 @@ from parazettel_mcp.services.zettel_service import ZettelService
 
 logger = logging.getLogger(__name__)
 
+_DAEMON_HEALTH_TIMEOUT_SECONDS = 5.0
+
 
 class BackendBundle(Protocol):
     """Service bundle contract for direct and daemon-backed MCP execution."""
@@ -56,12 +58,17 @@ class DaemonBackendBundle:
     """Thin MCP bundle that proxies service calls through the local daemon."""
 
     def __init__(self, base_url: str):
-        self.rpc_client = DaemonRpcClient(base_url)
+        self.health_client = DaemonRpcClient(
+            base_url, timeout_seconds=_DAEMON_HEALTH_TIMEOUT_SECONDS
+        )
+        self.rpc_client = DaemonRpcClient(
+            base_url, timeout_seconds=config.daemon_rpc_timeout_seconds
+        )
         self.zettel_service = RemoteServiceProxy(self.rpc_client, "zettel_service")
         self.search_service = RemoteServiceProxy(self.rpc_client, "search_service")
 
     def initialize(self) -> None:
-        self.rpc_client.health()
+        self.health_client.health()
 
     def close(self) -> None:
         return None

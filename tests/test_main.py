@@ -36,6 +36,8 @@ def restore_config():
     original_backend_mode = config.backend_mode
     original_daemon_host = config.daemon_host
     original_daemon_port = config.daemon_port
+    original_daemon_idle_timeout = config.daemon_idle_timeout_seconds
+    original_daemon_runtime_dir = config.daemon_runtime_dir
     yield
     config.notes_dir = original_notes_dir
     config.graph_db_path = original_graph_db_path
@@ -45,6 +47,8 @@ def restore_config():
     config.backend_mode = original_backend_mode
     config.daemon_host = original_daemon_host
     config.daemon_port = original_daemon_port
+    config.daemon_idle_timeout_seconds = original_daemon_idle_timeout
+    config.daemon_runtime_dir = original_daemon_runtime_dir
 
 
 def test_parse_args_reads_env_defaults(monkeypatch):
@@ -59,6 +63,7 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     monkeypatch.setenv("PARAZETTEL_BACKEND_MODE", "daemon")
     monkeypatch.setenv("PARAZETTEL_DAEMON_HOST", "127.0.0.1")
     monkeypatch.setenv("PARAZETTEL_DAEMON_PORT", "9101")
+    monkeypatch.setenv("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "60")
     monkeypatch.setattr(sys, "argv", ["parazettel"])
 
     args = main_module.parse_args()
@@ -73,6 +78,7 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     assert args.backend_mode == "daemon"
     assert args.daemon_host == "127.0.0.1"
     assert args.daemon_port == 9101
+    assert args.daemon_idle_timeout == 60
 
 
 def test_update_config_updates_paths():
@@ -89,6 +95,7 @@ def test_update_config_updates_paths():
         run_daemon=False,
         daemon_host="127.0.0.1",
         daemon_port=9101,
+        daemon_idle_timeout=120,
     )
 
     main_module.update_config(args)
@@ -101,6 +108,7 @@ def test_update_config_updates_paths():
     assert config.backend_mode == "daemon"
     assert config.daemon_host == "127.0.0.1"
     assert config.daemon_port == 9101
+    assert config.daemon_idle_timeout_seconds == 120
 
 
 def test_update_config_accepts_legacy_database_path_alias():
@@ -290,7 +298,9 @@ def test_main_runs_daemon_when_requested(monkeypatch, workspace_temp_dir):
 
     main_module.main()
 
-    daemon_factory.assert_called_once_with("127.0.0.1", 8766)
+    daemon_factory.assert_called_once_with(
+        "127.0.0.1", 8766, idle_timeout_seconds=0.0
+    )
     daemon.serve_forever.assert_called_once_with()
     daemon.shutdown.assert_called_once_with()
 
@@ -409,6 +419,84 @@ def test_main_exits_when_daemon_backend_cannot_start(
 
     assert excinfo.value.code == 1
     spawn.assert_called_once()
+
+
+def test_main_reports_daemon_status(monkeypatch, capsys, workspace_temp_dir):
+    """main should render daemon status and exit without starting services."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_status=True,
+        stop_daemon=False,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+        daemon_idle_timeout=0,
+    )
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", lambda *_: None)
+    monkeypatch.setattr(
+        main_module,
+        "get_daemon_status",
+        lambda: {
+            "healthy": True,
+            "health": {
+                "pid": 1234,
+                "graph_writable": True,
+                "idle_timeout_seconds": 300,
+                "version": "0.5.0",
+            },
+            "pid": 1234,
+            "pid_running": True,
+            "pid_file": "daemon.pid",
+            "base_url": "http://127.0.0.1:8766",
+            "error": None,
+        },
+    )
+
+    main_module.main()
+
+    output = capsys.readouterr().out
+    assert "Parazettel daemon is running." in output
+    assert "PID: 1234" in output
+
+
+def test_main_stops_daemon_and_prints_result(monkeypatch, capsys, workspace_temp_dir):
+    """main should stop the daemon and print the shutdown result."""
+    args = argparse.Namespace(
+        notes_dir=str(workspace_temp_dir / "notes"),
+        graph_db_path=str(workspace_temp_dir / "db" / "test_graph.kuzu"),
+        database_path=None,
+        log_level="INFO",
+        transport="stdio",
+        host="127.0.0.1",
+        port=8765,
+        backend_mode="daemon",
+        run_daemon=False,
+        daemon_status=False,
+        stop_daemon=True,
+        daemon_host="127.0.0.1",
+        daemon_port=8766,
+        daemon_idle_timeout=0,
+    )
+
+    monkeypatch.setattr(main_module, "parse_args", lambda: args)
+    monkeypatch.setattr(main_module, "setup_logging", lambda *_: None)
+    monkeypatch.setattr(
+        main_module, "stop_daemon", lambda: "Parazettel daemon stopped."
+    )
+
+    main_module.main()
+
+    output = capsys.readouterr().out
+    assert "Parazettel daemon stopped." in output
 
 
 def test_spawn_daemon_process_hides_windows_console(monkeypatch):

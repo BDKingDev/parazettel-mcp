@@ -33,6 +33,15 @@ python -m parazettel_mcp.main \
   --daemon-port 8766
 ```
 
+Useful daemon lifecycle commands while testing:
+
+```bash
+python -m parazettel_mcp.main --daemon-status
+python -m parazettel_mcp.main --stop-daemon
+```
+
+If you want the daemon to shut itself down after inactivity during manual testing, set `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` or pass `--daemon-idle-timeout` when starting it manually.
+
 For automated tests, continue using isolated temporary test data. Do not point integration tests at your real vault unless you intentionally want a live-vault check.
 
 ---
@@ -1048,7 +1057,9 @@ Returns notes *updated* on or after the start date, sorted by `updated_at`. Usef
 
 ### `pzk_rebuild_index`
 
-Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped logical snapshot backup of the current graph database is created before the rebuild starts.
+Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped file snapshot backup of the current graph database is created before the rebuild starts.
+
+In daemon mode, rebuild runs as an explicit maintenance operation. Other chats and clients can still connect to the daemon, but normal RPC calls are rejected until the rebuild finishes.
 
 **Call:** *(no parameters)*
 

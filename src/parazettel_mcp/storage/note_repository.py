@@ -14,13 +14,14 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import frontmatter
 import kuzu
@@ -218,8 +219,23 @@ class NoteRepository(Repository[Note]):
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
         self.graph_db_path = config.get_graph_db_path()
+        self.file_lock = threading.RLock()
         self.read_only = False
-        self.db: Optional[kuzu.Database]
+        self.db: Optional[kuzu.Database] = None
+        self._closed = True
+        self._open_graph_db(allow_rebuild_if_needed=True)
+
+    def close(self) -> None:
+        """Release resources held by this repository."""
+        if self._closed:
+            return
+        close_graph_db(self.graph_db_path, read_only=self.read_only)
+        self.db = None
+        self._closed = True
+
+    def _open_graph_db(self, *, allow_rebuild_if_needed: bool) -> None:
+        """Open the configured graph DB, optionally running startup rebuild checks."""
+        self.read_only = False
         try:
             self.db = init_graph_db(self.graph_db_path)
         except Exception as exc:
@@ -231,19 +247,15 @@ class NoteRepository(Repository[Note]):
             )
             self.db = init_graph_db(self.graph_db_path, read_only=True)
             self.read_only = True
-        self.file_lock = threading.RLock()
         self._closed = False
 
-        if not self.read_only:
+        if allow_rebuild_if_needed and not self.read_only:
             self.rebuild_index_if_needed()
 
-    def close(self) -> None:
-        """Release resources held by this repository."""
-        if self._closed:
-            return
-        close_graph_db(self.graph_db_path, read_only=self.read_only)
-        self.db = None
-        self._closed = True
+    def _reopen_graph_db(self, *, allow_rebuild_if_needed: bool = False) -> None:
+        """Close and reopen the graph DB handle in-place."""
+        self.close()
+        self._open_graph_db(allow_rebuild_if_needed=allow_rebuild_if_needed)
 
     @staticmethod
     def _is_graph_lock_error(exc: Exception) -> bool:
@@ -340,32 +352,33 @@ class NoteRepository(Repository[Note]):
         return backup_path
 
     def _create_graph_backup(self) -> Optional[Path]:
-        """Create a logical snapshot backup of the current graph before rebuild."""
+        """Create a file snapshot backup of the current graph before rebuild."""
         graph_db_path = self.graph_db_path
         if not graph_db_path.exists():
             return None
 
         backup_path = self._build_graph_backup_path()
-        backup_db = init_graph_db(backup_path)
-        backup_conn = kuzu.Connection(backup_db)
-        try:
-            backup_conn.execute("MATCH (n:Note) DETACH DELETE n")
-            backup_conn.execute("MATCH (t:Tag) DETACH DELETE t")
+        companion_paths = sorted(
+            path
+            for path in graph_db_path.parent.glob(f"{graph_db_path.name}.*")
+            if path.is_file()
+        )
 
-            with self._connection() as conn:
-                id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
-                ids = _result_first_column(id_result)
-                for i in range(0, len(ids), _GRAPH_BATCH_SIZE):
-                    batch = self._fetch_notes_by_ids(
-                        conn, ids[i : i + _GRAPH_BATCH_SIZE]
-                    )
-                    for note in batch:
-                        self._index_note_nodes_only(note, backup_conn)
-                    for note in batch:
-                        self._index_note_relations(note, backup_conn)
+        # Kuzu's runtime temp files are cleaned up when the DB is closed. Take a
+        # short stop-the-world snapshot under daemon ownership rather than
+        # replaying the full graph into a second database.
+        self.close()
+        try:
+            shutil.copy2(graph_db_path, backup_path)
+            for companion_path in companion_paths:
+                if not companion_path.exists():
+                    continue
+                shutil.copy2(
+                    companion_path,
+                    backup_path.with_name(f"{backup_path.name}{companion_path.suffix}"),
+                )
         finally:
-            backup_conn.close()
-            close_graph_db(backup_path)
+            self._open_graph_db(allow_rebuild_if_needed=False)
 
         logger.info("Created graph database backup before reindex: %s", backup_path)
         return backup_path
@@ -393,35 +406,57 @@ class NoteRepository(Repository[Note]):
         self._assert_writable()
         backup_path = self._create_graph_backup()
         note_files = list(self.notes_dir.glob("*.md"))
+        notes: List[Note] = []
+
+        for file_path in note_files:
+            note = self._parse_rebuild_note(file_path)
+            if note is not None:
+                notes.append(note)
 
         with self._connection() as conn:
             conn.execute("MATCH (n:Note) DETACH DELETE n")
             conn.execute("MATCH (t:Tag) DETACH DELETE t")
 
-            # Pass 1: create all Note nodes and Tags (no relationships yet)
-            for file_path in note_files:
-                note = self._parse_rebuild_note(file_path)
-                if note is None:
-                    continue
-                self._index_note_nodes_only(note, conn)
+            self._ensure_tag_nodes(
+                conn, (tag.name for note in notes for tag in note.tags)
+            )
 
-            # Pass 2: create all relationships
-            for file_path in note_files:
-                note = self._parse_rebuild_note(file_path)
-                if note is None:
-                    continue
-                self._index_note_relations(note, conn)
+            # Pass 1: create all Note nodes and Tags (no relationships yet).
+            # The graph was just cleared, so every note is new in this pass.
+            for note in notes:
+                self._index_note_nodes_only(
+                    note, conn, assume_missing=True, ensure_tags=False
+                )
+
+            # Pass 2: create all relationships in chunked batches
+            for i in range(0, len(notes), _GRAPH_BATCH_SIZE):
+                self._index_note_relations_batch(
+                    notes[i : i + _GRAPH_BATCH_SIZE],
+                    conn,
+                    clear_existing=False,
+                )
 
         return backup_path
 
-    def _index_note_nodes_only(self, note: Note, conn: kuzu.Connection) -> None:
+    def _index_note_nodes_only(
+        self,
+        note: Note,
+        conn: kuzu.Connection,
+        *,
+        assume_missing: bool = False,
+        ensure_tags: bool = True,
+    ) -> None:
         """Create or update only the Note node and Tag nodes (no edges)."""
         params = self._note_params(note, note.content)
 
-        exists_result = conn.execute(
-            "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
-        )
-        if exists_result.get_num_tuples() > 0:
+        if not assume_missing:
+            exists_result = conn.execute(
+                "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
+            )
+        else:
+            exists_result = None
+
+        if exists_result is not None and exists_result.get_num_tuples() > 0:
             update_params = {k: v for k, v in params.items() if k != "created_at"}
             conn.execute(
                 """
@@ -468,42 +503,118 @@ class NoteRepository(Repository[Note]):
                 params,
             )
 
-        for tag in note.tags:
-            conn.execute("MERGE (:Tag {name: $name})", {"name": tag.name})
+        if ensure_tags:
+            self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
 
-    def _index_note_relations(self, note: Note, conn: kuzu.Connection) -> None:
+    def _ensure_tag_nodes(
+        self, conn: kuzu.Connection, tag_names: Iterable[str]
+    ) -> None:
+        """Create tag nodes in one batched query, de-duping names first."""
+        unique_tag_names = list(dict.fromkeys(tag_names))
+        if not unique_tag_names:
+            return
+        conn.execute(
+            "UNWIND $tag_names AS tag_name MERGE (:Tag {name: tag_name})",
+            {"tag_names": unique_tag_names},
+        )
+
+    def _index_note_relations(
+        self,
+        note: Note,
+        conn: kuzu.Connection,
+        *,
+        clear_existing: bool = True,
+    ) -> None:
         """Create HAS_TAG and LINKS_TO relationships for a note."""
-        conn.execute(
-            "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r", {"id": note.id}
-        )
-        conn.execute(
-            "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r", {"id": note.id}
-        )
-        for tag in note.tags:
+        if clear_existing:
+            conn.execute(
+                "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r", {"id": note.id}
+            )
+            conn.execute(
+                "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r", {"id": note.id}
+            )
+
+        if note.tags:
             conn.execute(
                 """
-                MATCH (n:Note {id: $note_id}), (t:Tag {name: $tag_name})
+                UNWIND $tag_names AS tag_name
+                MATCH (n:Note {id: $note_id}), (t:Tag {name: tag_name})
                 CREATE (n)-[:HAS_TAG]->(t)
                 """,
-                {"note_id": note.id, "tag_name": tag.name},
+                {
+                    "note_id": note.id,
+                    "tag_names": [tag.name for tag in note.tags],
+                },
             )
-        for link in note.links:
+
+    def _index_note_relations_batch(
+        self,
+        notes: List[Note],
+        conn: kuzu.Connection,
+        *,
+        clear_existing: bool = True,
+    ) -> None:
+        """Create HAS_TAG and LINKS_TO relationships for many notes at once."""
+        if not notes:
+            return
+
+        if clear_existing:
+            note_ids = [note.id for note in notes]
             conn.execute(
                 """
-                MATCH (s:Note {id: $source_id}), (t:Note {id: $target_id})
+                UNWIND $note_ids AS note_id
+                MATCH (n:Note {id: note_id})-[r:HAS_TAG]->()
+                DELETE r
+                """,
+                {"note_ids": note_ids},
+            )
+            conn.execute(
+                """
+                UNWIND $note_ids AS note_id
+                MATCH (n:Note {id: note_id})-[r:LINKS_TO]->()
+                DELETE r
+                """,
+                {"note_ids": note_ids},
+            )
+
+        tag_rows = [
+            {"note_id": note.id, "tag_name": tag.name}
+            for note in notes
+            for tag in note.tags
+        ]
+        if tag_rows:
+            conn.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (n:Note {id: row.note_id}), (t:Tag {name: row.tag_name})
+                CREATE (n)-[:HAS_TAG]->(t)
+                """,
+                {"rows": tag_rows},
+            )
+
+        link_rows = [
+            {
+                "source_id": note.id,
+                "target_id": link.target_id,
+                "link_type": link.link_type.value,
+                "description": link.description,
+                "created_at": link.created_at,
+            }
+            for note in notes
+            for link in note.links
+        ]
+        if link_rows:
+            conn.execute(
+                """
+                UNWIND $rows AS row
+                MATCH (s:Note {id: row.source_id}), (t:Note {id: row.target_id})
                 CREATE (s)-[:LINKS_TO {
-                    link_type: $link_type,
-                    description: $description,
-                    created_at: $created_at
+                    link_type: row.link_type,
+                    description: row.description,
+                    created_at: row.created_at
                 }]->(t)
                 """,
-                {
-                    "source_id": link.source_id,
-                    "target_id": link.target_id,
-                    "link_type": link.link_type.value,
-                    "description": link.description,
-                    "created_at": link.created_at,
-                },
+                {"rows": link_rows},
             )
 
     def _parse_note_from_markdown(self, content: str) -> Note:
@@ -854,34 +965,8 @@ class NoteRepository(Repository[Note]):
                     params,
                 )
 
-            for tag in note.tags:
-                conn.execute("MERGE (:Tag {name: $name})", {"name": tag.name})
-                conn.execute(
-                    """
-                    MATCH (n:Note {id: $note_id}), (t:Tag {name: $tag_name})
-                    CREATE (n)-[:HAS_TAG]->(t)
-                    """,
-                    {"note_id": note.id, "tag_name": tag.name},
-                )
-
-            for link in note.links:
-                conn.execute(
-                    """
-                    MATCH (s:Note {id: $source_id}), (t:Note {id: $target_id})
-                    CREATE (s)-[:LINKS_TO {
-                        link_type: $link_type,
-                        description: $description,
-                        created_at: $created_at
-                    }]->(t)
-                    """,
-                    {
-                        "source_id": link.source_id,
-                        "target_id": link.target_id,
-                        "link_type": link.link_type.value,
-                        "description": link.description,
-                        "created_at": link.created_at,
-                    },
-                )
+            self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
+            self._index_note_relations(note, conn, clear_existing=node_exists)
 
     def _fetch_notes_by_ids(
         self, conn: kuzu.Connection, ids: List[str]

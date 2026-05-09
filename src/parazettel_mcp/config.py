@@ -1,6 +1,7 @@
 """Configuration module for the Zettelkasten MCP server."""
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -41,7 +42,7 @@ class ZettelkastenConfig(BaseModel):
     server_name: str = Field(
         default=os.getenv("PARAZETTEL_SERVER_NAME", "parazettel")
     )
-    server_version: str = Field(default="0.5.0")
+    server_version: str = Field(default="0.5.1")
     server_transport: str = Field(
         default=os.getenv("PARAZETTEL_MCP_TRANSPORT", "stdio")
     )
@@ -59,6 +60,20 @@ class ZettelkastenConfig(BaseModel):
     )
     daemon_port: int = Field(
         default=int(os.getenv("PARAZETTEL_DAEMON_PORT", "8766"))
+    )
+    daemon_rpc_timeout_seconds: float = Field(
+        default=float(os.getenv("PARAZETTEL_DAEMON_RPC_TIMEOUT_SECONDS", "300"))
+    )
+    daemon_idle_timeout_seconds: float = Field(
+        default=float(os.getenv("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "0"))
+    )
+    daemon_runtime_dir: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "PARAZETTEL_DAEMON_RUNTIME_DIR",
+                str(Path(tempfile.gettempdir()) / "parazettel-daemon"),
+            )
+        )
     )
     # Date format for ID generation (using ISO format for timestamps)
     id_date_format: str = Field(default="%Y%m%dT%H%M%S")
@@ -101,6 +116,16 @@ class ZettelkastenConfig(BaseModel):
     def get_daemon_base_url(self) -> str:
         """Get the localhost HTTP base URL for the Parazettel daemon."""
         return f"http://{self.daemon_host}:{self.daemon_port}"
+
+    def get_daemon_runtime_dir(self) -> Path:
+        """Get the runtime directory used for daemon metadata like PID files."""
+        runtime_dir = self.get_absolute_path(self.daemon_runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        return runtime_dir
+
+    def get_daemon_pid_file(self) -> Path:
+        """Get the PID file path for the managed local daemon."""
+        return self.get_daemon_runtime_dir() / "daemon.pid"
 
 
 # Create a global config instance
