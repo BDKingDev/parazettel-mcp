@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import parazettel_mcp.main as main_module
+from parazettel_mcp import __version__
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 
@@ -451,7 +452,7 @@ def test_main_reports_daemon_status(monkeypatch, capsys, workspace_temp_dir):
                 "pid": 1234,
                 "graph_writable": True,
                 "idle_timeout_seconds": 300,
-                "version": "0.5.0",
+                "version": __version__,
             },
             "pid": 1234,
             "pid_running": True,

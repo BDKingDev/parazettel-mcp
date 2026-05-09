@@ -8,6 +8,8 @@ from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+from parazettel_mcp import get_version
+
 # Load caller-specific .env first, then fill any missing values from the repo-root .env.
 load_dotenv()
 _REPO_ENV_PATH = Path(__file__).parent.parent.parent / ".env"
@@ -42,7 +44,7 @@ class ZettelkastenConfig(BaseModel):
     server_name: str = Field(
         default=os.getenv("PARAZETTEL_SERVER_NAME", "parazettel")
     )
-    server_version: str = Field(default="0.5.1")
+    server_version: str = Field(default_factory=get_version)
     server_transport: str = Field(
         default=os.getenv("PARAZETTEL_MCP_TRANSPORT", "stdio")
     )
