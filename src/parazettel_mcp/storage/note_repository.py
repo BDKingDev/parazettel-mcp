@@ -547,6 +547,31 @@ class NoteRepository(Repository[Note]):
                 },
             )
 
+        if note.links:
+            conn.execute(
+                """
+                UNWIND $links AS link
+                MATCH (s:Note {id: $source_id}), (t:Note {id: link.target_id})
+                CREATE (s)-[:LINKS_TO {
+                    link_type: link.link_type,
+                    description: link.description,
+                    created_at: link.created_at
+                }]->(t)
+                """,
+                {
+                    "source_id": note.id,
+                    "links": [
+                        {
+                            "target_id": link.target_id,
+                            "link_type": link.link_type.value,
+                            "description": link.description,
+                            "created_at": link.created_at,
+                        }
+                        for link in note.links
+                    ],
+                },
+            )
+
     def _index_note_relations_batch(
         self,
         notes: List[Note],

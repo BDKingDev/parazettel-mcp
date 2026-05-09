@@ -90,6 +90,79 @@ def test_daemon_client_round_trips_note_creation_and_lookup(daemon_server):
     assert fetched.title == "Daemon Created"
 
 
+def test_daemon_task_queries_reflect_live_task_writes(daemon_server):
+    """Task queries should see new and reassigned tasks without requiring rebuild."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    area = _create_area(client)
+    primary_project = client.call(
+        "zettel_service",
+        "create_project_note",
+        kwargs={
+            "title": "Daemon Task Project",
+            "content": "Primary project",
+            "area_id": area.id,
+            "source": NoteSource.MANUAL,
+        },
+    )
+    secondary_project = client.call(
+        "zettel_service",
+        "create_project_note",
+        kwargs={
+            "title": "Daemon Reassigned Project",
+            "content": "Secondary project",
+            "area_id": area.id,
+            "source": NoteSource.MANUAL,
+        },
+    )
+
+    task = client.call(
+        "zettel_service",
+        "create_task",
+        kwargs={
+            "title": "Daemon Visible Task",
+            "content": "Should appear immediately in task queries",
+            "project_id": primary_project.id,
+            "status": "ready",
+            "source": NoteSource.MANUAL,
+        },
+    )
+
+    fetched_tasks = client.call(
+        "zettel_service",
+        "get_tasks",
+        kwargs={"project_id": primary_project.id},
+    )
+    project_tasks = client.call(
+        "zettel_service",
+        "get_project_tasks",
+        args=[primary_project.id],
+    )
+
+    assert any(found.id == task.id for found in fetched_tasks)
+    assert any(found.id == task.id for found in project_tasks)
+
+    updated = client.call(
+        "zettel_service",
+        "update_task",
+        kwargs={"note_id": task.id, "project_id": secondary_project.id},
+    )
+    assert updated.project_id == secondary_project.id
+
+    old_project_tasks = client.call(
+        "zettel_service",
+        "get_project_tasks",
+        args=[primary_project.id],
+    )
+    new_project_tasks = client.call(
+        "zettel_service",
+        "get_project_tasks",
+        args=[secondary_project.id],
+    )
+
+    assert all(found.id != task.id for found in old_project_tasks)
+    assert any(found.id == task.id for found in new_project_tasks)
+
+
 def test_daemon_client_decodes_search_results(daemon_server):
     """Search RPC results should decode back into SearchResult objects."""
     client = DaemonRpcClient(daemon_server.base_url)
@@ -139,6 +212,70 @@ def test_daemon_client_can_rebuild_index(daemon_server):
     assert backup_path is not None
     assert fetched is not None
     assert fetched.id == created.id
+
+
+def test_daemon_link_queries_reflect_live_note_links(daemon_server):
+    """Linked-note and orphan queries should reflect note updates without rebuild."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    area = _create_area(client)
+    source = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={
+            "title": "Daemon Link Source",
+            "content": "Source note",
+            "note_type": NoteType.PERMANENT,
+            "source": NoteSource.MANUAL,
+            "area_id": area.id,
+        },
+    )
+    target = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={
+            "title": "Daemon Link Target",
+            "content": "Target note",
+            "note_type": NoteType.PERMANENT,
+            "source": NoteSource.MANUAL,
+            "area_id": area.id,
+        },
+    )
+
+    linked_before = client.call(
+        "zettel_service", "get_linked_notes", args=[source.id, "outgoing"]
+    )
+    orphaned_before = client.call("search_service", "find_orphaned_notes")
+    assert all(found.id != target.id for found in linked_before)
+    assert all(found.id != source.id for found in orphaned_before)
+    assert all(found.id != target.id for found in orphaned_before)
+
+    client.call(
+        "zettel_service",
+        "create_link",
+        kwargs={
+            "source_id": source.id,
+            "target_id": target.id,
+            "link_type": "reference",
+            "bidirectional": True,
+        },
+    )
+
+    outgoing = client.call(
+        "zettel_service",
+        "get_linked_notes",
+        args=[source.id, "outgoing"],
+    )
+    incoming = client.call(
+        "zettel_service",
+        "get_linked_notes",
+        args=[target.id, "incoming"],
+    )
+    orphaned_after = client.call("search_service", "find_orphaned_notes")
+
+    assert any(found.id == target.id for found in outgoing)
+    assert any(found.id == source.id for found in incoming)
+    assert all(found.id != source.id for found in orphaned_after)
+    assert all(found.id != target.id for found in orphaned_after)
 
 
 def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
