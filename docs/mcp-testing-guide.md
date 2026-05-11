@@ -1,8 +1,48 @@
 # MCP Testing Guide
 
-A complete walkthrough of all 26 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
+A complete walkthrough of all 30 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
 
 Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each creation call.
+
+---
+
+## Before You Start
+
+Pick the runtime mode you want to validate:
+
+- **Direct mode**: simplest for isolated local testing, but only one write-enabled process should own `graph.kuzu`.
+- **Daemon mode**: recommended for validating real multi-chat behavior. MCP launches in daemon mode now auto-start the local daemon if needed, but you can still start it manually when you want explicit control.
+
+Example shared-daemon startup:
+
+```bash
+python -m parazettel_mcp.main \
+  --run-daemon \
+  --notes-dir ./data/notes \
+  --graph-db-path ./data/db/graph.kuzu \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+Example daemon-backed MCP facade:
+
+```bash
+python -m parazettel_mcp.main \
+  --backend-mode daemon \
+  --daemon-host 127.0.0.1 \
+  --daemon-port 8766
+```
+
+Useful daemon lifecycle commands while testing:
+
+```bash
+python -m parazettel_mcp.main --daemon-status
+python -m parazettel_mcp.main --stop-daemon
+```
+
+If you want the daemon to shut itself down after inactivity during manual testing, set `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` or pass `--daemon-idle-timeout` when starting it manually.
+
+For automated tests, continue using isolated temporary test data. Do not point integration tests at your real vault unless you intentionally want a live-vault check.
 
 ---
 
@@ -1017,7 +1057,9 @@ Returns notes *updated* on or after the start date, sorted by `updated_at`. Usef
 
 ### `pzk_rebuild_index`
 
-Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped logical snapshot backup of the current graph database is created before the rebuild starts.
+Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped file snapshot backup of the current graph database is created before the rebuild starts.
+
+In daemon mode, rebuild runs as an explicit maintenance operation. Other chats and clients can still connect to the daemon, but normal RPC calls are rejected until the rebuild finishes.
 
 **Call:** *(no parameters)*
 

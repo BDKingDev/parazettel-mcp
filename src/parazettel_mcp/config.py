@@ -1,11 +1,14 @@
 """Configuration module for the Zettelkasten MCP server."""
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+from parazettel_mcp import get_version
 
 # Load caller-specific .env first, then fill any missing values from the repo-root .env.
 load_dotenv()
@@ -25,7 +28,7 @@ class ZettelkastenConfig(BaseModel):
     notes_dir: Path = Field(
         default_factory=lambda: Path(os.getenv("PARAZETTEL_NOTES_DIR", "data/notes"))
     )
-    # Graph database configuration (Kuzu directory path)
+    # Graph database configuration (Kuzu database file path)
     graph_db_path: Path = Field(
         default_factory=lambda: Path(
             os.getenv("PARAZETTEL_GRAPH_DB_PATH", "data/db/graph.kuzu")
@@ -41,7 +44,39 @@ class ZettelkastenConfig(BaseModel):
     server_name: str = Field(
         default=os.getenv("PARAZETTEL_SERVER_NAME", "parazettel")
     )
-    server_version: str = Field(default="0.5.0")
+    server_version: str = Field(default_factory=get_version)
+    server_transport: str = Field(
+        default=os.getenv("PARAZETTEL_MCP_TRANSPORT", "stdio")
+    )
+    server_host: str = Field(
+        default=os.getenv("PARAZETTEL_MCP_HOST", "127.0.0.1")
+    )
+    server_port: int = Field(
+        default=int(os.getenv("PARAZETTEL_MCP_PORT", "8765"))
+    )
+    backend_mode: str = Field(
+        default=os.getenv("PARAZETTEL_BACKEND_MODE", "direct")
+    )
+    daemon_host: str = Field(
+        default=os.getenv("PARAZETTEL_DAEMON_HOST", "127.0.0.1")
+    )
+    daemon_port: int = Field(
+        default=int(os.getenv("PARAZETTEL_DAEMON_PORT", "8766"))
+    )
+    daemon_rpc_timeout_seconds: float = Field(
+        default=float(os.getenv("PARAZETTEL_DAEMON_RPC_TIMEOUT_SECONDS", "300"))
+    )
+    daemon_idle_timeout_seconds: float = Field(
+        default=float(os.getenv("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "0"))
+    )
+    daemon_runtime_dir: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv(
+                "PARAZETTEL_DAEMON_RUNTIME_DIR",
+                str(Path(tempfile.gettempdir()) / "parazettel-daemon"),
+            )
+        )
+    )
     # Date format for ID generation (using ISO format for timestamps)
     id_date_format: str = Field(default="%Y%m%dT%H%M%S")
     # Default note template
@@ -79,6 +114,20 @@ class ZettelkastenConfig(BaseModel):
         db_path = self.get_absolute_path(self.database_path)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         return f"sqlite:///{db_path}"
+
+    def get_daemon_base_url(self) -> str:
+        """Get the localhost HTTP base URL for the Parazettel daemon."""
+        return f"http://{self.daemon_host}:{self.daemon_port}"
+
+    def get_daemon_runtime_dir(self) -> Path:
+        """Get the runtime directory used for daemon metadata like PID files."""
+        runtime_dir = self.get_absolute_path(self.daemon_runtime_dir)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        return runtime_dir
+
+    def get_daemon_pid_file(self) -> Path:
+        """Get the PID file path for the managed local daemon."""
+        return self.get_daemon_runtime_dir() / "daemon.pid"
 
 
 # Create a global config instance

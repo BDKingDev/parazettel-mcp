@@ -30,12 +30,17 @@ _NOTE_FTS_INDEXES = {
 }
 
 
-def _db_cache_key(db_path: Path) -> str:
-    """Return a normalized cache key for a graph database path."""
-    return str(Path(db_path).expanduser().resolve())
+class GraphDatabaseReadOnlyError(RuntimeError):
+    """Raised when a mutating operation is attempted in read-only graph mode."""
 
 
-def init_graph_db(db_path: Path) -> kuzu.Database:
+def _db_cache_key(db_path: Path, read_only: bool = False) -> str:
+    """Return a normalized cache key for a graph database path and access mode."""
+    mode = "ro" if read_only else "rw"
+    return f"{Path(db_path).expanduser().resolve()}::{mode}"
+
+
+def init_graph_db(db_path: Path, read_only: bool = False) -> kuzu.Database:
     """Create (or open) the Kuzu database at *db_path* and ensure the schema exists.
 
     Args:
@@ -48,7 +53,7 @@ def init_graph_db(db_path: Path) -> kuzu.Database:
         An open :class:`kuzu.Database` instance.
     """
     db_path = Path(db_path).expanduser().resolve()
-    cache_key = _db_cache_key(db_path)
+    cache_key = _db_cache_key(db_path, read_only=read_only)
 
     with _DB_CACHE_LOCK:
         cached = _DB_CACHE.get(cache_key)
@@ -58,19 +63,20 @@ def init_graph_db(db_path: Path) -> kuzu.Database:
             return db
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        db = kuzu.Database(str(db_path))
-        conn = kuzu.Connection(db)
-        try:
-            _create_schema(conn)
-        finally:
-            conn.close()
+        db = kuzu.Database(str(db_path), read_only=read_only)
+        if not read_only:
+            conn = kuzu.Connection(db)
+            try:
+                _create_schema(conn)
+            finally:
+                conn.close()
         _DB_CACHE[cache_key] = (db, 1)
         return db
 
 
-def close_graph_db(db_path: Path) -> None:
+def close_graph_db(db_path: Path, read_only: bool = False) -> None:
     """Release a shared graph database handle for *db_path*."""
-    cache_key = _db_cache_key(db_path)
+    cache_key = _db_cache_key(db_path, read_only=read_only)
 
     with _DB_CACHE_LOCK:
         cached = _DB_CACHE.get(cache_key)

@@ -35,13 +35,22 @@ def test_config(temp_dirs):
     # Save original config values
     original_notes_dir = config.notes_dir
     original_graph_db_path = config.graph_db_path
+    original_backend_mode = config.backend_mode
+    original_daemon_host = config.daemon_host
+    original_daemon_port = config.daemon_port
     # Update config for tests
     config.notes_dir = notes_dir
     config.graph_db_path = graph_db_path
+    config.backend_mode = "direct"
+    config.daemon_host = "127.0.0.1"
+    config.daemon_port = 8766
     yield config
     # Restore original config
     config.notes_dir = original_notes_dir
     config.graph_db_path = original_graph_db_path
+    config.backend_mode = original_backend_mode
+    config.daemon_host = original_daemon_host
+    config.daemon_port = original_daemon_port
 
 
 @pytest.fixture
