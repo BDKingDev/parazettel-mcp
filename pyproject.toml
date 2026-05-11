@@ -18,6 +18,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]>=1.2.0",
+    "tomli; python_version < '3.11'",
     "kuzu>=0.7.0",
     "pydantic>=2.0.0",
     "python-frontmatter>=1.0.0",
