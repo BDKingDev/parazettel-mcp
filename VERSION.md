@@ -1,6 +1,6 @@
 # Version History
 
-## v0.5.1 (Current Release)
+## v0.5.1.1 (Current Release)
 
 **Release Date:** 2026-05-08
 
