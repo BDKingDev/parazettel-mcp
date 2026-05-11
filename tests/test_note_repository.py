@@ -652,6 +652,26 @@ def test_rebuild_index_repopulates_graph(note_repository):
     assert backup_path.exists()
 
 
+def test_create_graph_backup_copies_directory_snapshot(note_repository, tmp_path, monkeypatch):
+    """Directory-backed graph paths should be snapshotted with copytree."""
+    graph_dir = tmp_path / "graph.kuzu"
+    graph_dir.mkdir()
+    nested_file = graph_dir / "data.bin"
+    nested_file.write_text("graph-bytes", encoding="utf-8")
+
+    note_repository.graph_db_path = graph_dir
+    monkeypatch.setattr(note_repository, "close", lambda: None)
+    monkeypatch.setattr(
+        note_repository, "_open_graph_db", lambda allow_rebuild_if_needed=False: None
+    )
+
+    backup_path = note_repository._create_graph_backup()
+
+    assert backup_path is not None
+    assert backup_path.is_dir()
+    assert (backup_path / "data.bin").read_text(encoding="utf-8") == "graph-bytes"
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 data layer tests
 # ---------------------------------------------------------------------------

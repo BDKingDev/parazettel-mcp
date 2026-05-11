@@ -28,7 +28,7 @@ class ZettelkastenConfig(BaseModel):
     notes_dir: Path = Field(
         default_factory=lambda: Path(os.getenv("PARAZETTEL_NOTES_DIR", "data/notes"))
     )
-    # Graph database configuration (Kuzu directory path)
+    # Graph database configuration (Kuzu database file path)
     graph_db_path: Path = Field(
         default_factory=lambda: Path(
             os.getenv("PARAZETTEL_GRAPH_DB_PATH", "data/db/graph.kuzu")

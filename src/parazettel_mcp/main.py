@@ -31,7 +31,7 @@ def parse_args():
     )
     parser.add_argument(
         "--graph-db-path",
-        help="Kuzu graph database directory path",
+        help="Kuzu graph database file path",
         type=str,
         default=os.environ.get("PARAZETTEL_GRAPH_DB_PATH"),
     )
@@ -264,15 +264,17 @@ def _get_windows_background_python() -> str:
 
 def _build_daemon_command(args: argparse.Namespace) -> list[str]:
     """Build the detached daemon launch command matching the current config."""
+    absolute_notes_dir = config.get_absolute_path(config.notes_dir)
+    absolute_graph_db_path = config.get_graph_db_path()
     command = [
         _get_windows_background_python() if os.name == "nt" else sys.executable,
         "-m",
         "parazettel_mcp.main",
         "--run-daemon",
         "--notes-dir",
-        str(config.notes_dir),
+        str(absolute_notes_dir),
         "--graph-db-path",
-        str(config.graph_db_path),
+        str(absolute_graph_db_path),
         "--log-level",
         args.log_level,
         "--daemon-host",

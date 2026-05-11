@@ -53,6 +53,12 @@ def test_daemon_health_reports_ready_state(daemon_server):
     assert health["pid"] > 0
 
 
+def test_daemon_rejects_non_loopback_bind():
+    """The daemon should refuse non-loopback bind hosts."""
+    with pytest.raises(ValueError, match="loopback hosts"):
+        ParazettelDaemonServer("0.0.0.0", 8766)
+
+
 def _create_area(client: DaemonRpcClient) -> Note:
     """Create a valid area for routing daemon-created notes."""
     return client.call(

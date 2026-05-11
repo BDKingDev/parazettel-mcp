@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from typing import Any, Dict, Optional, Set
 
 from parazettel_mcp.config import config
@@ -17,6 +18,16 @@ from parazettel_mcp.services.zettel_service import ZettelService
 
 logger = logging.getLogger(__name__)
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Return True when *host* resolves to a local loopback address."""
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class DaemonBusyError(RuntimeError):
@@ -81,6 +92,11 @@ class ParazettelDaemonServer:
         search_service: Optional[SearchService] = None,
         idle_timeout_seconds: Optional[float] = None,
     ):
+        if not _is_loopback_host(host):
+            raise ValueError(
+                "Parazettel daemon only supports loopback hosts. "
+                f"Received: {host}"
+            )
         self.host = host
         self.port = port
         self.zettel_service = zettel_service or ZettelService()
@@ -184,7 +200,25 @@ class ParazettelDaemonServer:
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
+            def _ensure_loopback_client(self) -> bool:
+                client_host = self.client_address[0]
+                if _is_loopback_host(client_host):
+                    return True
+                self._send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "type": "Forbidden",
+                            "message": "Parazettel daemon only accepts loopback clients.",
+                        },
+                    },
+                )
+                return False
+
             def do_GET(self) -> None:
+                if not self._ensure_loopback_client():
+                    return
                 if self.path == "/health":
                     self._send_json(
                         200,
@@ -204,6 +238,8 @@ class ParazettelDaemonServer:
                 self._send_json(404, {"ok": False, "error": {"type": "NotFound", "message": "Unknown path"}})
 
             def do_POST(self) -> None:
+                if not self._ensure_loopback_client():
+                    return
                 daemon._mark_activity()
                 if self.path == "/shutdown":
                     self._send_json(

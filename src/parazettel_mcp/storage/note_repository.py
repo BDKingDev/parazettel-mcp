@@ -336,15 +336,13 @@ class NoteRepository(Repository[Note]):
             self.rebuild_index()
 
     def _build_graph_backup_path(self) -> Path:
-        """Return a timestamped backup path for the graph DB file."""
+        """Return a timestamped backup path for the graph DB snapshot."""
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         backup_path = self.graph_db_path.with_name(
             f"{self.graph_db_path.name}.{timestamp}.bak"
         )
         counter = 1
-        while backup_path.exists() or backup_path.with_name(
-            f"{backup_path.name}.wal"
-        ).exists():
+        while backup_path.exists():
             backup_path = self.graph_db_path.with_name(
                 f"{self.graph_db_path.name}.{timestamp}.{counter}.bak"
             )
@@ -358,25 +356,30 @@ class NoteRepository(Repository[Note]):
             return None
 
         backup_path = self._build_graph_backup_path()
-        companion_paths = sorted(
-            path
-            for path in graph_db_path.parent.glob(f"{graph_db_path.name}.*")
-            if path.is_file()
-        )
 
-        # Kuzu's runtime temp files are cleaned up when the DB is closed. Take a
-        # short stop-the-world snapshot under daemon ownership rather than
-        # replaying the full graph into a second database.
+        # Kuzu runtime files are cleaned up when the DB is closed. Take a short
+        # stop-the-world snapshot under daemon ownership rather than replaying
+        # the full graph into a second database.
         self.close()
         try:
-            shutil.copy2(graph_db_path, backup_path)
-            for companion_path in companion_paths:
-                if not companion_path.exists():
-                    continue
-                shutil.copy2(
-                    companion_path,
-                    backup_path.with_name(f"{backup_path.name}{companion_path.suffix}"),
+            if graph_db_path.is_dir():
+                shutil.copytree(graph_db_path, backup_path)
+            else:
+                companion_paths = sorted(
+                    path
+                    for path in graph_db_path.parent.glob(f"{graph_db_path.name}.*")
+                    if path.is_file()
                 )
+                shutil.copy2(graph_db_path, backup_path)
+                for companion_path in companion_paths:
+                    if not companion_path.exists():
+                        continue
+                    shutil.copy2(
+                        companion_path,
+                        backup_path.with_name(
+                            f"{backup_path.name}{companion_path.suffix}"
+                        ),
+                    )
         finally:
             self._open_graph_db(allow_rebuild_if_needed=False)
 
