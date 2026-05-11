@@ -1188,7 +1188,7 @@ class ZettelkastenMcpServer:
         ) -> str:
             """Query tasks with optional filters.
             Args:
-                status: Filter by status (inbox, ready, active, waiting, someday, done, cancelled)
+                status: Filter by status. If omitted, done and archived tasks are hidden by default.
                 project_id: Filter to tasks linked to this project
                 due_date: Filter to tasks due on or before this date (YYYY-MM-DD)
                 overdue_only: Only return tasks with due_date before today

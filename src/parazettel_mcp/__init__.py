@@ -20,11 +20,14 @@ def _load_version_from_pyproject() -> str:
 
 
 def get_version() -> str:
-    """Return the installed package version, or the repo version as fallback."""
+    """Return the repo version, else installed metadata, else ``0.0.0``."""
     try:
-        return package_version(PACKAGE_NAME)
-    except PackageNotFoundError:
         return _load_version_from_pyproject()
+    except FileNotFoundError:
+        try:
+            return package_version(PACKAGE_NAME)
+        except PackageNotFoundError:
+            return "0.0.0"
 
 
 __version__ = get_version()

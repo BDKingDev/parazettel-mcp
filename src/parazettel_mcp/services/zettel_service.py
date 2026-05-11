@@ -758,6 +758,12 @@ class ZettelService:
         if priority is not None:
             kwargs["priority"] = priority
         tasks = self.repository.search(**kwargs)
+        if status is None:
+            tasks = [
+                task
+                for task in tasks
+                if task.status not in {NoteStatus.DONE, NoteStatus.ARCHIVED}
+            ]
         if project_id:
             project_task_ids = {
                 n.id

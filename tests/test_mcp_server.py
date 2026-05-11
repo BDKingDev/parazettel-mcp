@@ -1165,6 +1165,28 @@ class TestMcpServer:
         assert "Invalid due_date" in result
         self.mock_zettel_service.get_tasks.assert_not_called()
 
+    def test_get_tasks_tool_uses_default_visibility_without_status_filter(self):
+        """pzk_get_tasks should rely on service defaults when no status is requested."""
+        ready_task = MagicMock()
+        ready_task.id = "task123"
+        ready_task.title = "Ready task"
+        ready_task.status = NoteStatus.READY
+        ready_task.due_date = None
+        ready_task.priority = None
+        self.mock_zettel_service.get_tasks.return_value = [ready_task]
+
+        fn = self.registered_tools["pzk_get_tasks"]
+        result = fn(limit=10)
+
+        assert "Found 1 task(s)" in result
+        self.mock_zettel_service.get_tasks.assert_called_once_with(
+            status=None,
+            project_id=None,
+            due_date_before=None,
+            priority=None,
+            limit=10,
+        )
+
     def test_get_todays_tasks_tool_formats_priorities_and_due_dates(self):
         """pzk_get_todays_tasks should render task priorities and due dates."""
         task = MagicMock()
