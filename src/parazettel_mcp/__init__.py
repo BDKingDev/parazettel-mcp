@@ -20,7 +20,7 @@ def _load_version_from_pyproject() -> str:
 
 
 def get_version() -> str:
-    """Return the repo version in source checkouts, else installed metadata."""
+    """Return the repo version, else installed metadata, else ``0.0.0``."""
     try:
         return _load_version_from_pyproject()
     except FileNotFoundError:

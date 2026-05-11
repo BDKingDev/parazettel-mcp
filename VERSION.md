@@ -2,6 +2,16 @@
 
 ## v0.5.1.1 (Current Release)
 
+**Release Date:** 2026-05-11
+
+### Highlights
+
+- `get_tasks()` now hides `done` and `archived` tasks by default
+- explicit status filters still allow direct retrieval of `done` and `archived` tasks
+- runtime version resolution now prefers the local source checkout version during active development
+
+## v0.5.1
+
 **Release Date:** 2026-05-08
 
 ### Highlights
