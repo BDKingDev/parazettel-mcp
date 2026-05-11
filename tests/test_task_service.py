@@ -334,6 +334,39 @@ def test_get_tasks_filters_by_project(zettel_service, area):
     assert tasks[0].id == task_in.id
 
 
+def test_get_tasks_excludes_done_and_archived_by_default(zettel_service, project):
+    """get_tasks() should hide done and archived tasks unless explicitly requested."""
+    zettel_service.create_task(
+        title="Ready task",
+        content=".",
+        project_id=project.id,
+        status=NoteStatus.READY,
+    )
+    zettel_service.create_task(
+        title="Done task",
+        content=".",
+        project_id=project.id,
+        status=NoteStatus.DONE,
+    )
+    zettel_service.create_task(
+        title="Archived task",
+        content=".",
+        project_id=project.id,
+        status=NoteStatus.ARCHIVED,
+    )
+
+    default_tasks = zettel_service.get_tasks()
+    done_tasks = zettel_service.get_tasks(status=NoteStatus.DONE)
+    archived_tasks = zettel_service.get_tasks(status=NoteStatus.ARCHIVED)
+
+    default_titles = {task.title for task in default_tasks}
+    assert "Ready task" in default_titles
+    assert "Done task" not in default_titles
+    assert "Archived task" not in default_titles
+    assert [task.title for task in done_tasks] == ["Done task"]
+    assert [task.title for task in archived_tasks] == ["Archived task"]
+
+
 # ---------------------------------------------------------------------------
 # get_todays_tasks
 # ---------------------------------------------------------------------------
