@@ -90,8 +90,11 @@ class DaemonRpcClient:
             self._raise_remote_error(payload.get("error", {}))
         except (error.URLError, OSError) as exc:
             raise DaemonUnavailableError(
-                "Parazettel daemon is unavailable. Start the local daemon or switch "
-                "back to direct mode."
+                "Parazettel daemon is unavailable. Start it with: "
+                "python -m parazettel_mcp.main --run-daemon "
+                "(or restart your MCP client, which auto-starts the daemon; "
+                "check status with python -m parazettel_mcp.main --daemon-status). "
+                "To run without the daemon, set PARAZETTEL_BACKEND=direct."
             ) from exc
 
         payload = json.loads(body)
