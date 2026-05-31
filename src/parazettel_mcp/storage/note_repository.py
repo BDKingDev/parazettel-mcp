@@ -383,14 +383,18 @@ class NoteRepository(Repository[Note]):
                 # copy that may predate an external edit landing in the same
                 # coarse mtime tick.
                 with open(file_path, "r", encoding="utf-8") as f:
-                    file_note = self._parse_note_from_markdown(f.read())
+                    file_body = frontmatter.loads(f.read()).content
             except Exception:
                 unreadable_files.append(note_id)
                 continue
-            # Re-render the on-disk note exactly as create/update would index it,
-            # then compare to the content the graph actually stored.
-            expected = frontmatter.loads(self._note_to_markdown(file_note)).content
-            if expected != stored_content.get(note_id):
+            # Compare the on-disk note body to exactly what the graph stored.
+            # create()/update() index the parsed-markdown body verbatim
+            # (frontmatter.loads(markdown).content), so the file body and the
+            # stored content are byte-identical when in sync. NOTE: do not compare
+            # against a re-render via _note_to_markdown — that regenerates the
+            # ## Links section and re-normalizes the heading, so every note with
+            # links would falsely register as drifted.
+            if file_body != stored_content.get(note_id):
                 content_drift.append(note_id)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
