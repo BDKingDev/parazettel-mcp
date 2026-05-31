@@ -228,6 +228,7 @@ def format_daemon_status(status: dict[str, object]) -> str:
         lines.append(f"Last known PID: {status['pid']}")
     if status["error"]:
         lines.append(f"Error: {status['error']}")
+    lines.append(f"To start it: {config.format_daemon_start_command()}")
     return "\n".join(lines)
 
 
@@ -359,7 +360,13 @@ def ensure_daemon_running(args: argparse.Namespace) -> None:
         _remove_daemon_pid_file()
 
     _spawn_daemon_process(args)
-    _wait_for_daemon_ready(client, _DAEMON_START_TIMEOUT_SECONDS)
+    try:
+        _wait_for_daemon_ready(client, _DAEMON_START_TIMEOUT_SECONDS)
+    except DaemonUnavailableError as exc:
+        raise DaemonUnavailableError(
+            "Failed to auto-start the Parazettel daemon. Start it manually "
+            f"with: {config.format_daemon_start_command()}"
+        ) from exc
 
 
 def main():

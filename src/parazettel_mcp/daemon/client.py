@@ -94,7 +94,7 @@ class DaemonRpcClient:
                 "python -m parazettel_mcp.main --run-daemon "
                 "(or restart your MCP client, which auto-starts the daemon; "
                 "check status with python -m parazettel_mcp.main --daemon-status). "
-                "To run without the daemon, set PARAZETTEL_BACKEND=direct."
+                "To run without the daemon, set PARAZETTEL_BACKEND_MODE=direct."
             ) from exc
 
         payload = json.loads(body)
