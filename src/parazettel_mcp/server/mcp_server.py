@@ -662,7 +662,9 @@ class ZettelkastenMcpServer:
                     output += f"{i}. {note.title} (ID: {note.id})\n"
                     # Surface the relevance score so the caller can tell a strong
                     # match from a weak one (only meaningful for text queries).
-                    if query and result.score:
+                    # Guard on a real number so non-numeric scores are skipped
+                    # rather than raising on the format spec.
+                    if query and isinstance(result.score, (int, float)) and result.score:
                         output += f"   Relevance: {result.score:.3f}\n"
                     if note.tags:
                         output += (
