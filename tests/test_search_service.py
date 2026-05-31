@@ -115,7 +115,7 @@ class TestSearchService:
         mock_repository.search.assert_called_once_with(text="python")
 
     def test_search_by_text_keeps_fts_only_candidates(self, zettel_service):
-        """FTS-only matches should not be dropped by substring-only scoring heuristics."""
+        """FTS-only matches (no literal substring) are kept and BM25-scored, not dropped."""
         note = zettel_service.create_note(
             title="Tooling Overview",
             content="Policies libraries decisions and planning support analysis.",
@@ -123,11 +123,46 @@ class TestSearchService:
         )
 
         search_service = SearchService(zettel_service)
+        # "library" is not a literal substring of the body ("libraries"), so the old
+        # substring heuristic would have flattened this to 0.1; FTS still matches it.
         results = search_service.search_by_text("library")
 
         assert [result.note.id for result in results] == [note.id]
-        assert results[0].score == pytest.approx(0.1)
-        assert results[0].matched_context == "FTS: Tooling Overview"
+        # Ranked by the index's real BM25 score, which is strictly positive.
+        assert results[0].score > 0.0
+        # A matched-context string is always provided for the caller.
+        assert results[0].matched_context
+
+    def test_search_by_text_ranks_by_bm25_not_flat_score(self, zettel_service):
+        """Text results are ordered by BM25 relevance and carry distinct positive scores.
+
+        Regression for the bug where every non-substring FTS hit was flattened to a
+        constant 0.1 score, leaving multi-result queries effectively unranked.
+        """
+        strong = zettel_service.create_note(
+            title="Kubernetes deployment strategies",
+            content=(
+                "Kubernetes deployment patterns: rolling deployment, blue-green "
+                "deployment, and canary deployment for a Kubernetes cluster."
+            ),
+            tags=["k8s"],
+        )
+        weak = zettel_service.create_note(
+            title="Weekly notes",
+            content="A passing mention of one Kubernetes deployment we tried once.",
+            tags=["misc"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_by_text("kubernetes deployment")
+        ids = [r.note.id for r in results]
+
+        assert strong.id in ids and weak.id in ids
+        # The denser, more relevant note ranks first...
+        assert ids[0] == strong.id
+        # ...with a strictly higher BM25 score than the weak match (not a flat tie).
+        scores = {r.note.id: r.score for r in results}
+        assert scores[strong.id] > scores[weak.id] > 0.0
 
     def test_search_by_tag(self, zettel_service):
         """Test searching for notes by tags."""
@@ -451,7 +486,7 @@ class TestSearchService:
         )
 
     def test_search_combined_keeps_fts_only_candidates(self, zettel_service):
-        """Combined search should preserve valid FTS matches after repository prefiltering."""
+        """Combined search keeps valid FTS matches and BM25-scores them (no 0.1 floor)."""
         note = zettel_service.create_note(
             title="Tooling Overview",
             content="Policies libraries decisions and planning support analysis.",
@@ -463,8 +498,8 @@ class TestSearchService:
         results = search_service.search_combined(text="library", tags=["tooling"])
 
         assert [result.note.id for result in results] == [note.id]
-        assert results[0].score == pytest.approx(0.1)
-        assert results[0].matched_context == "FTS: Tooling Overview"
+        assert results[0].score > 0.0
+        assert results[0].matched_context
 
     def test_search_combined_filters_non_task_notes_by_project(self, zettel_service):
         """Combined search should honor project_id for non-task notes as well."""

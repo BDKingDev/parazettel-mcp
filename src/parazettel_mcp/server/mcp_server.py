@@ -660,16 +660,28 @@ class ZettelkastenMcpServer:
                 for i, result in enumerate(results, 1):
                     note = result.note
                     output += f"{i}. {note.title} (ID: {note.id})\n"
+                    # Surface the relevance score so the caller can tell a strong
+                    # match from a weak one (only meaningful for text queries).
+                    if query and result.score:
+                        output += f"   Relevance: {result.score:.3f}\n"
                     if note.tags:
                         output += (
                             f"   Tags: {', '.join(tag.name for tag in note.tags)}\n"
                         )
                     output += f"   Created: {note.created_at.strftime('%Y-%m-%d')}\n"
-                    # Add a snippet of content (first 150 chars)
-                    content_preview = note.content[:150].replace("\n", " ")
-                    if len(note.content) > 150:
-                        content_preview += "..."
-                    output += f"   Preview: {content_preview}\n\n"
+                    # Prefer the matched context (why this note matched) when present,
+                    # otherwise fall back to a leading content snippet.
+                    if result.matched_context:
+                        match_line = result.matched_context.replace("\n", " ")
+                        if len(match_line) > 200:
+                            match_line = match_line[:200] + "..."
+                        output += f"   Match: {match_line}\n"
+                    else:
+                        content_preview = note.content[:150].replace("\n", " ")
+                        if len(note.content) > 150:
+                            content_preview += "..."
+                        output += f"   Preview: {content_preview}\n"
+                    output += "\n"
                 return output
             except Exception as e:
                 return self.format_error_response(e)

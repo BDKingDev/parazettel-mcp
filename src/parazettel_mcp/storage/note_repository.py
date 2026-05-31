@@ -1129,15 +1129,15 @@ class NoteRepository(Repository[Note]):
             note_map[note_id] = _db_dict_to_note(nd, tags, links)
         return [note_map[note_id] for note_id in ids if note_id in note_map]
 
-    def _query_fts_index(
+    def _query_fts_index_scored(
         self,
         conn: kuzu.Connection,
         index_name: str,
         query: str,
         *,
         conjunctive: bool = False,
-    ) -> List[str]:
-        """Return note IDs from a full-text search query ordered by score."""
+    ) -> List[Tuple[str, float]]:
+        """Return (note_id, BM25 score) pairs from a full-text query, ranked by score."""
         normalized_query = query.strip()
         if not normalized_query:
             return []
@@ -1154,7 +1154,45 @@ class NoteRepository(Repository[Note]):
             query_sql,
             {"query": normalized_query},
         )
-        return _result_first_column(result)
+        pairs: List[Tuple[str, float]] = []
+        while result.has_next():
+            row = result.get_next()
+            pairs.append((row[0], float(row[1])))
+        return pairs
+
+    def _query_fts_index(
+        self,
+        conn: kuzu.Connection,
+        index_name: str,
+        query: str,
+        *,
+        conjunctive: bool = False,
+    ) -> List[str]:
+        """Return note IDs from a full-text search query ordered by score."""
+        return [
+            note_id
+            for note_id, _score in self._query_fts_index_scored(
+                conn, index_name, query, conjunctive=conjunctive
+            )
+        ]
+
+    def text_fts_scores(self, text: str) -> Dict[str, float]:
+        """Return {note_id: BM25 score} for *text* against the combined note index.
+
+        Exposes the relevance scores Kuzu already computes for the full-text query
+        so callers can rank by BM25 instead of re-deriving order with lexical
+        substring heuristics.
+        """
+        normalized = text.strip() if isinstance(text, str) else ""
+        if not normalized:
+            return {}
+        with self._connection() as conn:
+            return {
+                note_id: score
+                for note_id, score in self._query_fts_index_scored(
+                    conn, "note_text_fts", normalized
+                )
+            }
 
     def _intersect_ordered_id_lists(self, ordered_id_lists: List[List[str]]) -> List[str]:
         """Intersect ordered ID lists while preserving the first list's order."""
