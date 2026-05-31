@@ -223,6 +223,9 @@ class NoteRepository(Repository[Note]):
         self.read_only = False
         self.db: Optional[kuzu.Database] = None
         self._closed = True
+        # Names of markdown files that failed to parse on the most recent rebuild.
+        # Surfaced to callers so a shrinking corpus is visible instead of silent.
+        self.last_rebuild_skipped: List[str] = []
         self._open_graph_db(allow_rebuild_if_needed=True)
 
     def close(self) -> None:
@@ -489,11 +492,25 @@ class NoteRepository(Repository[Note]):
         backup_path = self._create_graph_backup()
         note_files = list(self.notes_dir.glob("*.md"))
         notes: List[Note] = []
+        skipped: List[str] = []
 
         for file_path in note_files:
             note = self._parse_rebuild_note(file_path)
             if note is not None:
                 notes.append(note)
+            else:
+                skipped.append(file_path.name)
+
+        # Surface unparseable files instead of silently dropping them from the
+        # index. rebuild_index clears the graph first, so a parse regression would
+        # otherwise quietly shrink the searchable corpus while reporting success.
+        self.last_rebuild_skipped = skipped
+        if skipped:
+            logger.warning(
+                "rebuild_index skipped %d unparseable note file(s): %s",
+                len(skipped),
+                ", ".join(skipped),
+            )
 
         with self._connection() as conn:
             conn.execute("MATCH (n:Note) DETACH DELETE n")

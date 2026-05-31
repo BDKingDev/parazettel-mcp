@@ -950,10 +950,31 @@ class ZettelkastenMcpServer:
                     else "Backup created: none (database file did not exist)\n"
                 )
 
+                # Surface any markdown files that failed to parse so a shrinking
+                # corpus is visible to the caller, not silently dropped. Only the
+                # in-process direct backend exposes this; the daemon logs skips
+                # itself, so accept only a real list and ignore anything else
+                # (e.g. a proxy attribute or a test mock).
+                skipped = getattr(
+                    self.zettel_service.repository, "last_rebuild_skipped", []
+                )
+                if not isinstance(skipped, (list, tuple)):
+                    skipped = []
+                skipped_message = ""
+                if skipped:
+                    preview = ", ".join(skipped[:10])
+                    if len(skipped) > 10:
+                        preview += f", … (+{len(skipped) - 10} more)"
+                    skipped_message = (
+                        f"WARNING: {len(skipped)} file(s) failed to parse and were "
+                        f"skipped: {preview}\n"
+                    )
+
                 # Return a detailed success message
                 return (
                     f"Database index rebuilt successfully.\n"
                     f"{backup_message}"
+                    f"{skipped_message}"
                     f"Notes processed: {note_count_after}\n"
                     f"Change in note count: {note_count_after - note_count_before}"
                 )
