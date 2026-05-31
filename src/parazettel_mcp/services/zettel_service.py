@@ -496,68 +496,121 @@ class ZettelService:
     def find_similar_notes(
         self, note_id: str, threshold: float = 0.5
     ) -> List[Tuple[Note, float]]:
-        """Find notes similar to the given note based on shared tags and links."""
+        """Find notes similar to the given note.
+
+        Similarity blends two signals so that notes about the same idea are found
+        even when they share no tags or links yet (the common case for a freshly
+        created note):
+
+        * **Structural** (tags + outgoing/incoming/direct links) — the original
+          graph-topology signal.
+        * **Lexical** (title + content word overlap, Jaccard) — a content signal
+          that does not depend on prior curation.
+
+        The final score is ``max(structural, lexical_weight * lexical)`` so a
+        strong structural match still ranks at full strength, while a note with no
+        structural overlap can still surface on content alone. Lexical is weighted
+        below 1.0 so a pure word-overlap match does not outrank a genuine
+        tag/link relationship. Backwards compatible: same signature, same default
+        threshold, same return shape (list of ``(Note, score)`` sorted desc).
+        """
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
 
-        # Get all notes
         all_notes = self.repository.get_all()
         results = []
 
-        # Set of this note's tags and links
         note_tags = {tag.name for tag in note.tags}
         note_links = {link.target_id for link in note.links}
+        note_tokens = self._content_tokens(note)
 
-        # Add notes linked to this note
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
         note_incoming = {n.id for n in incoming_notes}
 
-        # For each note, calculate similarity
+        # Lexical contribution is capped below a full structural match so a pure
+        # word-overlap neighbour cannot outrank a real tag/link relationship.
+        lexical_weight = 0.6
+
         for other_note in all_notes:
             if other_note.id == note_id:
                 continue
 
-            # Calculate tag overlap
             other_tags = {tag.name for tag in other_note.tags}
             tag_overlap = len(note_tags.intersection(other_tags))
 
-            # Calculate link overlap (outgoing)
             other_links = {link.target_id for link in other_note.links}
             link_overlap = len(note_links.intersection(other_links))
 
-            # Check if other note links to this note
             incoming_overlap = 1 if other_note.id in note_incoming else 0
-
-            # Check if this note links to other note
             outgoing_overlap = 1 if other_note.id in note_links else 0
 
-            # Calculate similarity score
-            # Weight: 40% tags, 20% outgoing links, 20% incoming links, 20% direct connections
+            # Structural similarity (unchanged weighting).
             total_possible = (
                 max(len(note_tags), len(other_tags)) * 0.4
                 + max(len(note_links), len(other_links)) * 0.2
                 + 1 * 0.2  # Possible incoming link
                 + 1 * 0.2  # Possible outgoing link
             )
-
-            # Avoid division by zero
             if total_possible == 0:
-                similarity = 0.0
+                structural = 0.0
             else:
-                similarity = (
+                structural = (
                     (tag_overlap * 0.4)
                     + (link_overlap * 0.2)
                     + (incoming_overlap * 0.2)
                     + (outgoing_overlap * 0.2)
                 ) / total_possible
 
+            # Lexical similarity: Jaccard over title+content content words.
+            other_tokens = self._content_tokens(other_note)
+            if note_tokens and other_tokens:
+                intersection = len(note_tokens & other_tokens)
+                union = len(note_tokens | other_tokens)
+                lexical = intersection / union if union else 0.0
+            else:
+                lexical = 0.0
+
+            similarity = max(structural, lexical_weight * lexical)
+
             if similarity >= threshold:
                 results.append((other_note, similarity))
 
-        # Sort by similarity (descending)
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    # Lightweight English stopwords — enough to keep Jaccard overlap meaningful
+    # without pulling in an NLP dependency.
+    _SIMILARITY_STOPWORDS = frozenset(
+        """
+        a an the and or but if then else for to of in on at by with without from into
+        over under again further is are was were be been being do does did doing have
+        has had having this that these those it its as so than too very can will just
+        not no nor only own same out up down off about above below i you he she we they
+        them his her their our your my me us him
+        """.split()
+    )
+
+    @classmethod
+    def _content_tokens(cls, note: Note) -> Set[str]:
+        """Return the set of lowercased content words from a note's title + body.
+
+        Strips the rendered ``## Links`` section, wiki-link IDs, punctuation, very
+        short tokens, and stopwords so the overlap reflects topical words.
+        """
+        import re
+
+        title = note.title or ""
+        body = note.content or ""
+        # Drop the generated ## Links section so link IDs don't dominate overlap.
+        body = body.split("## Links", 1)[0]
+        text = f"{title} {body}".lower()
+        tokens = re.findall(r"[a-z0-9]+", text)
+        return {
+            tok
+            for tok in tokens
+            if len(tok) >= 3 and tok not in cls._SIMILARITY_STOPWORDS
+        }
 
     # ------------------------------------------------------------------
     # Action-item methods (PARA / GTD)
