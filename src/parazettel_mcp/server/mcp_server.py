@@ -962,6 +962,55 @@ class ZettelkastenMcpServer:
                 logger.error(f"Failed to rebuild index: {e}", exc_info=True)
                 return self.format_error_response(e)
 
+        @self.mcp.tool(name="pzk_check_consistency")
+        def pzk_check_consistency() -> str:
+            """Report drift between the markdown files and the graph index.
+
+            Read-only: this does not modify anything. It surfaces notes that exist
+            on disk but not in the index, notes indexed without a file, and notes
+            whose file content has diverged from the index. Run pzk_rebuild_index
+            to reconcile any drift it finds.
+            """
+            try:
+                report = self.zettel_service.check_consistency()
+
+                total_files = report.get("total_files", 0)
+                total_indexed = report.get("total_indexed", 0)
+                in_sync = report.get("in_sync", 0)
+                missing_from_index = report.get("missing_from_index", []) or []
+                missing_from_files = report.get("missing_from_files", []) or []
+                content_drift = report.get("content_drift", []) or []
+                unreadable = report.get("unreadable_files", []) or []
+
+                if report.get("consistent"):
+                    return (
+                        "Files and index are consistent.\n"
+                        f"Files: {total_files}, Indexed: {total_indexed}, "
+                        f"In sync: {in_sync}"
+                    )
+
+                def _section(label: str, ids: List[str]) -> str:
+                    if not ids:
+                        return ""
+                    preview = ", ".join(ids[:20])
+                    if len(ids) > 20:
+                        preview += f", … (+{len(ids) - 20} more)"
+                    return f"{label} ({len(ids)}): {preview}\n"
+
+                out = "Drift detected between files and index.\n"
+                out += (
+                    f"Files: {total_files}, Indexed: {total_indexed}, "
+                    f"In sync: {in_sync}\n\n"
+                )
+                out += _section("Files missing from index", missing_from_index)
+                out += _section("Indexed notes with no file", missing_from_files)
+                out += _section("Content drift (file != index)", content_drift)
+                out += _section("Unreadable files", unreadable)
+                out += "\nRun pzk_rebuild_index to reconcile."
+                return out
+            except Exception as e:
+                return self.format_error_response(e)
+
         # ----------------------------------------------------------------
         # Action-item tools (PARA / GTD)
         # ----------------------------------------------------------------
