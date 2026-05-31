@@ -478,6 +478,10 @@ class ZettelService:
         """Rebuild the graph index from files."""
         return self.repository.rebuild_index()
 
+    def check_consistency(self) -> Dict[str, Any]:
+        """Report drift between the markdown files and the graph index (read-only)."""
+        return self.repository.check_consistency()
+
     def export_note(self, note_id: str, format: str = "markdown") -> str:
         """Export a note in the specified format."""
         note = self.repository.get(note_id)

@@ -1,12 +1,40 @@
 """Tests for NoteRepository.check_consistency — file vs graph-index drift detection."""
 
 from parazettel_mcp.models.schema import Note, NoteType
+from parazettel_mcp.services.zettel_service import ZettelService
 
 
 def _make(repo, title, content):
     return repo.create(
         Note(title=title, content=content, note_type=NoteType.PERMANENT)
     )
+
+
+def test_service_check_consistency_delegates_to_repository(note_repository):
+    """ZettelService.check_consistency must exist and return the repository report.
+
+    The MCP tool and the daemon RPC path both call the *service*, not the repo
+    directly — so a missing delegate makes pzk_check_consistency raise even though
+    the repository method works. Guards against that wiring silently regressing.
+    """
+    service = ZettelService(repository=note_repository)
+    _make(note_repository, "One", "First note body.")
+
+    report = service.check_consistency()
+
+    assert isinstance(report, dict)
+    assert report["consistent"] is True
+    assert report["total_files"] == report["total_indexed"] == 1
+
+
+def test_check_consistency_whitelisted_for_daemon_rpc():
+    """check_consistency must be allowed across the daemon RPC boundary.
+
+    Without this, the daemon rejects the call with 'Unsupported RPC method'.
+    """
+    from parazettel_mcp.daemon.server import ALLOWED_SERVICE_METHODS
+
+    assert "check_consistency" in ALLOWED_SERVICE_METHODS["zettel_service"]
 
 
 def test_consistency_clean_vault_reports_consistent(note_repository):
