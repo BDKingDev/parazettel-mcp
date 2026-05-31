@@ -502,10 +502,13 @@ class ZettelService:
         even when they share no tags or links yet (the common case for a freshly
         created note):
 
-        * **Structural** (tags + outgoing/incoming/direct links) — the original
-          graph-topology signal.
-        * **Lexical** (title + content word overlap, Jaccard) — a content signal
-          that does not depend on prior curation.
+        * **Structural** — overlap of tags and *knowledge* links (PARA/GTD routing
+          links to a note's area/project are excluded; every sibling shares those,
+          so they carry no similarity signal).
+        * **Lexical** — title+content word overlap, scored with a length-aware
+          coefficient (see ``_lexical_overlap``) rather than raw Jaccard, so two
+          notes that merely share a few common words do not clear the bar while
+          notes with substantial, distinctive overlap do.
 
         The final score is ``max(structural, lexical_weight * lexical)`` so a
         strong structural match still ranks at full strength, while a note with no
@@ -522,11 +525,19 @@ class ZettelService:
         results = []
 
         note_tags = {tag.name for tag in note.tags}
-        note_links = {link.target_id for link in note.links}
+        # Only genuine knowledge links count toward structural similarity. PARA
+        # routing links (a note's reference to its area, and part_of/has_part to
+        # its project/area) are shared by EVERY note in the same area/project, so
+        # counting them gives unrelated notes a spurious structural floor — the
+        # same scaffolding-dominates-the-graph problem seen in find_central_notes.
+        note_links = self._knowledge_link_targets(note)
         note_tokens = self._content_tokens(note)
 
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
-        note_incoming = {n.id for n in incoming_notes}
+        # Exclude the note's own project/area from incoming overlap for the same
+        # reason (a parent project/area links to all of its children via has_part).
+        routing_ids = {note.area_id, note.project_id} - {None}
+        note_incoming = {n.id for n in incoming_notes if n.id not in routing_ids}
 
         # Lexical contribution is capped below a full structural match so a pure
         # word-overlap neighbour cannot outrank a real tag/link relationship.
@@ -539,7 +550,7 @@ class ZettelService:
             other_tags = {tag.name for tag in other_note.tags}
             tag_overlap = len(note_tags.intersection(other_tags))
 
-            other_links = {link.target_id for link in other_note.links}
+            other_links = self._knowledge_link_targets(other_note)
             link_overlap = len(note_links.intersection(other_links))
 
             incoming_overlap = 1 if other_note.id in note_incoming else 0
@@ -562,14 +573,9 @@ class ZettelService:
                     + (outgoing_overlap * 0.2)
                 ) / total_possible
 
-            # Lexical similarity: Jaccard over title+content content words.
+            # Lexical similarity: length-aware overlap over title+content words.
             other_tokens = self._content_tokens(other_note)
-            if note_tokens and other_tokens:
-                intersection = len(note_tokens & other_tokens)
-                union = len(note_tokens | other_tokens)
-                lexical = intersection / union if union else 0.0
-            else:
-                lexical = 0.0
+            lexical = self._lexical_overlap(note_tokens, other_tokens)
 
             similarity = max(structural, lexical_weight * lexical)
 
@@ -578,6 +584,32 @@ class ZettelService:
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    # Link types that express PARA/GTD routing rather than a knowledge
+    # relationship. These connect a note to its area/project (shared by every
+    # sibling), so they carry no similarity signal and are excluded from the
+    # structural overlap in find_similar_notes.
+    _ROUTING_LINK_TYPES = frozenset(
+        {LinkType.PART_OF, LinkType.HAS_PART, LinkType.BLOCKS, LinkType.BLOCKED_BY}
+    )
+
+    @classmethod
+    def _knowledge_link_targets(cls, note: Note) -> Set[str]:
+        """Return target ids of a note's genuine knowledge links.
+
+        Excludes PARA/GTD routing links (part_of/has_part/blocks) and the note's
+        own reference to its area, both of which are shared by all siblings and
+        would otherwise inflate structural similarity between unrelated notes.
+        """
+        targets: Set[str] = set()
+        for link in note.links:
+            if link.link_type in cls._ROUTING_LINK_TYPES:
+                continue
+            # The area reference link uses REFERENCE type but points at the area.
+            if note.area_id and link.target_id == note.area_id:
+                continue
+            targets.add(link.target_id)
+        return targets
 
     # Lightweight English stopwords — enough to keep Jaccard overlap meaningful
     # without pulling in an NLP dependency.
@@ -590,6 +622,32 @@ class ZettelService:
         them his her their our your my me us him
         """.split()
     )
+
+    # Minimum shared content words before lexical overlap counts at all. Two
+    # short notes sharing one or two common words should not register as similar;
+    # real topical overlap shows several shared distinctive terms.
+    _LEXICAL_MIN_SHARED = 3
+
+    @classmethod
+    def _lexical_overlap(cls, tokens_a: Set[str], tokens_b: Set[str]) -> float:
+        """Length-aware lexical similarity in [0, 1] for two content-word sets.
+
+        Plain Jaccard over-rewards tiny notes (a 6-word and 8-word note sharing 2
+        common words score ~0.2 even when unrelated). Instead:
+
+        * require at least ``_LEXICAL_MIN_SHARED`` shared words before scoring
+          anything, so incidental one/two-word overlaps read as 0; and
+        * normalise the shared count by the *smaller* token set (overlap
+          coefficient), so a focused note that is largely a topical subset of a
+          longer note scores high, while a couple of shared stopword-survivors in
+          otherwise disjoint notes stay low.
+        """
+        if not tokens_a or not tokens_b:
+            return 0.0
+        shared = len(tokens_a & tokens_b)
+        if shared < cls._LEXICAL_MIN_SHARED:
+            return 0.0
+        return shared / min(len(tokens_a), len(tokens_b))
 
     @classmethod
     def _content_tokens(cls, note: Note) -> Set[str]:
