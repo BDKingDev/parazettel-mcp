@@ -156,6 +156,33 @@ class ZettelService:
 
         return note
 
+    def _sync_area_reference_link(
+        self, note_id: str, previous_area_id: Optional[str], area_id: Optional[str]
+    ) -> Note:
+        """Keep a knowledge note's REFERENCE link to its area in sync after re-routing.
+
+        A non-area, non-project note carries a single REFERENCE link to its area,
+        seeded at creation in _seed_routing_links. When the note is later re-routed
+        to a different area (directly via area_id, or indirectly via a project whose
+        area differs), the stale REFERENCE must be removed and a fresh one added so
+        the markdown ## Links section matches the note's area_id. Projects use
+        _sync_project_area_links instead and are not handled here.
+        """
+        note = self.repository.get(note_id)
+        if not note:
+            raise ValueError(f"Note with ID {note_id} not found")
+        if previous_area_id == area_id:
+            return note
+
+        if previous_area_id and previous_area_id != note.id:
+            note.remove_link(previous_area_id, LinkType.REFERENCE)
+            note = self.repository.update(note)
+
+        if area_id and area_id != note.id:
+            note, _ = self.create_link(note.id, area_id, LinkType.REFERENCE)
+
+        return note
+
     def create_note(
         self,
         title: str,
@@ -314,6 +341,10 @@ class ZettelService:
         note = self.repository.update(note)
         if note.note_type == NoteType.PROJECT:
             note = self._sync_project_area_links(
+                note.id, previous_area_id, note.area_id
+            )
+        elif note.note_type != NoteType.AREA:
+            note = self._sync_area_reference_link(
                 note.id, previous_area_id, note.area_id
             )
         note = self._sync_part_of_link(
