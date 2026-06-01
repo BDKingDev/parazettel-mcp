@@ -51,6 +51,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "remove_link",
         "get_linked_notes",
         "rebuild_index",
+        "check_consistency",
         "export_note",
         "find_similar_notes",
         "create_task",

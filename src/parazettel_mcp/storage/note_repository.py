@@ -335,6 +335,85 @@ class NoteRepository(Repository[Note]):
         if db_ids != file_stems:
             self.rebuild_index()
 
+    def check_consistency(self) -> Dict[str, Any]:
+        """Compare the markdown files (source of truth) against the graph index.
+
+        Read-only: this never modifies either store. It surfaces the three ways
+        the file system and the Kuzu index can silently disagree:
+
+        * ``missing_from_index`` — a ``{id}.md`` file exists on disk but no Note
+          node is indexed for it (e.g. a note added/restored outside the server).
+        * ``missing_from_files`` — a Note node is indexed but its file is gone
+          (e.g. a note deleted on disk directly).
+        * ``content_drift`` — both exist, but the file's current content differs
+          from what the index stored (e.g. an external editor changed the body
+          and the index was never refreshed; ``rebuild_index_if_needed`` only
+          checks the ID set, so same-id content edits are invisible to it).
+
+        ``pzk_rebuild_index`` reconciles all three. Returns a structured report
+        so callers can decide whether a rebuild is warranted.
+        """
+        file_stems = {p.stem for p in self.notes_dir.glob("*.md")}
+        with self._connection() as conn:
+            db_ids = set(
+                _result_first_column(conn.execute("MATCH (n:Note) RETURN n.id"))
+            )
+            common = file_stems & db_ids
+            stored_content: Dict[str, str] = {}
+            if common:
+                result = conn.execute(
+                    "MATCH (n:Note) WHERE n.id IN $ids "
+                    "RETURN n.id AS id, n.content AS content",
+                    {"ids": list(common)},
+                )
+                while result.has_next():
+                    row = result.get_next()
+                    stored_content[row[0]] = row[1]
+
+        missing_from_index = sorted(file_stems - db_ids)
+        missing_from_files = sorted(db_ids - file_stems)
+
+        content_drift: List[str] = []
+        unreadable_files: List[str] = []
+        for note_id in sorted(common):
+            file_path = self.notes_dir / f"{note_id}.md"
+            try:
+                # Read the file directly, bypassing the mtime-keyed note cache: a
+                # consistency check must see the true on-disk bytes, not a cached
+                # copy that may predate an external edit landing in the same
+                # coarse mtime tick.
+                with open(file_path, "r", encoding="utf-8") as f:
+                    file_body = frontmatter.loads(f.read()).content
+            except Exception:
+                unreadable_files.append(note_id)
+                continue
+            # Compare the on-disk note body to exactly what the graph stored.
+            # create()/update() index the parsed-markdown body verbatim
+            # (frontmatter.loads(markdown).content), so the file body and the
+            # stored content are byte-identical when in sync. NOTE: do not compare
+            # against a re-render via _note_to_markdown — that regenerates the
+            # ## Links section and re-normalizes the heading, so every note with
+            # links would falsely register as drifted.
+            if file_body != stored_content.get(note_id):
+                content_drift.append(note_id)
+
+        in_sync = len(common) - len(content_drift) - len(unreadable_files)
+        return {
+            "total_files": len(file_stems),
+            "total_indexed": len(db_ids),
+            "in_sync": in_sync,
+            "missing_from_index": missing_from_index,
+            "missing_from_files": missing_from_files,
+            "content_drift": content_drift,
+            "unreadable_files": unreadable_files,
+            "consistent": not (
+                missing_from_index
+                or missing_from_files
+                or content_drift
+                or unreadable_files
+            ),
+        }
+
     def _build_graph_backup_path(self) -> Path:
         """Return a timestamped backup path for the graph DB snapshot."""
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
