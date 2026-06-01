@@ -1197,3 +1197,51 @@ def test_search_content_matches_get_content(note_repository):
     assert len(from_db) == 1
     assert from_file is not None
     assert from_db[0].content == from_file.content
+
+
+def test_copy_file_with_retry_recovers_from_transient_lock(tmp_path):
+    """The graph-backup copy retries WinError 33 (locked region) until it clears."""
+    from parazettel_mcp.storage import note_repository as nr
+
+    src = tmp_path / "graph.kuzu"
+    src.write_bytes(b"db-bytes")
+    dst = tmp_path / "graph.kuzu.bak"
+
+    real_copy = shutil.copy2
+    calls = {"n": 0}
+
+    def flaky_copy(s, d, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            err = PermissionError("locked")
+            err.winerror = 33  # ERROR_LOCK_VIOLATION
+            raise err
+        return real_copy(s, d, *args, **kwargs)
+
+    with patch.object(nr.shutil, "copy2", side_effect=flaky_copy):
+        with patch.object(nr.time, "sleep", lambda *_: None):
+            nr._copy_file_with_retry(src, dst)
+
+    assert calls["n"] == 3  # failed twice, succeeded on the third attempt
+    assert dst.read_bytes() == b"db-bytes"
+
+
+def test_copy_file_with_retry_reraises_non_retryable_error(tmp_path):
+    """A non-lock OSError is not retried and propagates immediately."""
+    from parazettel_mcp.storage import note_repository as nr
+
+    src = tmp_path / "graph.kuzu"
+    src.write_bytes(b"x")
+    dst = tmp_path / "graph.kuzu.bak"
+
+    calls = {"n": 0}
+
+    def failing_copy(s, d, *args, **kwargs):
+        calls["n"] += 1
+        raise FileNotFoundError("missing")
+
+    with patch.object(nr.shutil, "copy2", side_effect=failing_copy):
+        with pytest.raises(FileNotFoundError):
+            nr._copy_file_with_retry(src, dst)
+
+    assert calls["n"] == 1  # not retried

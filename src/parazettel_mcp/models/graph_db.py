@@ -15,6 +15,7 @@ Kuzu DATE values so that NULL is representable without a sentinel and round-trip
 through Python cleanly.
 """
 
+import os
 import threading
 from pathlib import Path
 from typing import Dict, Tuple
@@ -89,6 +90,65 @@ def close_graph_db(db_path: Path, read_only: bool = False) -> None:
         del _DB_CACHE[cache_key]
 
     db.close()
+
+
+def force_close_graph_db(db_path: Path) -> None:
+    """Fully release the cached handle for *db_path*, ignoring the refcount.
+
+    Used by the rebuild swap, which must guarantee the on-disk file is closed
+    (so it can be atomically replaced) regardless of how many logical references
+    are outstanding. Callers are responsible for reopening afterwards.
+    """
+    resolved = Path(db_path).expanduser().resolve()
+    with _DB_CACHE_LOCK:
+        for mode in ("rw", "ro"):
+            cache_key = f"{resolved}::{mode}"
+            cached = _DB_CACHE.pop(cache_key, None)
+            if cached is not None:
+                cached[0].close()
+
+
+# Kuzu sidecar files that live next to the main DB file (e.g. graph.kuzu.wal).
+# Restricted to a known suffix allowlist so unrelated files that merely share the
+# DB name prefix (backups, in-progress rebuild temp DBs) are never matched.
+_KUZU_SIDECAR_SUFFIXES = (".wal", ".shadow", ".tmp.wal")
+
+
+def graph_db_companions(db_path: Path) -> list[Path]:
+    """Return Kuzu sidecar files (e.g. the .wal) that travel with the DB file."""
+    return [
+        path
+        for suffix in _KUZU_SIDECAR_SUFFIXES
+        for path in [db_path.with_name(f"{db_path.name}{suffix}")]
+        if path.is_file()
+    ]
+
+
+# Backwards-compatible internal alias.
+_companion_paths = graph_db_companions
+
+
+def swap_graph_db_file(new_db_path: Path, live_db_path: Path) -> None:
+    """Atomically replace the live graph DB file with a freshly built one.
+
+    The caller must have already closed every handle to *live_db_path*
+    (see :func:`force_close_graph_db`). Both the main DB file and its Kuzu
+    sidecar files (``.wal`` etc.) are swapped; stale sidecars left over from the
+    old database are removed so a half-old/half-new on-disk state is impossible.
+    """
+    new_db_path = Path(new_db_path)
+    live_db_path = Path(live_db_path)
+
+    # Remove the old live sidecars first so none survive the swap.
+    for stale in _companion_paths(live_db_path):
+        stale.unlink()
+
+    os.replace(new_db_path, live_db_path)
+
+    # Move any sidecars produced alongside the freshly built DB into place.
+    for companion in _companion_paths(new_db_path):
+        suffix = companion.name[len(new_db_path.name):]
+        os.replace(companion, live_db_path.parent / f"{live_db_path.name}{suffix}")
 
 
 def _ensure_fts_indexes(conn: kuzu.Connection) -> None:

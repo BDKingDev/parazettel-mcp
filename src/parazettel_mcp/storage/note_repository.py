@@ -30,7 +30,10 @@ from parazettel_mcp.config import config
 from parazettel_mcp.models.graph_db import (
     GraphDatabaseReadOnlyError,
     close_graph_db,
+    force_close_graph_db,
+    graph_db_companions,
     init_graph_db,
+    swap_graph_db_file,
 )
 from parazettel_mcp.models.schema import (
     Link,
@@ -60,6 +63,12 @@ _NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
+# Snapshotting the just-closed graph DB file can briefly race the OS releasing
+# Kuzu's memory-map: WinError 32 (file in use) and 33 (locked region) both clear
+# within a few milliseconds, so the backup copy retries on them.
+_GRAPH_BACKUP_COPY_ATTEMPTS = 8
+_GRAPH_BACKUP_BACKOFF_SECONDS = 0.05
+_RETRYABLE_GRAPH_COPY_WINERRORS = {5, 32, 33}
 _GRAPH_BATCH_SIZE = 100
 # Cap how many skipped filenames are inlined into the rebuild warning log so a
 # mass parse failure can't emit one enormous log line.
@@ -152,6 +161,30 @@ def _is_retryable_atomic_write_error(exc: OSError) -> bool:
     if exc.errno == 13:
         return True
     return getattr(exc, "winerror", None) in _RETRYABLE_ATOMIC_WRITE_WINERRORS
+
+
+def _is_retryable_graph_copy_error(exc: OSError) -> bool:
+    """Return True when copying the graph DB file hit a transient lock."""
+    return getattr(exc, "winerror", None) in _RETRYABLE_GRAPH_COPY_WINERRORS
+
+
+def _copy_file_with_retry(src: Path, dst: Path) -> None:
+    """Copy *src* to *dst*, retrying transient Windows file locks with backoff."""
+    last_error: Optional[OSError] = None
+    for attempt in range(_GRAPH_BACKUP_COPY_ATTEMPTS):
+        try:
+            shutil.copy2(src, dst)
+            return
+        except OSError as exc:
+            last_error = exc
+            if (
+                attempt == _GRAPH_BACKUP_COPY_ATTEMPTS - 1
+                or not _is_retryable_graph_copy_error(exc)
+            ):
+                break
+            time.sleep(_GRAPH_BACKUP_BACKOFF_SECONDS * (2**attempt))
+    assert last_error is not None
+    raise last_error
 
 
 def _result_to_records(result: Any) -> List[Dict[str, Any]]:
@@ -442,31 +475,28 @@ class NoteRepository(Repository[Note]):
 
         backup_path = self._build_graph_backup_path()
 
-        # Kuzu runtime files are cleaned up when the DB is closed. Take a short
-        # stop-the-world snapshot under daemon ownership rather than replaying
-        # the full graph into a second database.
-        self.close()
-        try:
-            if graph_db_path.is_dir():
-                shutil.copytree(graph_db_path, backup_path)
-            else:
-                companion_paths = sorted(
-                    path
-                    for path in graph_db_path.parent.glob(f"{graph_db_path.name}.*")
-                    if path.is_file()
-                )
-                shutil.copy2(graph_db_path, backup_path)
-                for companion_path in companion_paths:
-                    if not companion_path.exists():
-                        continue
-                    shutil.copy2(
-                        companion_path,
-                        backup_path.with_name(
-                            f"{backup_path.name}{companion_path.suffix}"
-                        ),
-                    )
-        finally:
-            self._open_graph_db(allow_rebuild_if_needed=False)
+        # Kuzu keeps the DB file memory-mapped while open, so copying it while a
+        # handle is live raises WinError 33 on Windows. The handle is refcounted,
+        # so a plain close() can be a silent no-op when another reference is
+        # outstanding; force_close_graph_db guarantees the file is released for
+        # the brief stop-the-world snapshot, then we reopen.
+        with self.file_lock:
+            force_close_graph_db(graph_db_path)
+            self.db = None
+            self._closed = True
+            try:
+                if graph_db_path.is_dir():
+                    shutil.copytree(graph_db_path, backup_path)
+                else:
+                    _copy_file_with_retry(graph_db_path, backup_path)
+                    for companion_path in graph_db_companions(graph_db_path):
+                        suffix = companion_path.name[len(graph_db_path.name):]
+                        _copy_file_with_retry(
+                            companion_path,
+                            backup_path.with_name(f"{backup_path.name}{suffix}"),
+                        )
+            finally:
+                self._open_graph_db(allow_rebuild_if_needed=False)
 
         logger.info("Created graph database backup before reindex: %s", backup_path)
         return backup_path
@@ -484,18 +514,27 @@ class NoteRepository(Repository[Note]):
     def rebuild_index(self) -> Optional[Path]:
         """Rebuild the graph index from all markdown files.
 
-        Uses a two-pass strategy:
-        * Pass 1 – create all Note nodes and Tag nodes.
-        * Pass 2 – create all LINKS_TO / HAS_TAG relationships.
+        The rebuild is the only path that fully reconciles the graph with the
+        files, so it must reflect *every* on-disk edit — including tags or links
+        removed by hand. Rather than clearing the live database in place (a bulk
+        ``DETACH DELETE`` on a large graph segfaults Kuzu 0.11.3 on Windows, and
+        an in-place clear can also strand Tag nodes that lost their last note),
+        the new graph is built into a fresh temporary database and then
+        atomically swapped in. Building from empty means only tags/links present
+        in the files survive, so removals are picked up and orphan Tag nodes
+        disappear for free.
 
-        This guarantees that LINKS_TO edges are created even when the source
-        note appears before the target note in filesystem order.
+        Within the fresh build a two-pass strategy is used:
+        * Pass 1 – create all Note nodes and Tag nodes.
+        * Pass 2 – create all LINKS_TO / HAS_TAG relationships, so edges are
+          created even when a link's target note appears later in file order.
         """
         self._assert_writable()
         # Reset up front so a failure before parsing completes (e.g. during backup
         # creation), or a concurrent reader, never sees a previous rebuild's list.
         self.last_rebuild_skipped = []
         backup_path = self._create_graph_backup()
+
         note_files = list(self.notes_dir.glob("*.md"))
         notes: List[Note] = []
         skipped: List[str] = []
@@ -508,8 +547,9 @@ class NoteRepository(Repository[Note]):
                 skipped.append(file_path.name)
 
         # Surface unparseable files instead of silently dropping them from the
-        # index. rebuild_index clears the graph first, so a parse regression would
-        # otherwise quietly shrink the searchable corpus while reporting success.
+        # index. The rebuilt graph contains only the files that parsed, so a parse
+        # regression would otherwise quietly shrink the searchable corpus while
+        # reporting success.
         self.last_rebuild_skipped = skipped
         if skipped:
             preview = ", ".join(skipped[:_REBUILD_SKIPPED_LOG_LIMIT])
@@ -521,30 +561,68 @@ class NoteRepository(Repository[Note]):
                 preview,
             )
 
-        with self._connection() as conn:
-            conn.execute("MATCH (n:Note) DETACH DELETE n")
-            conn.execute("MATCH (t:Tag) DETACH DELETE t")
+        # Build into an isolated subdirectory so the temp DB and its sidecars can
+        # never collide with (or be mistaken for a companion of) the live DB file
+        # in the same directory.
+        tmp_dir = self.graph_db_path.with_name(
+            f".rebuild.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        tmp_db_path = tmp_dir / self.graph_db_path.name
+        try:
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            self._build_graph_into(tmp_db_path, notes)
 
-            self._ensure_tag_nodes(
-                conn, (tag.name for note in notes for tag in note.tags)
-            )
-
-            # Pass 1: create all Note nodes and Tags (no relationships yet).
-            # The graph was just cleared, so every note is new in this pass.
-            for note in notes:
-                self._index_note_nodes_only(
-                    note, conn, assume_missing=True, ensure_tags=False
-                )
-
-            # Pass 2: create all relationships in chunked batches
-            for i in range(0, len(notes), _GRAPH_BATCH_SIZE):
-                self._index_note_relations_batch(
-                    notes[i : i + _GRAPH_BATCH_SIZE],
-                    conn,
-                    clear_existing=False,
-                )
+            # Close every handle to the live DB so the file can be replaced,
+            # then atomically swap the freshly built DB into place and reopen.
+            with self.file_lock:
+                force_close_graph_db(self.graph_db_path)
+                self.db = None
+                self._closed = True
+                swap_graph_db_file(tmp_db_path, self.graph_db_path)
+                self._open_graph_db(allow_rebuild_if_needed=False)
+        finally:
+            self._cleanup_rebuild_artifacts(tmp_dir)
 
         return backup_path
+
+    def _build_graph_into(self, db_path: Path, notes: List[Note]) -> None:
+        """Build a complete graph for *notes* in a fresh database at *db_path*.
+
+        The database starts empty, so every node is new and no deletes are
+        issued. ``init_graph_db`` creates the schema (and FTS indexes), and the
+        handle is fully released afterwards so the file can be swapped in.
+        """
+        db = init_graph_db(db_path)
+        try:
+            conn = kuzu.Connection(db)
+            try:
+                self._ensure_tag_nodes(
+                    conn, (tag.name for note in notes for tag in note.tags)
+                )
+                # Pass 1: all Note nodes (empty DB, so every note is new).
+                for note in notes:
+                    self._index_note_nodes_only(
+                        note, conn, assume_missing=True, ensure_tags=False
+                    )
+                # Pass 2: all relationships in chunked batches.
+                for i in range(0, len(notes), _GRAPH_BATCH_SIZE):
+                    self._index_note_relations_batch(
+                        notes[i : i + _GRAPH_BATCH_SIZE],
+                        conn,
+                        clear_existing=False,
+                    )
+            finally:
+                conn.close()
+        finally:
+            force_close_graph_db(db_path)
+
+    def _cleanup_rebuild_artifacts(self, tmp_dir: Path) -> None:
+        """Remove the temporary rebuild directory, if any of it remains."""
+        if tmp_dir.exists():
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except OSError as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning("Could not remove rebuild artifact %s: %s", tmp_dir, exc)
 
     def _index_note_nodes_only(
         self,
@@ -1607,9 +1685,18 @@ class NoteRepository(Repository[Note]):
             return self._fetch_notes_by_ids(conn, ids)
 
     def get_all_tags(self) -> List[Tag]:
-        """Return all tags stored in the graph."""
+        """Return every tag currently applied to at least one note.
+
+        Derived from HAS_TAG edges rather than Tag-node existence so the result
+        reflects tags actually in use. A Tag node only exists to classify notes,
+        so a node with no incoming HAS_TAG edge is orphaned cruft (left behind
+        when a tag is removed from its last note) and is intentionally excluded.
+        """
         with self._connection() as conn:
-            result = conn.execute("MATCH (t:Tag) RETURN t.name AS name")
+            result = conn.execute(
+                "MATCH (:Note)-[:HAS_TAG]->(t:Tag) "
+                "RETURN DISTINCT t.name AS name"
+            )
             return [Tag(name=name) for name in _result_first_column(result)]
 
     def get_link(
