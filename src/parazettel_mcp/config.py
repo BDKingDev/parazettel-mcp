@@ -1,6 +1,7 @@
 """Configuration module for the Zettelkasten MCP server."""
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -128,6 +129,33 @@ class ZettelkastenConfig(BaseModel):
     def get_daemon_pid_file(self) -> Path:
         """Get the PID file path for the managed local daemon."""
         return self.get_daemon_runtime_dir() / "daemon.pid"
+
+    def format_daemon_start_command(self) -> str:
+        """Render an absolute, copy-pasteable command that starts the daemon.
+
+        Uses the current interpreter and absolute vault paths so the command
+        works from any working directory (e.g. another repo where notes are
+        being created), not just the install directory.
+
+        Deliberately uses ``sys.executable`` (python.exe), not pythonw.exe: this
+        command is meant for a human to run manually, where seeing startup logs
+        and errors (e.g. a Kuzu lock conflict) matters.
+        """
+        parts = [
+            sys.executable,
+            "-m",
+            "parazettel_mcp.main",
+            "--run-daemon",
+            "--notes-dir",
+            str(self.get_absolute_path(self.notes_dir)),
+            "--graph-db-path",
+            str(self.get_absolute_path(self.graph_db_path)),
+            "--daemon-host",
+            self.daemon_host,
+            "--daemon-port",
+            str(self.daemon_port),
+        ]
+        return " ".join(f'"{part}"' if " " in part else part for part in parts)
 
 
 # Create a global config instance

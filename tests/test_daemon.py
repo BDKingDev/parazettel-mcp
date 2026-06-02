@@ -346,8 +346,13 @@ def test_daemon_client_reports_connection_failures_cleanly():
     """Missing daemons should raise a user-actionable client error."""
     client = DaemonRpcClient("http://127.0.0.1:65500", timeout_seconds=0.2)
 
-    with pytest.raises(DaemonUnavailableError, match="daemon is unavailable"):
+    with pytest.raises(DaemonUnavailableError, match="daemon is unavailable") as excinfo:
         client.health()
+
+    message = str(excinfo.value)
+    # The error must tell the user how to bring the daemon back up.
+    assert "python -m parazettel_mcp.main --run-daemon" in message
+    assert "--daemon-status" in message
 
 
 def test_daemon_shutdown_endpoint_stops_server(daemon_server):
