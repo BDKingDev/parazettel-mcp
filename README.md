@@ -144,7 +144,7 @@ All tools are prefixed `pzk_`.
 1. **Markdown files** — source of truth. Human-readable, version-controllable, directly editable. Each note is `{id}.md` with YAML frontmatter.
 2. **Kuzu graph database** — indexing and traversal layer. Used for search, link traversal, and PARA/GTD routing queries. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
 
-> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database, then builds a fresh index into a temporary database and atomically swaps it into place (the live index is never cleared in place). Files that fail to parse are reported rather than silently dropped. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
+> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database, then builds a fresh index into a temporary database and atomically swaps it into place (the live index is never cleared in place). Files that fail to parse are logged, and in direct (in-process) mode also surfaced in the tool's returned message; in daemon-backed mode they appear only in the daemon log. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
 >
 > **Obsidian aliases:** piped wiki links like `[[20260322T181907454570000|Habits and Habit Creation]]` are normalized to the underlying note ID during reads and index rebuilds.
 

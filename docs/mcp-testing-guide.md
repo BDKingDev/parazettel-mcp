@@ -1075,15 +1075,17 @@ Notes processed: N
 Change in note count: 0
 ```
 
-If any `.md` files fail to parse, they are reported instead of being silently dropped, e.g.:
+If any `.md` files fail to parse, they are reported (directly after the backup line) instead of being silently dropped, e.g.:
 
 ```
 Database index rebuilt successfully.
 Backup created: {BACKUP_PATH}
+WARNING: 2 file(s) failed to parse and were skipped: broken-one.md, broken-two.md
 Notes processed: N
 Change in note count: 0
-WARNING: 2 file(s) failed to parse and were skipped: broken-one.md, broken-two.md
 ```
+
+> **Note:** the `WARNING:` line only appears in **direct (in-process) mode**. In daemon-backed mode the facade can't read the skipped-file list back across the RPC boundary, so skipped files are recorded in the **daemon log** rather than the returned message. The rebuild itself still skips and reports them the same way internally.
 
 If the graph database file did not exist yet, the backup line will report that no backup was created.
 
