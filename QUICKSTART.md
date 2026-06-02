@@ -76,7 +76,7 @@ For single-chat direct mode, omit the daemon variables or set `PARAZETTEL_BACKEN
 
 ## 6. Verify
 
-Launch your MCP client and confirm Parazettel is available. The server currently exposes `30` tools.
+Launch your MCP client and confirm Parazettel is available. The server currently exposes `31` tools.
 
 Try one or two real calls:
 

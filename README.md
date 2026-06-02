@@ -105,12 +105,13 @@ All tools are prefixed `pzk_`.
 | `pzk_remove_link` | Remove a link |
 | `pzk_search_notes` | Search by text, tags, type, status, project_id, or area_id |
 | `pzk_get_linked_notes` | Get notes linked to/from a note |
-| `pzk_get_all_tags` | List all tags |
-| `pzk_find_similar_notes` | Find notes similar to a given note |
+| `pzk_get_all_tags` | List every tag in use across the vault (reuse these before inventing new ones) |
+| `pzk_find_similar_notes` | Find notes similar to a given note (content-aware: title/content overlap plus shared tags/links) |
 | `pzk_find_central_notes` | Find most-connected notes |
 | `pzk_find_orphaned_notes` | Find notes with no connections |
 | `pzk_list_notes_by_date` | List notes by creation or update date |
 | `pzk_rebuild_index` | Rebuild the Kuzu graph index from Markdown files |
+| `pzk_check_consistency` | Read-only audit of file-vs-index drift (run before deciding to rebuild) |
 
 ### Task management
 
@@ -143,7 +144,7 @@ All tools are prefixed `pzk_`.
 1. **Markdown files** — source of truth. Human-readable, version-controllable, directly editable. Each note is `{id}.md` with YAML frontmatter.
 2. **Kuzu graph database** — indexing and traversal layer. Used for search, link traversal, and PARA/GTD routing queries. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
 
-> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database before clearing and rebuilding it. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
+> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database, then builds a fresh index into a temporary database and atomically swaps it into place (the live index is never cleared in place). Files that fail to parse are logged, and in direct (in-process) mode also surfaced in the tool's returned message; in daemon-backed mode they appear only in the daemon log. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
 >
 > **Obsidian aliases:** piped wiki links like `[[20260322T181907454570000|Habits and Habit Creation]]` are normalized to the underlying note ID during reads and index rebuilds.
 
@@ -314,7 +315,7 @@ See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-
 | Document | Description |
 | --- | --- |
 | [`docs/para-gtd-guide.md`](docs/para-gtd-guide.md) | PARA/GTD workflow — areas, projects, tasks, today view, reminders |
-| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 26 tools with example calls and expected output |
+| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 31 tools with example calls and expected output |
 | [`docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md`](docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md) | Full link type reference |
 | [`docs/prompts/system/system-prompt.md`](docs/prompts/system/system-prompt.md) | System prompt for Claude |
 | [`docs/prompts/chat/`](docs/prompts/chat/) | Chat prompts for knowledge workflows |

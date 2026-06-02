@@ -73,14 +73,17 @@ This creates:
 
 For symmetric types (`reference`, `related`), both directions use the same link type.
 
-Custom Bidirectional Types
----------------------------
+Bidirectional inverses are automatic
+------------------------------------
 
-Use `bidirectional_type` to specify a non-default inverse:
+When you pass `bidirectional=true`, the reverse link's type is chosen automatically from the forward type — you do not (and cannot) specify it. For example, `supports` ⇄ `supported_by`, `extends` ⇄ `extended_by`, `part_of` ⇄ `has_part`; symmetric types (`reference`, `related`) use the same type both ways.
 
 ```text
-pzk_create_link source_id=NOTE_A target_id=NOTE_B link_type=supports bidirectional=true bidirectional_type=questions
+pzk_create_link source_id=NOTE_A target_id=NOTE_B link_type=supports bidirectional=true
+# creates supports A→B and supported_by B→A
 ```
+
+The `pzk_create_link` parameters are `source_id`, `target_id`, `link_type`, `description`, and `bidirectional`. There is no parameter to override the inverse type.
 
 Best Practices
 ---------------
