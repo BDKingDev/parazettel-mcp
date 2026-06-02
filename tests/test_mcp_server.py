@@ -1,6 +1,7 @@
 # tests/test_mcp_server.py
 """Tests for the MCP server implementation."""
 import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -112,6 +113,173 @@ class TestMcpServer:
             project_id=None,
             area_id="area123",
         )
+
+    def test_create_note_warns_on_likely_duplicate_and_does_not_create(self):
+        """A strong BM25 match blocks creation and surfaces the existing note."""
+        existing = MagicMock()
+        existing.id = "dup123"
+        existing.title = "Atomic notes hold one idea"
+        existing.content = "Each note contains exactly one idea for clarity."
+        existing.tags = [SimpleNamespace(name="zettelkasten")]
+        existing.note_type = NoteType.PERMANENT
+        match = SimpleNamespace(note=existing, score=2.6, matched_terms=set(), matched_context="")
+        self.mock_search_service.search_combined.return_value = [match]
+
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="Atomic notes contain a single idea",
+            content="A note should hold one idea.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        # Surfaced, not created.
+        assert "Not created" in result
+        assert "dup123" in result
+        assert "Atomic notes hold one idea" in result
+        assert "Relevance: 2.6" in result
+        assert "check_duplicates=false" in result
+        self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_create_note_whitespace_title_returns_validation_error(self):
+        """A whitespace-only title is a validation error, not a dedup warning."""
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="   ",
+            content="some content",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        assert "title is required" in result.lower()
+        # Neither the dedup probe nor creation should run for an invalid title.
+        self.mock_search_service.search_combined.assert_not_called()
+        self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_create_note_check_duplicates_false_skips_search(self):
+        """check_duplicates=false creates immediately without a dedup search."""
+        mock_note = MagicMock()
+        mock_note.id = "new123"
+        self.mock_zettel_service.create_note.return_value = mock_note
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="Atomic notes contain a single idea",
+            content="A note should hold one idea.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+            check_duplicates=False,
+        )
+
+        assert "successfully" in result
+        assert "new123" in result
+        self.mock_search_service.search_combined.assert_not_called()
+        self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_note_weak_match_does_not_block(self):
+        """A below-threshold match is ignored; the note is still created."""
+        weak = SimpleNamespace(
+            note=SimpleNamespace(
+                id="weak1",
+                title="Loosely related",
+                content="...",
+                tags=[],
+                note_type=NoteType.PERMANENT,
+            ),
+            score=0.4,
+            matched_terms=set(),
+            matched_context="",
+        )
+        self.mock_search_service.search_combined.return_value = [weak]
+        mock_note = MagicMock()
+        mock_note.id = "created1"
+        self.mock_zettel_service.create_note.return_value = mock_note
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="A distinct new idea",
+            content="Nothing like the rest.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        assert "successfully" in result
+        assert "created1" in result
+        self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_note_strong_non_knowledge_match_does_not_block(self):
+        """A strong match that's a task/project/area never blocks a knowledge note."""
+        task_hit = SimpleNamespace(
+            note=SimpleNamespace(
+                id="task1",
+                title="A distinct new idea",
+                content="task body",
+                tags=[],
+                note_type=NoteType.TASK,
+            ),
+            score=5.0,  # well above threshold
+            matched_terms=set(),
+            matched_context="",
+        )
+        self.mock_search_service.search_combined.return_value = [task_hit]
+        mock_note = MagicMock()
+        mock_note.id = "knowledge1"
+        self.mock_zettel_service.create_note.return_value = mock_note
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="A distinct new idea",
+            content="A genuinely new permanent note.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        # The task match is filtered out, so creation proceeds.
+        assert "successfully" in result
+        assert "knowledge1" in result
+        self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_area_note_skips_duplicate_check(self):
+        """Structural note types (area) are not dedup-checked."""
+        strong = SimpleNamespace(
+            note=SimpleNamespace(id="x", title="x", content="x", tags=[]),
+            score=9.9,
+            matched_terms=set(),
+            matched_context="",
+        )
+        self.mock_search_service.search_combined.return_value = [strong]
+        mock_note = MagicMock()
+        mock_note.id = "area999"
+        self.mock_zettel_service.create_note.return_value = mock_note
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="New Area",
+            content="An ongoing responsibility.",
+            note_type="area",
+        )
+
+        assert "successfully" in result
+        # area type never triggers the dedup search
+        self.mock_search_service.search_combined.assert_not_called()
 
     def test_create_note_tool_passes_status(self):
         """pzk_create_note forwards note status for knowledge-note triage."""

@@ -28,6 +28,24 @@ logger = logging.getLogger(__name__)
 
 _DAEMON_HEALTH_TIMEOUT_SECONDS = 5.0
 
+# Note types that get a duplicate check on create. Knowledge notes only — area,
+# project, and task are structural/action-item types handled by their own tools
+# (pzk_create_area / pzk_create_project / pzk_create_task) and are not deduped.
+_DEDUP_NOTE_TYPES = frozenset(
+    {
+        NoteType.FLEETING,
+        NoteType.LITERATURE,
+        NoteType.PERMANENT,
+        NoteType.STRUCTURE,
+        NoteType.HUB,
+    }
+)
+# A candidate must clear this BM25 relevance score to count as a likely
+# duplicate. Tuned to flag clear title/content overlap without crying wolf on
+# every loosely-related note; callers can always bypass with check_duplicates.
+_DEDUP_MIN_SCORE = 1.5
+_DEDUP_MAX_CANDIDATES = 5
+
 
 class BackendBundle(Protocol):
     """Service bundle contract for direct and daemon-backed MCP execution."""
@@ -148,6 +166,79 @@ class ZettelkastenMcpServer:
             logger.error(f"Unexpected error [{error_id}]: {str(error)}", exc_info=True)
             return f"An unexpected error occurred. Error ID: {error_id}"
 
+    def _find_duplicate_candidates(
+        self, title: str, content: str
+    ) -> List[Tuple[Note, float]]:
+        """Return existing notes that look like near-duplicates of (title, content).
+
+        Uses the same BM25 text search as pzk_search_notes. The title is the
+        strongest dedup signal, so it leads the query, with a little content
+        context appended. Best-effort: any search failure yields no candidates
+        (creation should never be blocked by a flaky dedup probe).
+        """
+        query = title.strip()
+        if content:
+            # Slice before strip so a large note body isn't fully stripped just
+            # to take a 200-char lead; only append when the slice is non-empty.
+            content_lead = content[:200].strip()
+            if content_lead:
+                query = f"{query} {content_lead}"
+        if not query.strip():
+            return []
+        try:
+            results = self.search_service.search_combined(text=query)
+        except Exception as exc:  # pragma: no cover - dedup is advisory only
+            logger.warning("Duplicate check skipped (search failed): %s", exc)
+            return []
+
+        candidates: List[Tuple[Note, float]] = []
+        for result in results:
+            score = result.score
+            if not isinstance(score, (int, float)):
+                continue
+            if score < _DEDUP_MIN_SCORE:
+                continue
+            # Only knowledge notes are duplicate candidates — an unrelated task,
+            # project, or area match must never block creating a knowledge note.
+            if result.note.note_type not in _DEDUP_NOTE_TYPES:
+                continue
+            candidates.append((result.note, float(score)))
+            if len(candidates) >= _DEDUP_MAX_CANDIDATES:
+                break
+        return candidates
+
+    @staticmethod
+    def _format_duplicate_warning(
+        title: str, duplicates: List[Tuple[Note, float]]
+    ) -> str:
+        """Render the 'possible duplicates found, not created' response."""
+        lines = [
+            f'Not created: "{title}" looks similar to {len(duplicates)} existing '
+            f"note(s). Review them before adding a near-duplicate:",
+            "",
+        ]
+        for i, (note, score) in enumerate(duplicates, 1):
+            # Slice before normalizing so we don't process a huge note body just
+            # to truncate it to 160 chars. A little headroom (200) covers any
+            # whitespace collapsed out of the lead.
+            snippet = note.content[:200].replace("\n", " ").strip()
+            if len(snippet) > 160:
+                snippet = snippet[:160] + "..."
+            lines.append(f"{i}. {note.title} (ID: {note.id})")
+            lines.append(f"   Relevance: {score:.3f}")
+            if note.tags:
+                lines.append(
+                    f"   Tags: {', '.join(tag.name for tag in note.tags)}"
+                )
+            lines.append(f"   Preview: {snippet}")
+            lines.append("")
+        lines.append(
+            "If one of these is the same idea, update it with pzk_update_note "
+            "instead of creating a new note. If this note is genuinely distinct, "
+            "call pzk_create_note again with check_duplicates=false to create it."
+        )
+        return "\n".join(lines)
+
     @staticmethod
     def _format_note_result(note: Note) -> str:
         """Render a note using the standard MCP note output."""
@@ -233,6 +324,7 @@ class ZettelkastenMcpServer:
             status: Optional[str] = None,
             project_id: Optional[str] = None,
             area_id: Optional[str] = None,
+            check_duplicates: bool = True,
         ) -> str:
             """Create a new Zettelkasten note.
             Args:
@@ -246,8 +338,20 @@ class ZettelkastenMcpServer:
                 status: Optional workflow status such as inbox, evergreen, or archived.
                 project_id: Optional project to route the note under; inherits the project's area.
                 area_id: ID of the area this note belongs to when project_id is not provided.
+                check_duplicates: When True (default), search for existing notes that look
+                    like near-duplicates of this title/content BEFORE creating. If strong
+                    matches are found, the note is NOT created and the matches are returned
+                    for you to review — then either update the existing note with
+                    pzk_update_note, or call pzk_create_note again with check_duplicates=false
+                    to create it anyway. Set to false to skip the check.
             """
             try:
+                # Validate title up front so an empty/whitespace-only title
+                # returns the expected validation error rather than being routed
+                # into the duplicate-check path (which runs before create_note).
+                if not title or not title.strip():
+                    return "Error: title is required."
+
                 # Convert note_type string to enum
                 try:
                     note_type_enum = NoteType(note_type.lower())
@@ -323,6 +427,16 @@ class ZettelkastenMcpServer:
                             return (
                                 f"area_id {resolved_area_id} is not a valid area note."
                             )
+
+                # Before creating, surface likely duplicates so the caller can
+                # decide to reuse/update an existing note instead of silently
+                # accreting a near-identical one. Knowledge notes only — area /
+                # project / task are structural/action-item types handled by their
+                # own create tools.
+                if check_duplicates and note_type_enum in _DEDUP_NOTE_TYPES:
+                    duplicates = self._find_duplicate_candidates(title, content)
+                    if duplicates:
+                        return self._format_duplicate_warning(title, duplicates)
 
                 # Create the note
                 note = self.zettel_service.create_note(
