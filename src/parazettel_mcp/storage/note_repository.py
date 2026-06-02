@@ -398,7 +398,12 @@ class NoteRepository(Repository[Note]):
         except OSError:
             pass
         finally:
-            os.close(dir_fd)
+            # Swallow close errors too: directory fsync is best-effort and must
+            # never fail the write path (consistent with the docstring).
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
 
     def rebuild_index_if_needed(self) -> None:
         """Rebuild the graph index from files when the ID sets diverge."""
