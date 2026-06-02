@@ -1095,20 +1095,26 @@ Read-only audit that compares the Markdown files (the source of truth) against t
 
 **Call:** *(no parameters)*
 
-**Expected output:** a summary with counts plus any offending note IDs:
+**Expected output:** a human-readable summary. When everything matches:
 
 ```
-total_files: N
-total_indexed: N
-in_sync: N
-missing_from_index: []   # a {id}.md exists on disk but no Note node is indexed
-missing_from_files: []   # a Note node is indexed but its file is gone
-content_drift: []        # both exist but the file body differs from the index
-unreadable_files: []
-consistent: true
+Files and index are consistent.
+Files: N, Indexed: N, In sync: N
 ```
 
-When `consistent` is `false`, run `pzk_rebuild_index` to reconcile.
+When there is drift, each non-empty category is listed with a capped preview of the offending note IDs:
+
+```
+Drift detected between files and index.
+Files: N, Indexed: N, In sync: N
+
+Files missing from index (1): 20260516T234131539013000
+Content drift (file != index) (2): 20260101T000000000000000, 20260102T000000000000000
+
+Run pzk_rebuild_index to reconcile.
+```
+
+The categories are: **Files missing from index** (a `{id}.md` exists on disk but no Note node is indexed), **Indexed notes with no file** (a Note node is indexed but its file is gone), **Content drift (file != index)** (both exist but the file body differs from the index), and **Unreadable files**. Run `pzk_rebuild_index` to reconcile.
 
 ---
 

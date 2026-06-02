@@ -105,7 +105,7 @@ All tools are prefixed `pzk_`.
 | `pzk_remove_link` | Remove a link |
 | `pzk_search_notes` | Search by text, tags, type, status, project_id, or area_id |
 | `pzk_get_linked_notes` | Get notes linked to/from a note |
-| `pzk_get_all_tags` | List all tags currently applied to a note (reuse these before inventing new ones) |
+| `pzk_get_all_tags` | List every tag in use across the vault (reuse these before inventing new ones) |
 | `pzk_find_similar_notes` | Find notes similar to a given note (content-aware: title/content overlap plus shared tags/links) |
 | `pzk_find_central_notes` | Find most-connected notes |
 | `pzk_find_orphaned_notes` | Find notes with no connections |
