@@ -61,6 +61,9 @@ _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
 _GRAPH_BATCH_SIZE = 100
+# Cap how many skipped filenames are inlined into the rebuild warning log so a
+# mass parse failure can't emit one enormous log line.
+_REBUILD_SKIPPED_LOG_LIMIT = 10
 
 _NOTE_SELECT = (
     "n.id AS id, n.title AS title, n.content AS content, n.note_type AS note_type, "
@@ -489,6 +492,9 @@ class NoteRepository(Repository[Note]):
         note appears before the target note in filesystem order.
         """
         self._assert_writable()
+        # Reset up front so a failure before parsing completes (e.g. during backup
+        # creation), or a concurrent reader, never sees a previous rebuild's list.
+        self.last_rebuild_skipped = []
         backup_path = self._create_graph_backup()
         note_files = list(self.notes_dir.glob("*.md"))
         notes: List[Note] = []
@@ -506,10 +512,13 @@ class NoteRepository(Repository[Note]):
         # otherwise quietly shrink the searchable corpus while reporting success.
         self.last_rebuild_skipped = skipped
         if skipped:
+            preview = ", ".join(skipped[:_REBUILD_SKIPPED_LOG_LIMIT])
+            if len(skipped) > _REBUILD_SKIPPED_LOG_LIMIT:
+                preview += f", … (+{len(skipped) - _REBUILD_SKIPPED_LOG_LIMIT} more)"
             logger.warning(
                 "rebuild_index skipped %d unparseable note file(s): %s",
                 len(skipped),
-                ", ".join(skipped),
+                preview,
             )
 
         with self._connection() as conn:

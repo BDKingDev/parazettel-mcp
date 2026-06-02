@@ -1587,6 +1587,48 @@ class TestMcpServer:
         assert "Backup created: backup-2026-04-23.db" in result
         assert "Notes processed: 2" in result
         assert "Change in note count: -1" in result
+        # No skipped files -> no warning line.
+        assert "WARNING" not in result
+
+    def test_rebuild_index_tool_reports_skipped_files(self):
+        """pzk_rebuild_index surfaces unparseable files via a WARNING line."""
+        self.mock_zettel_service.get_all_notes.side_effect = [
+            [MagicMock(), MagicMock()],
+            [MagicMock(), MagicMock()],
+        ]
+        self.mock_zettel_service.rebuild_index.return_value = "backup.db"
+        self.mock_zettel_service.repository.last_rebuild_skipped = [
+            "broken-one.md",
+            "broken-two.md",
+        ]
+
+        fn = self.registered_tools["pzk_rebuild_index"]
+        result = fn()
+
+        assert "Database index rebuilt successfully." in result
+        assert "WARNING: 2 file(s) failed to parse and were skipped:" in result
+        assert "broken-one.md" in result
+        assert "broken-two.md" in result
+
+    def test_rebuild_index_tool_caps_skipped_file_preview(self):
+        """The skipped-files warning previews at most 10 names then summarizes."""
+        self.mock_zettel_service.get_all_notes.side_effect = [
+            [MagicMock()],
+            [MagicMock()],
+        ]
+        self.mock_zettel_service.rebuild_index.return_value = "backup.db"
+        self.mock_zettel_service.repository.last_rebuild_skipped = [
+            f"broken-{i}.md" for i in range(13)
+        ]
+
+        fn = self.registered_tools["pzk_rebuild_index"]
+        result = fn()
+
+        assert "WARNING: 13 file(s) failed to parse and were skipped:" in result
+        assert "… (+3 more)" in result
+        assert "broken-0.md" in result
+        # The 11th+ names are summarized, not listed.
+        assert "broken-12.md" not in result
 
     def test_create_area_tool_passes_cadence_and_tags(self):
         """pzk_create_area forwards cadence and parsed tag values."""
