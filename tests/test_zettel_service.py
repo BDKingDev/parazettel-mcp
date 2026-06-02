@@ -575,8 +575,11 @@ def test_concurrent_same_note_updates_stay_consistent(zettel_service):
     threads = [threading.Thread(target=write, args=(i,)) for i in writers]
     for t in threads:
         t.start()
+    # Join with a timeout so a lock regression that deadlocks update_note fails
+    # the test fast instead of hanging the whole suite.
     for t in threads:
-        t.join()
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "update_note deadlocked"
 
     assert not errors, f"update threads raised: {errors}"
     final = zettel_service.get_note(note.id)
@@ -643,3 +646,68 @@ def test_concurrent_link_changes_on_same_pair_do_not_deadlock(zettel_service):
     # Graph is still consistent and readable.
     assert zettel_service.get_note(a.id) is not None
     assert zettel_service.get_note(b.id) is not None
+
+
+def test_concurrent_task_reassignment_and_parent_edits_stay_consistent(zettel_service):
+    """Routing updates lock both endpoints, so a parent's HAS_PART isn't clobbered.
+
+    A task reassignment rewrites the new project's HAS_PART link while another
+    thread edits that same project. Because update_task/update_note now lock the
+    task AND its current/new project up front (stable order), the parent update
+    can't be lost and the operations can't deadlock.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    proj_a = zettel_service.create_project_note(
+        title="Project A", content="a", area_id=area.id
+    )
+    proj_b = zettel_service.create_project_note(
+        title="Project B", content="b", area_id=area.id
+    )
+    task = zettel_service.create_task(
+        title="Roaming task", content="t", project_id=proj_a.id
+    )
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def reassign() -> None:
+        try:
+            barrier.wait()
+            for _ in range(5):
+                zettel_service.update_task(task.id, project_id=proj_b.id)
+                zettel_service.update_task(task.id, project_id=proj_a.id)
+        except Exception as exc:  # pragma: no cover
+            errors.append(("reassign", exc))
+
+    def edit_parent() -> None:
+        try:
+            barrier.wait()
+            for i in range(5):
+                # Concurrently edit project B (a routing endpoint) directly.
+                zettel_service.update_note(proj_b.id, content=f"b-{i}")
+        except Exception as exc:  # pragma: no cover
+            errors.append(("edit_parent", exc))
+
+    threads = [threading.Thread(target=reassign), threading.Thread(target=edit_parent)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads), "routing update deadlocked"
+    assert not errors, f"routing threads raised: {errors}"
+
+    # Final state: task ends on project A; project A must still record the task as
+    # a child (HAS_PART), and project B must not (the reassignment removed it).
+    final_task = zettel_service.get_note(task.id)
+    assert final_task.project_id == proj_a.id
+    a_children = {
+        link.target_id
+        for link in zettel_service.get_note(proj_a.id).links
+        if link.link_type == LinkType.HAS_PART
+    }
+    assert task.id in a_children, "parent A lost its HAS_PART link to the task"

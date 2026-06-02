@@ -53,39 +53,53 @@ class ZettelService:
         # otherwise last-writer-win. A registry lock guards the registry itself.
         self._note_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._note_locks_registry_lock = threading.Lock()
+        # Note ids whose lock the *current thread* already holds. Lets nested
+        # acquisitions (e.g. a routing helper that also touches the parent note
+        # while an update already holds the child's lock) skip re-acquiring an
+        # owned lock instead of deadlocking on the non-reentrant Lock.
+        self._held_note_ids = threading.local()
+
+    def _owned_ids(self) -> Set[str]:
+        owned = getattr(self._held_note_ids, "ids", None)
+        if owned is None:
+            owned = set()
+            self._held_note_ids.ids = owned
+        return owned
 
     @contextmanager
     def _note_lock(self, note_id: str) -> Iterator[None]:
-        """Serialize mutations to a single note across threads.
-
-        Acquired at the service layer so it spans the whole read-modify-write,
-        and always before the repository's file lock to keep a consistent lock
-        order (no deadlock).
-        """
-        with self._note_locks_registry_lock:
-            lock = self._note_locks[note_id]
-        with lock:
+        """Serialize mutations to a single note (see _note_locks_for)."""
+        with self._note_locks_for(note_id):
             yield
 
     @contextmanager
     def _note_locks_for(self, *note_ids: str) -> Iterator[None]:
-        """Lock several notes at once for a multi-note mutation (e.g. a link).
+        """Acquire per-note locks for one or more notes, deadlock- and reentrancy-safe.
 
-        Locks are always acquired in a stable order (sorted, de-duplicated) so
-        two concurrent operations touching the same pair can't deadlock by
-        grabbing them in opposite orders.
+        Locks the requested notes that this thread does not already hold, always
+        in a global stable order (sorted ids), so two operations touching an
+        overlapping set can't deadlock by grabbing them in opposite orders. Ids
+        already owned by the current thread are skipped (the underlying Lock is
+        non-reentrant), which lets a routing helper acquire the parent/area lock
+        while the enclosing update already holds the child's lock.
+
+        Locks are taken at the service layer so they span the whole
+        read-modify-write, and always before the repository's file lock.
         """
-        ordered = sorted({nid for nid in note_ids if nid})
+        owned = self._owned_ids()
+        to_acquire = sorted({nid for nid in note_ids if nid and nid not in owned})
         with self._note_locks_registry_lock:
-            locks = [self._note_locks[nid] for nid in ordered]
+            locks = [(nid, self._note_locks[nid]) for nid in to_acquire]
         acquired = []
         try:
-            for lock in locks:
+            for nid, lock in locks:
                 lock.acquire()
-                acquired.append(lock)
+                acquired.append((nid, lock))
+                owned.add(nid)
             yield
         finally:
-            for lock in reversed(acquired):
+            for nid, lock in reversed(acquired):
+                owned.discard(nid)
                 lock.release()
 
     def initialize(self) -> None:
@@ -129,19 +143,25 @@ class ZettelService:
         return note
 
     def _ensure_parent_has_part_link(self, parent_id: Optional[str], child_id: str) -> None:
-        """Update the parent note once so it reflects the child relationship."""
+        """Update the parent note once so it reflects the child relationship.
+
+        Takes the parent's per-note lock (a no-op if the caller already holds it)
+        so the parent's HAS_PART read-modify-write isn't clobbered by a
+        concurrent edit to that parent.
+        """
         if not parent_id:
             return
-        parent = self.repository.get(parent_id)
-        if not parent:
-            raise ValueError(f"Parent note with ID {parent_id} not found")
-        if any(
-            link.target_id == child_id and link.link_type == LinkType.HAS_PART
-            for link in parent.links
-        ):
-            return
-        parent.add_link(child_id, LinkType.HAS_PART)
-        self.repository.update(parent)
+        with self._note_locks_for(parent_id):
+            parent = self.repository.get(parent_id)
+            if not parent:
+                raise ValueError(f"Parent note with ID {parent_id} not found")
+            if any(
+                link.target_id == child_id and link.link_type == LinkType.HAS_PART
+                for link in parent.links
+            ):
+                return
+            parent.add_link(child_id, LinkType.HAS_PART)
+            self.repository.update(parent)
 
     def _attach_area_reference_link(self, note_id: str, area_id: Optional[str]) -> Note:
         """Ensure a newly created note references its assigned area."""
@@ -309,8 +329,15 @@ class ZettelService:
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
     ) -> Note:
-        """Update an existing note (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        """Update an existing note (serialized per note against concurrent edits).
+
+        Acquires the locks for every note this update may also touch — the note
+        itself plus its current and new parent/area (routing changes update the
+        parent's HAS_PART link too) — up front in one stable-ordered acquisition,
+        so the cross-note routing updates can't lose writes or deadlock.
+        """
+        related = self._related_routing_ids(note_id, project_id, area_id)
+        with self._note_locks_for(note_id, *related):
             return self._update_note_locked(
                 note_id,
                 title=title,
@@ -322,6 +349,33 @@ class ZettelService:
                 project_id=project_id,
                 area_id=area_id,
             )
+
+    def _related_routing_ids(
+        self, note_id: str, project_id: Any, area_id: Any
+    ) -> List[str]:
+        """Best-effort set of other note ids an update/routing change may mutate.
+
+        Read without a lock purely to size the lock set; the authoritative work
+        re-reads under the held locks. Includes the note's current parent/area
+        and any incoming new project/area routing, so all endpoints of a
+        PART_OF/HAS_PART or area-reference change are locked together.
+        """
+        ids: Set[str] = set()
+        note = self.repository.get(note_id)
+        if note:
+            if note.project_id:
+                ids.add(note.project_id)
+            if note.area_id:
+                ids.add(note.area_id)
+        if isinstance(project_id, str) and project_id:
+            ids.add(project_id)
+            project = self.repository.get(project_id)
+            if project and project.area_id:
+                ids.add(project.area_id)
+        if isinstance(area_id, str) and area_id:
+            ids.add(area_id)
+        ids.discard(note_id)
+        return sorted(ids)
 
     def _update_note_locked(
         self,
@@ -887,8 +941,14 @@ class ZettelService:
         recurrence_rule: Any = _UNSET,
         tags: Any = _UNSET,
     ) -> Note:
-        """Update task fields (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        """Update task fields (serialized per note against concurrent edits).
+
+        Locks the task plus its current and new project/area up front (a project
+        reassignment also rewrites the project's HAS_PART link), in one stable
+        order, so cross-note routing updates stay consistent and deadlock-free.
+        """
+        related = self._related_routing_ids(note_id, project_id, _UNSET)
+        with self._note_locks_for(note_id, *related):
             return self._update_task_locked(
                 note_id,
                 status=status,
