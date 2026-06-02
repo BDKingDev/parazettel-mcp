@@ -819,11 +819,11 @@ Found 1 matching notes:
    Relevance: 1.842
    Tags: zettelkasten, methodology, atomicity, core-principle
    Created: 2026-03-26
-   Match: Each note contains exactly one idea. This constraint forces clarity...
+   Match: Title: Atomic notes are the foundation of Zettelkasten
 
 ```
 
-For a text `query`, results are ranked by the Kuzu full-text **BM25 relevance score**, and each hit shows a `Relevance:` line (higher = stronger match) so a strong match is distinguishable from a weak one. The `Match:` line shows why the note matched (the matched title/content context); it replaces the `Preview:` line, which is only shown when there is no matched context (e.g. a tag- or type-only filter with no text query).
+For a text `query`, results are ranked by the Kuzu full-text **BM25 relevance score**, and each hit shows a `Relevance:` line (higher = stronger match) so a strong match is distinguishable from a weak one. The `Match:` line shows *why* the note matched and is prefixed with the field it matched — `Title: …` when the query hits the title (as above, since "atomic" is in the title) or `Content: …<snippet>…` when it hits the body. It replaces the `Preview:` line, which is only shown when there is no matched context (e.g. a tag- or type-only filter with no text query).
 
 **Call (by note\_type):**
 
