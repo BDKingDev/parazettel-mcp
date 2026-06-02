@@ -594,3 +594,52 @@ def test_concurrent_same_note_updates_stay_consistent(zettel_service):
     assert not any(tok in final.content for tok in other_tokens), (
         f"torn write: foreign writer token present in {final.content!r}"
     )
+
+
+def test_concurrent_link_changes_on_same_pair_do_not_deadlock(zettel_service):
+    """create_link/remove_link on the same note pair are lock-ordered (no deadlock).
+
+    Two notes linked/unlinked from opposite directions by many threads must lock
+    their endpoints in a stable order; otherwise an A->B / B->A acquisition could
+    deadlock. The test passes if every thread completes (no hang) and the graph
+    stays readable afterward.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    a = zettel_service.create_note(
+        title="Note A", content="a", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    b = zettel_service.create_note(
+        title="Note B", content="b", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def churn(i: int) -> None:
+        try:
+            barrier.wait()
+            # Half the threads work A->B, half B->A — opposite orders on the
+            # same pair, which is exactly the deadlock-prone pattern.
+            src, tgt = (a.id, b.id) if i % 2 == 0 else (b.id, a.id)
+            for _ in range(5):
+                zettel_service.create_link(src, tgt, LinkType.RELATED)
+                zettel_service.remove_link(src, tgt, LinkType.RELATED)
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=churn, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    # A generous join timeout turns a deadlock into a test failure instead of a hang.
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "link churn deadlocked"
+    assert not errors, f"link churn raised: {errors}"
+
+    # Graph is still consistent and readable.
+    assert zettel_service.get_note(a.id) is not None
+    assert zettel_service.get_note(b.id) is not None

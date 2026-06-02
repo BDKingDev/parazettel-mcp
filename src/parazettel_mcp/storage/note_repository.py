@@ -350,6 +350,12 @@ class NoteRepository(Repository[Note]):
                         f.flush()
                         os.fsync(f.fileno())
                     tmp_path.replace(file_path)
+                    # Persist the rename itself: on POSIX the directory entry can
+                    # otherwise be lost on power loss even though the file's data
+                    # was synced. Best-effort — not all platforms/filesystems
+                    # allow opening a directory for fsync (e.g. Windows), so a
+                    # failure here must not fail the write.
+                    self._fsync_dir(file_path.parent)
                 return
             except OSError as e:
                 last_error = e
@@ -369,6 +375,26 @@ class NoteRepository(Repository[Note]):
         raise IOError(
             f"Failed to write note to {file_path}: {last_error}"
         ) from last_error
+
+    @staticmethod
+    def _fsync_dir(dir_path: Path) -> None:
+        """Best-effort fsync of a directory so a rename survives power loss.
+
+        Required on POSIX to durably persist the directory entry created by the
+        atomic replace. Windows (and some filesystems) don't support opening a
+        directory for fsync, so any failure is swallowed — durability of the
+        rename is a best-effort guarantee, not a hard one.
+        """
+        try:
+            dir_fd = os.open(str(dir_path), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
 
     def rebuild_index_if_needed(self) -> None:
         """Rebuild the graph index from files when the ID sets diverge."""

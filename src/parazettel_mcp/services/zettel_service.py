@@ -67,6 +67,27 @@ class ZettelService:
         with lock:
             yield
 
+    @contextmanager
+    def _note_locks_for(self, *note_ids: str) -> Iterator[None]:
+        """Lock several notes at once for a multi-note mutation (e.g. a link).
+
+        Locks are always acquired in a stable order (sorted, de-duplicated) so
+        two concurrent operations touching the same pair can't deadlock by
+        grabbing them in opposite orders.
+        """
+        ordered = sorted({nid for nid in note_ids if nid})
+        with self._note_locks_registry_lock:
+            locks = [self._note_locks[nid] for nid in ordered]
+        acquired = []
+        try:
+            for lock in locks:
+                lock.acquire()
+                acquired.append(lock)
+            yield
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
     def initialize(self) -> None:
         """Initialize the service and dependencies."""
         # Nothing to do here for synchronous implementation
@@ -129,7 +150,9 @@ class ZettelService:
             raise ValueError(f"Note with ID {note_id} not found")
         if not area_id or note.note_type == NoteType.AREA or area_id == note.id:
             return note
-        note, _ = self.create_link(note.id, area_id, LinkType.REFERENCE)
+        # Already inside a locked update of note.id; use the unlocked impl so we
+        # don't re-enter the non-reentrant per-note lock.
+        note, _ = self._create_link_locked(note.id, area_id, LinkType.REFERENCE)
         return note
 
     def _sync_part_of_link(
@@ -149,7 +172,9 @@ class ZettelService:
                 self.repository.update(previous_parent)
 
         if parent_id and previous_parent_id != parent_id:
-            note, _ = self.create_link(note.id, parent_id, LinkType.PART_OF, bidirectional=True)
+            note, _ = self._create_link_locked(
+                note.id, parent_id, LinkType.PART_OF, bidirectional=True
+            )
         return note
 
     def _sync_project_area_links(
@@ -202,7 +227,7 @@ class ZettelService:
             note = self.repository.update(note)
 
         if area_id and area_id != note.id:
-            note, _ = self.create_link(note.id, area_id, LinkType.REFERENCE)
+            note, _ = self._create_link_locked(note.id, area_id, LinkType.REFERENCE)
 
         return note
 
@@ -438,20 +463,22 @@ class ZettelService:
         return self.repository.find_by_tag(tag)
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
-        """Add a tag to a note."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        note.add_tag(tag)
-        return self.repository.update(note)
+        """Add a tag to a note (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            note = self.repository.get(note_id)
+            if not note:
+                raise ValueError(f"Note with ID {note_id} not found")
+            note.add_tag(tag)
+            return self.repository.update(note)
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
-        """Remove a tag from a note."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        note.remove_tag(tag)
-        return self.repository.update(note)
+        """Remove a tag from a note (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            note = self.repository.get(note_id)
+            if not note:
+                raise ValueError(f"Note with ID {note_id} not found")
+            note.remove_tag(tag)
+            return self.repository.update(note)
 
     def get_all_tags(self) -> List[Tag]:
         """Get all tags in the system."""
@@ -466,7 +493,32 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Create a link between notes with proper bidirectional semantics.
+        """Create a link between notes (serialized per note against concurrent edits).
+
+        Locks both endpoints (in a stable order) so a concurrent edit to either
+        note can't interleave with this read-modify-write. Internal callers that
+        already hold a note's lock use _create_link_locked instead.
+        """
+        with self._note_locks_for(source_id, target_id):
+            return self._create_link_locked(
+                source_id,
+                target_id,
+                link_type=link_type,
+                description=description,
+                bidirectional=bidirectional,
+                bidirectional_type=bidirectional_type,
+            )
+
+    def _create_link_locked(
+        self,
+        source_id: str,
+        target_id: str,
+        link_type: LinkType = LinkType.REFERENCE,
+        description: Optional[str] = None,
+        bidirectional: bool = False,
+        bidirectional_type: Optional[LinkType] = None,
+    ) -> Tuple[Note, Optional[Note]]:
+        """Create-link implementation; caller holds the relevant note lock(s).
 
         Args:
             source_id: ID of the source note
@@ -526,26 +578,33 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Remove a link between notes."""
-        source_note = self.repository.get(source_id)
-        if not source_note:
-            raise ValueError(f"Source note with ID {source_id} not found")
+        """Remove a link between notes (serialized per note against concurrent edits).
 
-        # Remove link from source to target
-        source_note.remove_link(target_id, link_type)
-        source_note = self.repository.update(source_note)
+        Locks both endpoints in a stable order so a concurrent edit to either
+        note can't interleave with this read-modify-write.
+        """
+        with self._note_locks_for(source_id, target_id):
+            source_note = self.repository.get(source_id)
+            if not source_note:
+                raise ValueError(f"Source note with ID {source_id} not found")
 
-        # If bidirectional, remove link from target to source
-        reverse_note = None
-        if bidirectional:
-            target_note = self.repository.get(target_id)
-            if target_note:
-                if bidirectional_type is None and link_type is not None:
-                    bidirectional_type = _INVERSE_LINK_TYPES.get(link_type, link_type)
-                target_note.remove_link(source_id, bidirectional_type)
-                reverse_note = self.repository.update(target_note)
+            # Remove link from source to target
+            source_note.remove_link(target_id, link_type)
+            source_note = self.repository.update(source_note)
 
-        return source_note, reverse_note
+            # If bidirectional, remove link from target to source
+            reverse_note = None
+            if bidirectional:
+                target_note = self.repository.get(target_id)
+                if target_note:
+                    if bidirectional_type is None and link_type is not None:
+                        bidirectional_type = _INVERSE_LINK_TYPES.get(
+                            link_type, link_type
+                        )
+                    target_note.remove_link(source_id, bidirectional_type)
+                    reverse_note = self.repository.update(target_note)
+
+            return source_note, reverse_note
 
     def get_linked_notes(self, note_id: str, direction: str = "outgoing") -> List[Note]:
         """Get notes linked to/from a note."""
