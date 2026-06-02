@@ -2,8 +2,10 @@
 
 import datetime
 import logging
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (
@@ -45,6 +47,27 @@ class ZettelService:
     def __init__(self, repository: Optional[NoteRepository] = None):
         """Initialize the service."""
         self.repository = repository or NoteRepository()
+        # A single global write lock serializes ALL mutating operations. The
+        # underlying Kuzu database is single-writer (only one write transaction
+        # may exist process-wide), and the daemon dispatches RPC calls on
+        # separate threads, so concurrent writes — even to *different* notes —
+        # must be serialized or Kuzu raises. A reentrant lock lets a mutator call
+        # another mutator (e.g. update_task -> update_task_status, or a routing
+        # helper that also rewrites the parent) without self-deadlocking, and it
+        # blocks (queues) rather than failing, so overlapping callers run in turn.
+        self._write_lock = threading.RLock()
+
+    @contextmanager
+    def _write_locked(self) -> Iterator[None]:
+        """Serialize a mutating operation against all other writers.
+
+        Held across the whole read-modify-write (and any nested mutators) so a
+        note's get -> mutate -> update can't interleave with another writer, and
+        so two writes never hit Kuzu's single write transaction at once. Callers
+        block until the lock is free rather than erroring.
+        """
+        with self._write_lock:
+            yield
 
     def initialize(self) -> None:
         """Initialize the service and dependencies."""
@@ -87,29 +110,25 @@ class ZettelService:
         return note
 
     def _ensure_parent_has_part_link(self, parent_id: Optional[str], child_id: str) -> None:
-        """Update the parent note once so it reflects the child relationship."""
+        """Update the parent note once so it reflects the child relationship.
+
+        Serialized by the global write lock (reentrant, so this is safe whether
+        or not the caller already holds it) so the parent's HAS_PART
+        read-modify-write isn't clobbered by a concurrent writer.
+        """
         if not parent_id:
             return
-        parent = self.repository.get(parent_id)
-        if not parent:
-            raise ValueError(f"Parent note with ID {parent_id} not found")
-        if any(
-            link.target_id == child_id and link.link_type == LinkType.HAS_PART
-            for link in parent.links
-        ):
-            return
-        parent.add_link(child_id, LinkType.HAS_PART)
-        self.repository.update(parent)
-
-    def _attach_area_reference_link(self, note_id: str, area_id: Optional[str]) -> Note:
-        """Ensure a newly created note references its assigned area."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        if not area_id or note.note_type == NoteType.AREA or area_id == note.id:
-            return note
-        note, _ = self.create_link(note.id, area_id, LinkType.REFERENCE)
-        return note
+        with self._write_locked():
+            parent = self.repository.get(parent_id)
+            if not parent:
+                raise ValueError(f"Parent note with ID {parent_id} not found")
+            if any(
+                link.target_id == child_id and link.link_type == LinkType.HAS_PART
+                for link in parent.links
+            ):
+                return
+            parent.add_link(child_id, LinkType.HAS_PART)
+            self.repository.update(parent)
 
     def _sync_part_of_link(
         self, note_id: str, previous_parent_id: Optional[str], parent_id: Optional[str]
@@ -128,7 +147,9 @@ class ZettelService:
                 self.repository.update(previous_parent)
 
         if parent_id and previous_parent_id != parent_id:
-            note, _ = self.create_link(note.id, parent_id, LinkType.PART_OF, bidirectional=True)
+            note, _ = self._create_link_locked(
+                note.id, parent_id, LinkType.PART_OF, bidirectional=True
+            )
         return note
 
     def _sync_project_area_links(
@@ -181,7 +202,7 @@ class ZettelService:
             note = self.repository.update(note)
 
         if area_id and area_id != note.id:
-            note, _ = self.create_link(note.id, area_id, LinkType.REFERENCE)
+            note, _ = self._create_link_locked(note.id, area_id, LinkType.REFERENCE)
 
         return note
 
@@ -202,45 +223,51 @@ class ZettelService:
             raise ValueError("Title is required")
         if not content:
             raise ValueError("Content is required")
-        if area_id and note_type != NoteType.AREA:
-            self._get_area_for_routing(area_id)
 
-        resolved_area_id = area_id
-        if project_id:
-            project = self._get_project_for_routing(project_id)
-            project_area_id = project.area_id
-            if project_area_id:
-                if resolved_area_id and resolved_area_id != project_area_id:
+        # Hold the write lock across routing validation AND the create, so a
+        # concurrent re-route of the project/area between resolving the inherited
+        # area_id and persisting the note can't make it inherit stale routing
+        # (TOCTOU). Reentrant, so the nested create/link calls don't re-deadlock.
+        with self._write_locked():
+            if area_id and note_type != NoteType.AREA:
+                self._get_area_for_routing(area_id)
+
+            resolved_area_id = area_id
+            if project_id:
+                project = self._get_project_for_routing(project_id)
+                project_area_id = project.area_id
+                if project_area_id:
+                    if resolved_area_id and resolved_area_id != project_area_id:
+                        raise ValueError(
+                            f"area_id {resolved_area_id} does not match project "
+                            f"{project_id} area_id {project_area_id}"
+                        )
+                    resolved_area_id = project_area_id
+                elif not resolved_area_id:
                     raise ValueError(
-                        f"area_id {resolved_area_id} does not match project "
-                        f"{project_id} area_id {project_area_id}"
+                        f"Project {project_id} does not have an area_id to inherit"
                     )
-                resolved_area_id = project_area_id
-            elif not resolved_area_id:
-                raise ValueError(
-                    f"Project {project_id} does not have an area_id to inherit"
-                )
 
-        # Create note object
-        note = Note(
-            title=title,
-            content=content,
-            note_type=note_type,
-            tags=[Tag(name=tag) for tag in (tags or [])],
-            metadata=metadata or {},
-            source=source,
-            status=status,
-            project_id=project_id,
-            area_id=resolved_area_id,
-        )
+            # Create note object
+            note = Note(
+                title=title,
+                content=content,
+                note_type=note_type,
+                tags=[Tag(name=tag) for tag in (tags or [])],
+                metadata=metadata or {},
+                source=source,
+                status=status,
+                project_id=project_id,
+                area_id=resolved_area_id,
+            )
 
-        if note_type == NoteType.AREA:
-            note.area_id = note.id
-        else:
-            note = self._seed_routing_links(note, parent_id=project_id)
+            if note_type == NoteType.AREA:
+                note.area_id = note.id
+            else:
+                note = self._seed_routing_links(note, parent_id=project_id)
 
-        note = self.repository.create(note)
-        self._ensure_parent_has_part_link(project_id, note.id)
+            note = self.repository.create(note)
+            self._ensure_parent_has_part_link(project_id, note.id)
         return note
 
     def get_note(self, note_id: str) -> Optional[Note]:
@@ -263,7 +290,39 @@ class ZettelService:
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
     ) -> Note:
-        """Update an existing note."""
+        """Update an existing note.
+
+        Serialized against all other writers by the global write lock, so the
+        whole read-modify-write (including the cross-note routing updates that
+        rewrite a parent's HAS_PART link, and the incoming-link alias refresh)
+        runs atomically with respect to other mutations.
+        """
+        with self._write_locked():
+            return self._update_note_locked(
+                note_id,
+                title=title,
+                content=content,
+                note_type=note_type,
+                tags=tags,
+                status=status,
+                metadata=metadata,
+                project_id=project_id,
+                area_id=area_id,
+            )
+
+    def _update_note_locked(
+        self,
+        note_id: str,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        note_type: Optional[NoteType] = None,
+        tags: Optional[List[str]] = None,
+        status: Any = _UNSET,
+        metadata: Optional[Dict[str, Any]] = None,
+        project_id: Any = _UNSET,
+        area_id: Any = _UNSET,
+    ) -> Note:
+        """Update implementation; caller holds the write lock."""
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -374,8 +433,9 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note."""
-        self.repository.delete(note_id)
+        """Delete a note (serialized against all writers by the global write lock)."""
+        with self._write_locked():
+            self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
         """Get all notes."""
@@ -390,20 +450,22 @@ class ZettelService:
         return self.repository.find_by_tag(tag)
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
-        """Add a tag to a note."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        note.add_tag(tag)
-        return self.repository.update(note)
+        """Add a tag to a note (serialized against all writers by the global write lock)."""
+        with self._write_locked():
+            note = self.repository.get(note_id)
+            if not note:
+                raise ValueError(f"Note with ID {note_id} not found")
+            note.add_tag(tag)
+            return self.repository.update(note)
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
-        """Remove a tag from a note."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        note.remove_tag(tag)
-        return self.repository.update(note)
+        """Remove a tag from a note (serialized against all writers by the global write lock)."""
+        with self._write_locked():
+            note = self.repository.get(note_id)
+            if not note:
+                raise ValueError(f"Note with ID {note_id} not found")
+            note.remove_tag(tag)
+            return self.repository.update(note)
 
     def get_all_tags(self) -> List[Tag]:
         """Get all tags in the system."""
@@ -418,7 +480,32 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Create a link between notes with proper bidirectional semantics.
+        """Create a link between notes (serialized by the global write lock).
+
+        The global write lock makes the whole read-modify-write of both notes
+        atomic against any other writer. Internal callers that already hold the
+        write lock use _create_link_locked instead.
+        """
+        with self._write_locked():
+            return self._create_link_locked(
+                source_id,
+                target_id,
+                link_type=link_type,
+                description=description,
+                bidirectional=bidirectional,
+                bidirectional_type=bidirectional_type,
+            )
+
+    def _create_link_locked(
+        self,
+        source_id: str,
+        target_id: str,
+        link_type: LinkType = LinkType.REFERENCE,
+        description: Optional[str] = None,
+        bidirectional: bool = False,
+        bidirectional_type: Optional[LinkType] = None,
+    ) -> Tuple[Note, Optional[Note]]:
+        """Create-link implementation; caller holds the global write lock.
 
         Args:
             source_id: ID of the source note
@@ -478,26 +565,33 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Remove a link between notes."""
-        source_note = self.repository.get(source_id)
-        if not source_note:
-            raise ValueError(f"Source note with ID {source_id} not found")
+        """Remove a link between notes (serialized by the global write lock).
 
-        # Remove link from source to target
-        source_note.remove_link(target_id, link_type)
-        source_note = self.repository.update(source_note)
+        The global write lock makes the whole read-modify-write of both notes
+        atomic against any other writer.
+        """
+        with self._write_locked():
+            source_note = self.repository.get(source_id)
+            if not source_note:
+                raise ValueError(f"Source note with ID {source_id} not found")
 
-        # If bidirectional, remove link from target to source
-        reverse_note = None
-        if bidirectional:
-            target_note = self.repository.get(target_id)
-            if target_note:
-                if bidirectional_type is None and link_type is not None:
-                    bidirectional_type = _INVERSE_LINK_TYPES.get(link_type, link_type)
-                target_note.remove_link(source_id, bidirectional_type)
-                reverse_note = self.repository.update(target_note)
+            # Remove link from source to target
+            source_note.remove_link(target_id, link_type)
+            source_note = self.repository.update(source_note)
 
-        return source_note, reverse_note
+            # If bidirectional, remove link from target to source
+            reverse_note = None
+            if bidirectional:
+                target_note = self.repository.get(target_id)
+                if target_note:
+                    if bidirectional_type is None and link_type is not None:
+                        bidirectional_type = _INVERSE_LINK_TYPES.get(
+                            link_type, link_type
+                        )
+                    target_note.remove_link(source_id, bidirectional_type)
+                    reverse_note = self.repository.update(target_note)
+
+            return source_note, reverse_note
 
     def get_linked_notes(self, note_id: str, direction: str = "outgoing") -> List[Note]:
         """Get notes linked to/from a note."""
@@ -511,8 +605,15 @@ class ZettelService:
         return self._get_project_for_routing(project_id)
 
     def rebuild_index(self) -> Optional[Path]:
-        """Rebuild the graph index from files."""
-        return self.repository.rebuild_index()
+        """Rebuild the graph index from files.
+
+        Serialized by the global write lock so a rebuild (which swaps the whole
+        graph DB) can't run concurrently with another write. In daemon mode the
+        facade additionally rejects overlapping writes via maintenance mode; this
+        lock also covers direct (in-process) mode.
+        """
+        with self._write_locked():
+            return self.repository.rebuild_index()
 
     def check_consistency(self) -> Dict[str, Any]:
         """Report drift between the markdown files and the graph index (read-only)."""
@@ -733,38 +834,42 @@ class ZettelService:
             raise ValueError(
                 "Tasks must be associated with a project (project_id required)"
             )
-        project = self._get_project_for_routing(project_id)
-        if project.area_id:
-            if area_id and area_id != project.area_id:
+        # Hold the write lock across routing validation AND the create so a
+        # concurrent re-route of the project can't make the task inherit a stale
+        # area_id between resolution and persistence (TOCTOU).
+        with self._write_locked():
+            project = self._get_project_for_routing(project_id)
+            if project.area_id:
+                if area_id and area_id != project.area_id:
+                    raise ValueError(
+                        f"area_id {area_id} does not match project "
+                        f"{project_id} area_id {project.area_id}"
+                    )
+                area_id = project.area_id
+            elif not area_id:
                 raise ValueError(
-                    f"area_id {area_id} does not match project "
-                    f"{project_id} area_id {project.area_id}"
+                    "Tasks must resolve to an area from the linked project or explicit area_id"
                 )
-            area_id = project.area_id
-        elif not area_id:
-            raise ValueError(
-                "Tasks must resolve to an area from the linked project or explicit area_id"
+            if area_id:
+                self._get_area_for_routing(area_id)
+            task = Note(
+                title=title,
+                content=content,
+                note_type=NoteType.TASK,
+                tags=[Tag(name=t) for t in (tags or [])],
+                status=status,
+                source=source,
+                due_date=due_date,
+                priority=priority,
+                recurrence_rule=recurrence_rule,
+                estimated_minutes=estimated_minutes,
+                remind_at=remind_at,
+                project_id=project_id,
+                area_id=area_id,
             )
-        if area_id:
-            self._get_area_for_routing(area_id)
-        task = Note(
-            title=title,
-            content=content,
-            note_type=NoteType.TASK,
-            tags=[Tag(name=t) for t in (tags or [])],
-            status=status,
-            source=source,
-            due_date=due_date,
-            priority=priority,
-            recurrence_rule=recurrence_rule,
-            estimated_minutes=estimated_minutes,
-            remind_at=remind_at,
-            project_id=project_id,
-            area_id=area_id,
-        )
-        task = self._seed_routing_links(task, parent_id=project_id)
-        task = self.repository.create(task)
-        self._ensure_parent_has_part_link(project_id, task.id)
+            task = self._seed_routing_links(task, parent_id=project_id)
+            task = self.repository.create(task)
+            self._ensure_parent_has_part_link(project_id, task.id)
         return task
 
     def update_task(
@@ -780,7 +885,39 @@ class ZettelService:
         recurrence_rule: Any = _UNSET,
         tags: Any = _UNSET,
     ) -> Note:
-        """Update task fields, including project reassignment before status changes."""
+        """Update task fields (serialized by the global write lock).
+
+        The global write lock makes the whole read-modify-write atomic against
+        other writers, including the cross-note routing update that rewrites the
+        project's HAS_PART link on reassignment.
+        """
+        with self._write_locked():
+            return self._update_task_locked(
+                note_id,
+                status=status,
+                project_id=project_id,
+                due_date=due_date,
+                remind_at=remind_at,
+                priority=priority,
+                estimated_minutes=estimated_minutes,
+                recurrence_rule=recurrence_rule,
+                tags=tags,
+            )
+
+    def _update_task_locked(
+        self,
+        note_id: str,
+        *,
+        status: Any = _UNSET,
+        project_id: Any = _UNSET,
+        due_date: Any = _UNSET,
+        remind_at: Any = _UNSET,
+        priority: Any = _UNSET,
+        estimated_minutes: Any = _UNSET,
+        recurrence_rule: Any = _UNSET,
+        tags: Any = _UNSET,
+    ) -> Note:
+        """Update-task implementation; caller holds the write lock."""
         task = self.repository.get(note_id)
         if not task:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -833,11 +970,22 @@ class ZettelService:
             )
 
         if status is not _UNSET:
-            return self.update_task_status(note_id, status)
+            # Already inside the held write lock — call the impl directly.
+            return self._update_task_status_locked(note_id, status)
         return task
 
     def update_task_status(self, note_id: str, new_status: NoteStatus) -> Note:
-        """Update the status of a task. Spawns a new task when a recurring one is completed."""
+        """Update task status (serialized against all writers by the global write lock)."""
+        with self._write_locked():
+            return self._update_task_status_locked(note_id, new_status)
+
+    def _update_task_status_locked(
+        self, note_id: str, new_status: NoteStatus
+    ) -> Note:
+        """Status-update implementation; caller holds the write lock.
+
+        Spawns a new task when a recurring one is completed.
+        """
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -964,43 +1112,47 @@ class ZettelService:
         Top-level projects require an ``area_id``. Subprojects pass a parent project
         through ``project_id`` and inherit that parent project's ``area_id``.
         """
-        if project_id:
-            parent_project = self._get_project_for_routing(project_id)
-            if not parent_project.area_id:
+        # Hold the write lock across routing validation AND the create so a
+        # concurrent re-route of the parent project can't make this project/
+        # subproject inherit stale routing between resolution and persistence.
+        with self._write_locked():
+            if project_id:
+                parent_project = self._get_project_for_routing(project_id)
+                if not parent_project.area_id:
+                    raise ValueError(
+                        f"Project {project_id} does not have an area_id to inherit"
+                    )
+                if area_id and area_id != parent_project.area_id:
+                    raise ValueError(
+                        f"area_id {area_id} does not match project "
+                        f"{project_id} area_id {parent_project.area_id}"
+                    )
+                area_id = parent_project.area_id
+            if not area_id:
                 raise ValueError(
-                    f"Project {project_id} does not have an area_id to inherit"
+                    "Projects must be associated with an area (area_id required)"
                 )
-            if area_id and area_id != parent_project.area_id:
-                raise ValueError(
-                    f"area_id {area_id} does not match project "
-                    f"{project_id} area_id {parent_project.area_id}"
-                )
-            area_id = parent_project.area_id
-        if not area_id:
-            raise ValueError(
-                "Projects must be associated with an area (area_id required)"
+            self._get_area_for_routing(area_id)
+            metadata: Dict[str, Any] = {}
+            if outcome:
+                metadata["outcome"] = outcome
+            project = Note(
+                title=title,
+                content=content,
+                note_type=NoteType.PROJECT,
+                tags=[Tag(name=t) for t in (tags or [])],
+                metadata=metadata,
+                due_date=deadline,
+                project_id=project_id,
+                area_id=area_id,
+                source=source,
             )
-        self._get_area_for_routing(area_id)
-        metadata: Dict[str, Any] = {}
-        if outcome:
-            metadata["outcome"] = outcome
-        project = Note(
-            title=title,
-            content=content,
-            note_type=NoteType.PROJECT,
-            tags=[Tag(name=t) for t in (tags or [])],
-            metadata=metadata,
-            due_date=deadline,
-            project_id=project_id,
-            area_id=area_id,
-            source=source,
-        )
-        project = self._seed_routing_links(project, parent_id=area_id)
-        if project_id:
-            project.add_link(project_id, LinkType.PART_OF)
-        project = self.repository.create(project)
-        self._ensure_parent_has_part_link(area_id, project.id)
-        self._ensure_parent_has_part_link(project_id, project.id)
+            project = self._seed_routing_links(project, parent_id=area_id)
+            if project_id:
+                project.add_link(project_id, LinkType.PART_OF)
+            project = self.repository.create(project)
+            self._ensure_parent_has_part_link(area_id, project.id)
+            self._ensure_parent_has_part_link(project_id, project.id)
         return project
 
     def get_parent_project(self, project_id: str) -> Optional[Note]:

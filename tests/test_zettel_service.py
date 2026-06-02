@@ -527,3 +527,292 @@ def test_find_similar_notes(zettel_service):
     # At least one of note2 or note3 should be in the similar notes
     # (They share tags and/or links with note1)
     assert note2.id in similar_ids or note3.id in similar_ids
+
+
+def test_concurrent_same_note_updates_stay_consistent(zettel_service):
+    """The global write lock serializes concurrent full-value updates to one note.
+
+    Each ``update_note`` runs to completion without interleaving another writer
+    mid-write, so the note never ends up in a torn state and the final value is
+    exactly one writer's complete content/tags (clean last-writer-wins), not a
+    corrupted mix. (It does not merge separate read-modify-write calls — that is
+    a different, compare-and-swap operation.)
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    note = zettel_service.create_note(
+        title="Concurrency target",
+        content="base",
+        note_type=NoteType.PERMANENT,
+        tags=["base"],
+        status=NoteStatus.INBOX,
+        area_id=area.id,
+    )
+
+    # Each thread writes a self-consistent (content_i, tag_i) pair. Whichever
+    # wins, the persisted content and tag must come from the *same* writer.
+    writers = list(range(12))
+    barrier = threading.Barrier(len(writers))
+    errors = []
+
+    # Use a unique, non-prefixing token per writer (zero-padded) so substring
+    # checks can't collide (e.g. "w1" inside "w10").
+    def token(i: int) -> str:
+        return f"w{i:02d}"
+
+    def write(i: int) -> None:
+        try:
+            barrier.wait()  # maximize overlap
+            zettel_service.update_note(
+                note.id, content=f"body-{token(i)}-end", tags=[f"tag-{token(i)}"]
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in writers]
+    for t in threads:
+        t.start()
+    # Join with a timeout so a lock regression that deadlocks update_note fails
+    # the test fast instead of hanging the whole suite.
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "update_note deadlocked"
+
+    assert not errors, f"update threads raised: {errors}"
+    final = zettel_service.get_note(note.id)
+    final_tags = [t.name for t in final.tags]
+    # Exactly one writer's tag survives, and the content carries that same
+    # writer's token (no torn mix of one writer's content with another's tags).
+    assert len(final_tags) == 1, f"expected one winning tag, got {final_tags}"
+    winner = final_tags[0]  # e.g. "tag-w07"
+    winner_token = winner.split("tag-")[1]
+    assert f"body-{winner_token}-end" in final.content, (
+        f"torn write: content={final.content!r} but tag={winner!r}"
+    )
+    # No other writer's token leaked into the body alongside the winner's.
+    other_tokens = [token(i) for i in writers if token(i) != winner_token]
+    assert not any(tok in final.content for tok in other_tokens), (
+        f"torn write: foreign writer token present in {final.content!r}"
+    )
+
+
+def test_concurrent_link_changes_on_same_pair_do_not_deadlock(zettel_service):
+    """create_link/remove_link on the same note pair serialize cleanly (no deadlock).
+
+    Many threads link/unlink the same two notes from opposite directions. The
+    global write lock serializes every mutation, so there is no lock-ordering
+    cycle to deadlock on. The test passes if every thread completes (no hang) and
+    the graph stays readable afterward.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    a = zettel_service.create_note(
+        title="Note A", content="a", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    b = zettel_service.create_note(
+        title="Note B", content="b", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def churn(i: int) -> None:
+        try:
+            barrier.wait()
+            # Half the threads work A->B, half B->A — opposite orders on the
+            # same pair, which is exactly the deadlock-prone pattern.
+            src, tgt = (a.id, b.id) if i % 2 == 0 else (b.id, a.id)
+            for _ in range(5):
+                zettel_service.create_link(src, tgt, LinkType.RELATED)
+                zettel_service.remove_link(src, tgt, LinkType.RELATED)
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=churn, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    # A generous join timeout turns a deadlock into a test failure instead of a hang.
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "link churn deadlocked"
+    assert not errors, f"link churn raised: {errors}"
+
+    # Graph is still consistent and readable.
+    assert zettel_service.get_note(a.id) is not None
+    assert zettel_service.get_note(b.id) is not None
+
+
+def test_concurrent_task_reassignment_and_parent_edits_stay_consistent(zettel_service):
+    """Routing updates stay consistent under the global write lock.
+
+    A task reassignment rewrites the new project's HAS_PART link while another
+    thread edits that same project. The global write lock serializes both, so the
+    parent update can't be lost and the operations can't deadlock.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    proj_a = zettel_service.create_project_note(
+        title="Project A", content="a", area_id=area.id
+    )
+    proj_b = zettel_service.create_project_note(
+        title="Project B", content="b", area_id=area.id
+    )
+    task = zettel_service.create_task(
+        title="Roaming task", content="t", project_id=proj_a.id
+    )
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def reassign() -> None:
+        try:
+            barrier.wait()
+            for _ in range(5):
+                zettel_service.update_task(task.id, project_id=proj_b.id)
+                zettel_service.update_task(task.id, project_id=proj_a.id)
+        except Exception as exc:  # pragma: no cover
+            errors.append(("reassign", exc))
+
+    def edit_parent() -> None:
+        try:
+            barrier.wait()
+            for i in range(5):
+                # Concurrently edit project B (a routing endpoint) directly.
+                zettel_service.update_note(proj_b.id, content=f"b-{i}")
+        except Exception as exc:  # pragma: no cover
+            errors.append(("edit_parent", exc))
+
+    threads = [threading.Thread(target=reassign), threading.Thread(target=edit_parent)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads), "routing update deadlocked"
+    assert not errors, f"routing threads raised: {errors}"
+
+    # Final state: task ends on project A; project A must still record the task as
+    # a child (HAS_PART), and project B must not (the reassignment removed it).
+    final_task = zettel_service.get_note(task.id)
+    assert final_task.project_id == proj_a.id
+    a_children = {
+        link.target_id
+        for link in zettel_service.get_note(proj_a.id).links
+        if link.link_type == LinkType.HAS_PART
+    }
+    assert task.id in a_children, "parent A lost its HAS_PART link to the task"
+    # ...and project B must no longer record the task (the reassignment removed it).
+    b_children = {
+        link.target_id
+        for link in zettel_service.get_note(proj_b.id).links
+        if link.link_type == LinkType.HAS_PART
+    }
+    assert task.id not in b_children, "parent B still has a stale HAS_PART link"
+
+
+def test_concurrent_updates_to_different_notes_all_succeed(zettel_service):
+    """Concurrent writes to *different* notes serialize and succeed.
+
+    Kuzu is single-writer (one write transaction process-wide), so without the
+    global write lock two threads updating different notes both open a write
+    transaction and one raises "Cannot start a new write transaction". The lock
+    must make them queue and all complete — every update applied, none dropped.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    notes = [
+        zettel_service.create_note(
+            title=f"N{i}", content="base", note_type=NoteType.PERMANENT, area_id=area.id
+        )
+        for i in range(6)
+    ]
+
+    barrier = threading.Barrier(len(notes))
+    errors = []
+
+    def hammer(note_id: str, idx: int) -> None:
+        try:
+            barrier.wait()
+            for j in range(10):
+                zettel_service.update_note(note_id, content=f"n{idx}-{j}")
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append((idx, repr(exc)))
+
+    threads = [
+        threading.Thread(target=hammer, args=(n.id, i)) for i, n in enumerate(notes)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads), "writes deadlocked"
+    # The key assertion: no "one write transaction at a time" RuntimeError.
+    assert not errors, f"concurrent different-note writes failed: {errors}"
+    # Every note got its last write persisted.
+    for i, n in enumerate(notes):
+        assert f"n{i}-9" in zettel_service.get_note(n.id).content
+
+
+def test_create_holds_write_lock_during_routing_and_create(zettel_service, monkeypatch):
+    """Create paths hold the write lock across routing validation AND the create.
+
+    Guards the TOCTOU window: if routing (project/area resolution) ran outside the
+    lock, a concurrent re-route could make the new note inherit stale routing
+    before it is persisted. Asserting the lock is held when repository.create
+    fires proves validation + create are one atomic critical section.
+    """
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    project = zettel_service.create_project_note(
+        title="P", content="p", area_id=area.id
+    )
+
+    import threading
+
+    locked_during_create = []
+    real_create = zettel_service.repository.create
+
+    def tracking_create(note):
+        # Probe from ANOTHER thread: a non-owning thread can only fail to acquire
+        # the RLock if some thread currently holds it. If create ran outside the
+        # write lock, this probe would succeed (lock free) -> recorded False.
+        result = {}
+
+        def probe():
+            got = zettel_service._write_lock.acquire(blocking=False)
+            if got:
+                zettel_service._write_lock.release()
+            result["free"] = got
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        locked_during_create.append(not result["free"])  # True = lock was held
+        return real_create(note)
+
+    monkeypatch.setattr(zettel_service.repository, "create", tracking_create)
+
+    # Exercise all three create paths.
+    zettel_service.create_note(
+        title="N", content="c", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    zettel_service.create_task(title="T", content="t", project_id=project.id)
+    zettel_service.create_project_note(title="P2", content="p2", area_id=area.id)
+
+    assert locked_during_create and all(locked_during_create), (
+        "repository.create ran without the write lock held (TOCTOU window open)"
+    )

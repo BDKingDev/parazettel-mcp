@@ -1245,3 +1245,39 @@ def test_copy_file_with_retry_reraises_non_retryable_error(tmp_path):
             nr._copy_file_with_retry(src, dst)
 
     assert calls["n"] == 1  # not retried
+
+
+def test_atomic_write_fsyncs_temp_file_before_replace(note_repository):
+    """The temp file is fsync'd BEFORE the atomic rename, not merely sometime.
+
+    Recording the order matters: a regression that moved fsync after replace (or
+    dropped it) would still "call fsync" but lose the durability guarantee, so
+    this asserts the relative ordering rather than just that fsync ran.
+    """
+    import pathlib
+
+    from parazettel_mcp.storage import note_repository as nr
+
+    events = []
+    real_fsync = nr.os.fsync
+    real_replace = pathlib.Path.replace
+
+    def tracking_fsync(fd):
+        events.append("fsync")
+        return real_fsync(fd)
+
+    def tracking_replace(self, target):
+        events.append("replace")
+        return real_replace(self, target)
+
+    target = note_repository.notes_dir / "fsync-test.md"
+    with patch.object(nr.os, "fsync", side_effect=tracking_fsync):
+        with patch.object(pathlib.Path, "replace", tracking_replace):
+            note_repository._write_markdown_atomically(target, "# hi\n\nbody\n")
+
+    # The temp-file fsync must come before the rename.
+    assert "fsync" in events and "replace" in events
+    assert events.index("fsync") < events.index("replace"), (
+        f"fsync must precede replace, got order: {events}"
+    )
+    assert target.read_text(encoding="utf-8") == "# hi\n\nbody\n"
