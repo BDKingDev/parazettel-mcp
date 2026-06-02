@@ -146,6 +146,22 @@ class TestMcpServer:
         assert "check_duplicates=false" in result
         self.mock_zettel_service.create_note.assert_not_called()
 
+    def test_create_note_whitespace_title_returns_validation_error(self):
+        """A whitespace-only title is a validation error, not a dedup warning."""
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="   ",
+            content="some content",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        assert "title is required" in result.lower()
+        # Neither the dedup probe nor creation should run for an invalid title.
+        self.mock_search_service.search_combined.assert_not_called()
+        self.mock_zettel_service.create_note.assert_not_called()
+
     def test_create_note_check_duplicates_false_skips_search(self):
         """check_duplicates=false creates immediately without a dedup search."""
         mock_note = MagicMock()

@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 _DAEMON_HEALTH_TIMEOUT_SECONDS = 5.0
 
 # Note types that get a duplicate check on create. Knowledge notes only — area,
-# project, and task notes are structural singletons handled by their own tools.
+# project, and task are structural/action-item types handled by their own tools
+# (pzk_create_area / pzk_create_project / pzk_create_task) and are not deduped.
 _DEDUP_NOTE_TYPES = frozenset(
     {
         NoteType.FLEETING,
@@ -341,6 +342,12 @@ class ZettelkastenMcpServer:
                     to create it anyway. Set to false to skip the check.
             """
             try:
+                # Validate title up front so an empty/whitespace-only title
+                # returns the expected validation error rather than being routed
+                # into the duplicate-check path (which runs before create_note).
+                if not title or not title.strip():
+                    return "Error: title is required."
+
                 # Convert note_type string to enum
                 try:
                     note_type_enum = NoteType(note_type.lower())
@@ -420,7 +427,8 @@ class ZettelkastenMcpServer:
                 # Before creating, surface likely duplicates so the caller can
                 # decide to reuse/update an existing note instead of silently
                 # accreting a near-identical one. Knowledge notes only — area /
-                # project / task notes are structural singletons handled elsewhere.
+                # project / task are structural/action-item types handled by their
+                # own create tools.
                 if check_duplicates and note_type_enum in _DEDUP_NOTE_TYPES:
                     duplicates = self._find_duplicate_candidates(title, content)
                     if duplicates:
