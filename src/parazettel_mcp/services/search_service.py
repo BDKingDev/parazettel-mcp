@@ -36,12 +36,16 @@ def _score_text_results(
     """Rank text-search notes by BM25 relevance, with lexical hits only as a tiebreaker.
 
     ``notes`` already arrive in BM25 order from the repository. Each result carries
-    its real BM25 ``score`` (from ``bm25_scores``); a small lexical ``boost`` — exact
-    phrase and per-term hits in the title/content — breaks ties so an exact title
-    match edges out an equally-ranked partial. The boost never overrides BM25 order,
-    and scores are never collapsed to a flat constant the way the previous substring
-    heuristic did. When ``bm25_scores`` is empty (no provider, or a mocked repository
-    in tests) every score is 0.0 and the stable sort preserves the repository order.
+    its real BM25 ``score`` (from ``bm25_scores``); a small lexical ``boost`` breaks
+    ties only. The boost weights, strongest first: full-query substring in the title
+    (+1.0), full-query substring in the content (+0.25), each query term present in
+    the title (+0.1), each query term present in the content (+0.02). So an exact
+    title match edges out an equally-ranked partial, and a content term hit can edge
+    out a BM25-equal note with no term hit, while title hits still outrank content
+    hits. The boost never overrides BM25 order, and scores are never collapsed to a
+    flat constant the way the previous substring heuristic did. When ``bm25_scores``
+    is empty (no provider, or a mocked repository in tests) every score is 0.0 and
+    the stable sort preserves the repository order.
     """
     bm25_scores = _coerce_score_map(bm25_scores)
     query_lower = query.lower()
@@ -75,6 +79,11 @@ def _score_text_results(
                     matched_context = f"Content: ...{note.content[start:end]}..."
             for term in terms:
                 if term in content_lower:
+                    if term not in matched_terms:
+                        # Small tiebreaker so a content term hit can edge out a
+                        # BM25-equal note with no term hit at all. Kept below the
+                        # title term boost (0.1) so title hits still rank higher.
+                        boost += 0.02
                     matched_terms.add(term)
 
         if not matched_context:
@@ -116,17 +125,30 @@ class SearchService:
 
     def _get_text_candidates(
         self, query: str, *, include_content: bool, include_title: bool
-    ) -> List[Note]:
-        """Use the repository to prefilter text-search candidates."""
+    ) -> Tuple[List[Note], Dict[str, float]]:
+        """Prefilter candidates AND fetch their BM25 scores in one repository pass.
+
+        The repository returns scores from the same FTS index that produced the
+        candidate ordering, so a title-only or content-only search is scored by
+        its own index rather than the combined title+content index.
+        """
         if not include_content and not include_title:
-            return []
+            return [], {}
 
         repository = self.zettel_service.repository
         if include_content and include_title:
-            return repository.search(text=query)
-        if include_title:
-            return repository.search(title=query)
-        return repository.search(content=query)
+            search_kwargs = {"text": query}
+        elif include_title:
+            search_kwargs = {"title": query}
+        else:
+            search_kwargs = {"content": query}
+
+        scored = getattr(repository, "search_scored", None)
+        if callable(scored):
+            return scored(**search_kwargs)
+        # Fallback for repositories (or mocks) without the one-pass API: candidates
+        # only, no BM25 scores — _score_text_results then keeps repository order.
+        return repository.search(**search_kwargs), {}
 
     def search_by_text(
         self, query: str, include_content: bool = True, include_title: bool = True
@@ -135,11 +157,10 @@ class SearchService:
         if not query:
             return []
 
-        # Use the graph index to narrow AND rank the candidate set (BM25 order).
-        all_notes = self._get_text_candidates(
+        # One FTS pass narrows, ranks, and scores the candidate set.
+        all_notes, bm25_scores = self._get_text_candidates(
             query, include_content=include_content, include_title=include_title
         )
-        bm25_scores = self._text_fts_scores(query)
         return _score_text_results(
             all_notes,
             query,
@@ -263,12 +284,18 @@ class SearchService:
         if text:
             search_kwargs["text"] = text
 
-        filtered_notes = self.zettel_service.repository.search(**search_kwargs)
-
+        repository = self.zettel_service.repository
         if text:
-            # Notes arrive in BM25 order; rank by the index's real relevance score.
-            bm25_scores = self._text_fts_scores(text)
+            # One FTS pass returns BM25-ordered candidates AND their scores.
+            scored = getattr(repository, "search_scored", None)
+            if callable(scored):
+                filtered_notes, bm25_scores = scored(**search_kwargs)
+            else:  # fallback: candidates only, then a separate score lookup
+                filtered_notes = repository.search(**search_kwargs)
+                bm25_scores = self._text_fts_scores(text)
             return _score_text_results(filtered_notes, text, bm25_scores)
+
+        filtered_notes = repository.search(**search_kwargs)
 
         # No text query: structural/tag filter only — uniform score, repository order.
         return [

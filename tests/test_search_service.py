@@ -79,9 +79,11 @@ class TestSearchService:
         )
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = MagicMock()
-        mock_zettel_service.repository.search.side_effect = [
-            [title_match],
-            [content_match],
+        # search_by_text now fetches candidates AND scores in one pass via
+        # search_scored, which returns (notes, {id: bm25}).
+        mock_zettel_service.repository.search_scored.side_effect = [
+            ([title_match], {"title-note": 2.0}),
+            ([content_match], {"content-note": 1.5}),
         ]
         search_service = SearchService(mock_zettel_service)
 
@@ -93,8 +95,9 @@ class TestSearchService:
         assert [result.note.id for result in content_results] == ["content-note"]
         assert content_results[0].matched_context.startswith("Content: ...")
         assert "python appears" in content_results[0].matched_context.lower()
-        mock_zettel_service.repository.search.assert_any_call(title="python")
-        mock_zettel_service.repository.search.assert_any_call(content="python")
+        # Title-only and content-only searches query their own FTS index.
+        mock_zettel_service.repository.search_scored.assert_any_call(title="python")
+        mock_zettel_service.repository.search_scored.assert_any_call(content="python")
 
     def test_search_by_text_prefilters_candidates_via_repository(self):
         """search_by_text() should use the graph-backed repository prefilter."""
@@ -104,7 +107,7 @@ class TestSearchService:
             content="Python shows up in this content.",
         )
         mock_repository = MagicMock()
-        mock_repository.search.return_value = [matching_note]
+        mock_repository.search_scored.return_value = ([matching_note], {"python-note": 3.0})
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = mock_repository
         search_service = SearchService(mock_zettel_service)
@@ -112,7 +115,7 @@ class TestSearchService:
         results = search_service.search_by_text("python")
 
         assert [result.note.id for result in results] == ["python-note"]
-        mock_repository.search.assert_called_once_with(text="python")
+        mock_repository.search_scored.assert_called_once_with(text="python")
 
     def test_search_by_text_keeps_fts_only_candidates(self, zettel_service):
         """FTS-only matches (no literal substring) are kept and BM25-scored, not dropped."""
@@ -163,6 +166,55 @@ class TestSearchService:
         # ...with a strictly higher BM25 score than the weak match (not a flat tie).
         scores = {r.note.id: r.score for r in results}
         assert scores[strong.id] > scores[weak.id] > 0.0
+
+    def test_search_by_text_uses_single_fts_pass(self):
+        """Candidates and BM25 scores come from one search_scored call, not two FTS queries."""
+        note = SimpleNamespace(id="n1", title="Python", content="python body")
+        mock_repository = MagicMock()
+        mock_repository.search_scored.return_value = ([note], {"n1": 4.0})
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_by_text("python")
+
+        assert results[0].score == 4.0
+        mock_repository.search_scored.assert_called_once_with(text="python")
+        # The old second-query path (text_fts_scores) must not be used when the
+        # one-pass scored API is available.
+        mock_repository.text_fts_scores.assert_not_called()
+        mock_repository.search.assert_not_called()
+
+    def test_search_by_text_falls_back_when_scored_api_absent(self):
+        """Repos without search_scored still work via search + text_fts_scores."""
+        note = SimpleNamespace(id="n1", title="Python", content="python body")
+        mock_repository = MagicMock(spec=["search", "text_fts_scores"])
+        mock_repository.search.return_value = [note]
+        mock_repository.text_fts_scores.return_value = {"n1": 1.0}
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_by_text("python")
+
+        assert [r.note.id for r in results] == ["n1"]
+        mock_repository.search.assert_called_once_with(text="python")
+
+    def test_search_scored_uses_own_index_for_title_only(self, zettel_service):
+        """A title-only search is scored by the title index, not the combined one."""
+        note = zettel_service.create_note(
+            title="Kubernetes deployment guide",
+            content="Body text that does not mention the title keywords at all.",
+            tags=["k8s"],
+        )
+
+        # Title-only candidates + scores in one pass; score must be positive and
+        # come from the title FTS index (the body lacks the query terms).
+        notes, scores = zettel_service.repository.search_scored(
+            title="kubernetes deployment"
+        )
+        assert note.id in [n.id for n in notes]
+        assert scores.get(note.id, 0.0) > 0.0
 
     def test_search_by_tag(self, zettel_service):
         """Test searching for notes by tags."""
@@ -465,7 +517,7 @@ class TestSearchService:
         """search_combined() should include text in the graph-backed prefilter."""
         note = SimpleNamespace(id="note-1", title="Python", content="Python body")
         mock_repository = MagicMock()
-        mock_repository.search.return_value = [note]
+        mock_repository.search_scored.return_value = ([note], {"note-1": 2.5})
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = mock_repository
         search_service = SearchService(mock_zettel_service)
@@ -478,7 +530,8 @@ class TestSearchService:
         )
 
         assert [result.note.id for result in results] == ["note-1"]
-        mock_repository.search.assert_called_once_with(
+        # Text combined search uses the one-pass scored API.
+        mock_repository.search_scored.assert_called_once_with(
             tags=["python"],
             project_id="project123",
             area_id="area456",

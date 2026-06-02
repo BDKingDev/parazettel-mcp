@@ -1211,37 +1211,52 @@ class NoteRepository(Repository[Note]):
                 seen.add(note_id)
         return ordered_common_ids
 
-    def _candidate_ids_from_text_filters(
+    def _candidate_ids_and_scores(
         self, conn: kuzu.Connection, kwargs: Dict[str, Any]
-    ) -> Optional[List[str]]:
-        """Return FTS candidate IDs for any text-oriented filters in *kwargs*."""
-        ordered_id_lists: List[List[str]] = []
+    ) -> Tuple[Optional[List[str]], Dict[str, float]]:
+        """Return (FTS candidate IDs, BM25 score map) for text filters in *kwargs*.
+
+        The score map is taken from the *first* text-oriented index queried — the
+        same index whose ordering drives the candidate list (see
+        ``_intersect_ordered_id_lists``, which preserves the first list's order).
+        Returning scores from that index, rather than always the combined
+        title+content index, means a title-only or content-only search is never
+        re-ranked with scores from a different index than produced its candidates.
+
+        Returns ``(None, {})`` when no text filter is present (so callers fall
+        back to structural ordering with no BM25 scores).
+        """
+        ordered_scored: List[List[Tuple[str, float]]] = []
 
         text_query = kwargs.get("text")
         if isinstance(text_query, str):
-            ordered_id_lists.append(
-                self._query_fts_index(conn, "note_text_fts", text_query)
+            ordered_scored.append(
+                self._query_fts_index_scored(conn, "note_text_fts", text_query)
             )
 
         title_query = kwargs.get("title")
         if isinstance(title_query, str):
-            ordered_id_lists.append(
-                self._query_fts_index(
+            ordered_scored.append(
+                self._query_fts_index_scored(
                     conn, "note_title_fts", title_query, conjunctive=True
                 )
             )
 
         content_query = kwargs.get("content")
         if isinstance(content_query, str):
-            ordered_id_lists.append(
-                self._query_fts_index(
+            ordered_scored.append(
+                self._query_fts_index_scored(
                     conn, "note_content_fts", content_query, conjunctive=True
                 )
             )
 
-        if not ordered_id_lists:
-            return None
-        return self._intersect_ordered_id_lists(ordered_id_lists)
+        if not ordered_scored:
+            return None, {}
+
+        ordered_id_lists = [[note_id for note_id, _ in pairs] for pairs in ordered_scored]
+        candidate_ids = self._intersect_ordered_id_lists(ordered_id_lists)
+        score_by_id = {note_id: score for note_id, score in ordered_scored[0]}
+        return candidate_ids, score_by_id
 
     def create(self, note: Note) -> Note:
         """Create a new note."""
@@ -1417,10 +1432,26 @@ class NoteRepository(Repository[Note]):
         status, source, due_date_before, due_date_after, priority,
         remind_at_before, remind_at_after, project_id, area_id
         """
+        notes, _scores = self._search_with_scores(**kwargs)
+        return notes
+
+    def search_scored(self, **kwargs: Any) -> Tuple[List[Note], Dict[str, float]]:
+        """Like :meth:`search`, but also return the BM25 score map in one FTS pass.
+
+        Avoids the previous two-query pattern (one FTS call for candidates, a
+        second for scores). The scores come from the same index that produced the
+        candidate ordering. For a non-text search the score map is empty.
+        """
+        return self._search_with_scores(**kwargs)
+
+    def _search_with_scores(
+        self, **kwargs: Any
+    ) -> Tuple[List[Note], Dict[str, float]]:
+        """Shared search implementation returning notes plus their BM25 scores."""
         with self._connection() as conn:
-            candidate_ids = self._candidate_ids_from_text_filters(conn, kwargs)
+            candidate_ids, bm25_scores = self._candidate_ids_and_scores(conn, kwargs)
             if candidate_ids == []:
-                return []
+                return [], {}
 
             match_clauses = ["MATCH (n:Note)"]
             where_parts: List[str] = []
@@ -1500,7 +1531,7 @@ class NoteRepository(Repository[Note]):
                 id_set = set(ids)
                 ids = [note_id for note_id in candidate_ids if note_id in id_set]
 
-            return self._fetch_notes_by_ids(conn, ids)
+            return self._fetch_notes_by_ids(conn, ids), bm25_scores
 
     def find_by_tag(self, tag: Union[str, Tag]) -> List[Note]:
         """Find notes by tag."""
