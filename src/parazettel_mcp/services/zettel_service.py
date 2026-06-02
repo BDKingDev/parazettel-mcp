@@ -271,8 +271,10 @@ class ZettelService:
         else:
             note = self._seed_routing_links(note, parent_id=project_id)
 
-        note = self.repository.create(note)
-        self._ensure_parent_has_part_link(project_id, note.id)
+        # Serialize the write against all other writers (Kuzu is single-writer).
+        with self._write_locked():
+            note = self.repository.create(note)
+            self._ensure_parent_has_part_link(project_id, note.id)
         return note
 
     def get_note(self, note_id: str) -> Optional[Note]:
@@ -438,7 +440,7 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note (serialized per note against concurrent edits)."""
+        """Delete a note (serialized against all writers by the global write lock)."""
         with self._write_locked():
             self.repository.delete(note_id)
 
@@ -455,7 +457,7 @@ class ZettelService:
         return self.repository.find_by_tag(tag)
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
-        """Add a tag to a note (serialized per note against concurrent edits)."""
+        """Add a tag to a note (serialized against all writers by the global write lock)."""
         with self._write_locked():
             note = self.repository.get(note_id)
             if not note:
@@ -464,7 +466,7 @@ class ZettelService:
             return self.repository.update(note)
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
-        """Remove a tag from a note (serialized per note against concurrent edits)."""
+        """Remove a tag from a note (serialized against all writers by the global write lock)."""
         with self._write_locked():
             note = self.repository.get(note_id)
             if not note:
@@ -485,11 +487,11 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Create a link between notes (serialized per note against concurrent edits).
+        """Create a link between notes (serialized by the global write lock).
 
-        Locks both endpoints (in a stable order) so a concurrent edit to either
-        note can't interleave with this read-modify-write. Internal callers that
-        already hold the write lock use _create_link_locked instead.
+        The global write lock makes the whole read-modify-write of both notes
+        atomic against any other writer. Internal callers that already hold the
+        write lock use _create_link_locked instead.
         """
         with self._write_locked():
             return self._create_link_locked(
@@ -510,7 +512,7 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Create-link implementation; caller holds the relevant note lock(s).
+        """Create-link implementation; caller holds the global write lock.
 
         Args:
             source_id: ID of the source note
@@ -570,10 +572,10 @@ class ZettelService:
         bidirectional: bool = False,
         bidirectional_type: Optional[LinkType] = None,
     ) -> Tuple[Note, Optional[Note]]:
-        """Remove a link between notes (serialized per note against concurrent edits).
+        """Remove a link between notes (serialized by the global write lock).
 
-        Locks both endpoints in a stable order so a concurrent edit to either
-        note can't interleave with this read-modify-write.
+        The global write lock makes the whole read-modify-write of both notes
+        atomic against any other writer.
         """
         with self._write_locked():
             source_note = self.repository.get(source_id)
@@ -869,8 +871,10 @@ class ZettelService:
             area_id=area_id,
         )
         task = self._seed_routing_links(task, parent_id=project_id)
-        task = self.repository.create(task)
-        self._ensure_parent_has_part_link(project_id, task.id)
+        # Serialize the write against all other writers (Kuzu is single-writer).
+        with self._write_locked():
+            task = self.repository.create(task)
+            self._ensure_parent_has_part_link(project_id, task.id)
         return task
 
     def update_task(
@@ -886,11 +890,11 @@ class ZettelService:
         recurrence_rule: Any = _UNSET,
         tags: Any = _UNSET,
     ) -> Note:
-        """Update task fields (serialized per note against concurrent edits).
+        """Update task fields (serialized by the global write lock).
 
-        Locks the task plus its current and new project/area up front (a project
-        reassignment also rewrites the project's HAS_PART link), in one stable
-        order, so cross-note routing updates stay consistent and deadlock-free.
+        The global write lock makes the whole read-modify-write atomic against
+        other writers, including the cross-note routing update that rewrites the
+        project's HAS_PART link on reassignment.
         """
         with self._write_locked():
             return self._update_task_locked(
@@ -976,7 +980,7 @@ class ZettelService:
         return task
 
     def update_task_status(self, note_id: str, new_status: NoteStatus) -> Note:
-        """Update task status (serialized per note against concurrent edits)."""
+        """Update task status (serialized against all writers by the global write lock)."""
         with self._write_locked():
             return self._update_task_status_locked(note_id, new_status)
 
@@ -1147,9 +1151,11 @@ class ZettelService:
         project = self._seed_routing_links(project, parent_id=area_id)
         if project_id:
             project.add_link(project_id, LinkType.PART_OF)
-        project = self.repository.create(project)
-        self._ensure_parent_has_part_link(area_id, project.id)
-        self._ensure_parent_has_part_link(project_id, project.id)
+        # Serialize the write against all other writers (Kuzu is single-writer).
+        with self._write_locked():
+            project = self.repository.create(project)
+            self._ensure_parent_has_part_link(area_id, project.id)
+            self._ensure_parent_has_part_link(project_id, project.id)
         return project
 
     def get_parent_project(self, project_id: str) -> Optional[Note]:

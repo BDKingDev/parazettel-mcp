@@ -600,12 +600,12 @@ def test_concurrent_same_note_updates_stay_consistent(zettel_service):
 
 
 def test_concurrent_link_changes_on_same_pair_do_not_deadlock(zettel_service):
-    """create_link/remove_link on the same note pair are lock-ordered (no deadlock).
+    """create_link/remove_link on the same note pair serialize cleanly (no deadlock).
 
-    Two notes linked/unlinked from opposite directions by many threads must lock
-    their endpoints in a stable order; otherwise an A->B / B->A acquisition could
-    deadlock. The test passes if every thread completes (no hang) and the graph
-    stays readable afterward.
+    Many threads link/unlink the same two notes from opposite directions. The
+    global write lock serializes every mutation, so there is no lock-ordering
+    cycle to deadlock on. The test passes if every thread completes (no hang) and
+    the graph stays readable afterward.
     """
     import threading
 
@@ -649,12 +649,11 @@ def test_concurrent_link_changes_on_same_pair_do_not_deadlock(zettel_service):
 
 
 def test_concurrent_task_reassignment_and_parent_edits_stay_consistent(zettel_service):
-    """Routing updates lock both endpoints, so a parent's HAS_PART isn't clobbered.
+    """Routing updates stay consistent under the global write lock.
 
     A task reassignment rewrites the new project's HAS_PART link while another
-    thread edits that same project. Because update_task/update_note now lock the
-    task AND its current/new project up front (stable order), the parent update
-    can't be lost and the operations can't deadlock.
+    thread edits that same project. The global write lock serializes both, so the
+    parent update can't be lost and the operations can't deadlock.
     """
     import threading
 
