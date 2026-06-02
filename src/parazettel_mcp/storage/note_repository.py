@@ -344,6 +344,11 @@ class NoteRepository(Repository[Note]):
                 with self.file_lock:
                     with open(tmp_path, "w", encoding="utf-8") as f:
                         f.write(markdown)
+                        # Flush to disk before the atomic rename so a crash or
+                        # power loss can't leave an empty/truncated file in place
+                        # (rename gives atomic *visibility*, not durable content).
+                        f.flush()
+                        os.fsync(f.fileno())
                     tmp_path.replace(file_path)
                 return
             except OSError as e:

@@ -1245,3 +1245,26 @@ def test_copy_file_with_retry_reraises_non_retryable_error(tmp_path):
             nr._copy_file_with_retry(src, dst)
 
     assert calls["n"] == 1  # not retried
+
+
+def test_atomic_write_fsyncs_before_replace(note_repository):
+    """Markdown writes flush + fsync the temp file before the atomic rename.
+
+    Guards durability: rename gives atomic visibility, not durable content, so a
+    crash between write and flush could otherwise leave an empty/truncated file.
+    """
+    from parazettel_mcp.storage import note_repository as nr
+
+    fsync_calls = []
+    real_fsync = nr.os.fsync
+
+    def tracking_fsync(fd):
+        fsync_calls.append(fd)
+        return real_fsync(fd)
+
+    target = note_repository.notes_dir / "fsync-test.md"
+    with patch.object(nr.os, "fsync", side_effect=tracking_fsync):
+        note_repository._write_markdown_atomically(target, "# hi\n\nbody\n")
+
+    assert fsync_calls, "expected os.fsync to be called before the atomic replace"
+    assert target.read_text(encoding="utf-8") == "# hi\n\nbody\n"

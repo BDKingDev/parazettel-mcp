@@ -527,3 +527,70 @@ def test_find_similar_notes(zettel_service):
     # At least one of note2 or note3 should be in the similar notes
     # (They share tags and/or links with note1)
     assert note2.id in similar_ids or note3.id in similar_ids
+
+
+def test_concurrent_same_note_updates_stay_consistent(zettel_service):
+    """Per-note locking serializes concurrent full-value updates to one note.
+
+    The lock guarantees each ``update_note`` runs to completion without
+    interleaving another writer mid-write, so the note never ends up in a torn
+    state and the final value is exactly one writer's complete content/tags
+    (clean last-writer-wins), not a corrupted mix. (It does not merge separate
+    read-modify-write calls — that is a different, compare-and-swap operation.)
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    note = zettel_service.create_note(
+        title="Concurrency target",
+        content="base",
+        note_type=NoteType.PERMANENT,
+        tags=["base"],
+        status=NoteStatus.INBOX,
+        area_id=area.id,
+    )
+
+    # Each thread writes a self-consistent (content_i, tag_i) pair. Whichever
+    # wins, the persisted content and tag must come from the *same* writer.
+    writers = list(range(12))
+    barrier = threading.Barrier(len(writers))
+    errors = []
+
+    # Use a unique, non-prefixing token per writer (zero-padded) so substring
+    # checks can't collide (e.g. "w1" inside "w10").
+    def token(i: int) -> str:
+        return f"w{i:02d}"
+
+    def write(i: int) -> None:
+        try:
+            barrier.wait()  # maximize overlap
+            zettel_service.update_note(
+                note.id, content=f"body-{token(i)}-end", tags=[f"tag-{token(i)}"]
+            )
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write, args=(i,)) for i in writers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"update threads raised: {errors}"
+    final = zettel_service.get_note(note.id)
+    final_tags = [t.name for t in final.tags]
+    # Exactly one writer's tag survives, and the content carries that same
+    # writer's token (no torn mix of one writer's content with another's tags).
+    assert len(final_tags) == 1, f"expected one winning tag, got {final_tags}"
+    winner = final_tags[0]  # e.g. "tag-w07"
+    winner_token = winner.split("tag-")[1]
+    assert f"body-{winner_token}-end" in final.content, (
+        f"torn write: content={final.content!r} but tag={winner!r}"
+    )
+    # No other writer's token leaked into the body alongside the winner's.
+    other_tokens = [token(i) for i in writers if token(i) != winner_token]
+    assert not any(tok in final.content for tok in other_tokens), (
+        f"torn write: foreign writer token present in {final.content!r}"
+    )

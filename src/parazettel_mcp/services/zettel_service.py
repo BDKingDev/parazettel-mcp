@@ -2,8 +2,11 @@
 
 import datetime
 import logging
+import threading
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (
@@ -45,6 +48,24 @@ class ZettelService:
     def __init__(self, repository: Optional[NoteRepository] = None):
         """Initialize the service."""
         self.repository = repository or NoteRepository()
+        # Per-note locks guard read-modify-write sequences (get -> mutate ->
+        # update) against concurrent edits to the *same* note, which would
+        # otherwise last-writer-win. A registry lock guards the registry itself.
+        self._note_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._note_locks_registry_lock = threading.Lock()
+
+    @contextmanager
+    def _note_lock(self, note_id: str) -> Iterator[None]:
+        """Serialize mutations to a single note across threads.
+
+        Acquired at the service layer so it spans the whole read-modify-write,
+        and always before the repository's file lock to keep a consistent lock
+        order (no deadlock).
+        """
+        with self._note_locks_registry_lock:
+            lock = self._note_locks[note_id]
+        with lock:
+            yield
 
     def initialize(self) -> None:
         """Initialize the service and dependencies."""
@@ -263,7 +284,33 @@ class ZettelService:
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
     ) -> Note:
-        """Update an existing note."""
+        """Update an existing note (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            return self._update_note_locked(
+                note_id,
+                title=title,
+                content=content,
+                note_type=note_type,
+                tags=tags,
+                status=status,
+                metadata=metadata,
+                project_id=project_id,
+                area_id=area_id,
+            )
+
+    def _update_note_locked(
+        self,
+        note_id: str,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        note_type: Optional[NoteType] = None,
+        tags: Optional[List[str]] = None,
+        status: Any = _UNSET,
+        metadata: Optional[Dict[str, Any]] = None,
+        project_id: Any = _UNSET,
+        area_id: Any = _UNSET,
+    ) -> Note:
+        """Update implementation; caller holds the per-note lock."""
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -374,8 +421,9 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note."""
-        self.repository.delete(note_id)
+        """Delete a note (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
         """Get all notes."""
@@ -780,7 +828,34 @@ class ZettelService:
         recurrence_rule: Any = _UNSET,
         tags: Any = _UNSET,
     ) -> Note:
-        """Update task fields, including project reassignment before status changes."""
+        """Update task fields (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            return self._update_task_locked(
+                note_id,
+                status=status,
+                project_id=project_id,
+                due_date=due_date,
+                remind_at=remind_at,
+                priority=priority,
+                estimated_minutes=estimated_minutes,
+                recurrence_rule=recurrence_rule,
+                tags=tags,
+            )
+
+    def _update_task_locked(
+        self,
+        note_id: str,
+        *,
+        status: Any = _UNSET,
+        project_id: Any = _UNSET,
+        due_date: Any = _UNSET,
+        remind_at: Any = _UNSET,
+        priority: Any = _UNSET,
+        estimated_minutes: Any = _UNSET,
+        recurrence_rule: Any = _UNSET,
+        tags: Any = _UNSET,
+    ) -> Note:
+        """Update-task implementation; caller holds the per-note lock."""
         task = self.repository.get(note_id)
         if not task:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -833,11 +908,23 @@ class ZettelService:
             )
 
         if status is not _UNSET:
-            return self.update_task_status(note_id, status)
+            # Already holding this note's lock — call the unlocked impl directly
+            # so we don't re-acquire the non-reentrant lock and deadlock.
+            return self._update_task_status_locked(note_id, status)
         return task
 
     def update_task_status(self, note_id: str, new_status: NoteStatus) -> Note:
-        """Update the status of a task. Spawns a new task when a recurring one is completed."""
+        """Update task status (serialized per note against concurrent edits)."""
+        with self._note_lock(note_id):
+            return self._update_task_status_locked(note_id, new_status)
+
+    def _update_task_status_locked(
+        self, note_id: str, new_status: NoteStatus
+    ) -> Note:
+        """Status-update implementation; caller holds the per-note lock.
+
+        Spawns a new task when a recurring one is completed.
+        """
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
