@@ -3,7 +3,6 @@
 import datetime
 import logging
 import threading
-from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
@@ -48,84 +47,27 @@ class ZettelService:
     def __init__(self, repository: Optional[NoteRepository] = None):
         """Initialize the service."""
         self.repository = repository or NoteRepository()
-        # Per-note locks guard read-modify-write sequences (get -> mutate ->
-        # update) against concurrent edits to the *same* note, which would
-        # otherwise last-writer-win. A registry lock guards the registry itself.
-        self._note_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
-        self._note_locks_registry_lock = threading.Lock()
-        # Note ids whose lock the *current thread* already holds. Lets nested
-        # acquisitions (e.g. a routing helper that also touches the parent note
-        # while an update already holds the child's lock) skip re-acquiring an
-        # owned lock instead of deadlocking on the non-reentrant Lock.
-        self._held_note_ids = threading.local()
-
-    def _owned_ids(self) -> Set[str]:
-        owned = getattr(self._held_note_ids, "ids", None)
-        if owned is None:
-            owned = set()
-            self._held_note_ids.ids = owned
-        return owned
+        # A single global write lock serializes ALL mutating operations. The
+        # underlying Kuzu database is single-writer (only one write transaction
+        # may exist process-wide), and the daemon dispatches RPC calls on
+        # separate threads, so concurrent writes — even to *different* notes —
+        # must be serialized or Kuzu raises. A reentrant lock lets a mutator call
+        # another mutator (e.g. update_task -> update_task_status, or a routing
+        # helper that also rewrites the parent) without self-deadlocking, and it
+        # blocks (queues) rather than failing, so overlapping callers run in turn.
+        self._write_lock = threading.RLock()
 
     @contextmanager
-    def _note_lock(self, note_id: str) -> Iterator[None]:
-        """Serialize mutations to a single note (see _note_locks_for)."""
-        with self._note_locks_for(note_id):
-            yield
+    def _write_locked(self) -> Iterator[None]:
+        """Serialize a mutating operation against all other writers.
 
-    @contextmanager
-    def _note_locks_for(self, *note_ids: str) -> Iterator[None]:
-        """Acquire per-note locks for one or more notes, deadlock- and reentrancy-safe.
-
-        Locks the requested notes that this thread does not already hold, always
-        in a global stable order (sorted ids), so two operations touching an
-        overlapping set can't deadlock by grabbing them in opposite orders. Ids
-        already owned by the current thread are skipped (the underlying Lock is
-        non-reentrant), which lets a routing helper acquire the parent/area lock
-        while the enclosing update already holds the child's lock.
-
-        Locks are taken at the service layer so they span the whole
-        read-modify-write, and always before the repository's file lock.
+        Held across the whole read-modify-write (and any nested mutators) so a
+        note's get -> mutate -> update can't interleave with another writer, and
+        so two writes never hit Kuzu's single write transaction at once. Callers
+        block until the lock is free rather than erroring.
         """
-        owned = self._owned_ids()
-        to_acquire = sorted({nid for nid in note_ids if nid and nid not in owned})
-        with self._note_locks_registry_lock:
-            locks = [(nid, self._note_locks[nid]) for nid in to_acquire]
-        acquired = []
-        try:
-            for nid, lock in locks:
-                lock.acquire()
-                acquired.append((nid, lock))
-                owned.add(nid)
+        with self._write_lock:
             yield
-        finally:
-            for nid, lock in reversed(acquired):
-                owned.discard(nid)
-                lock.release()
-
-    @contextmanager
-    def _locked_for_routing(
-        self, note_id: str, project_id: Any, area_id: Any
-    ) -> Iterator[None]:
-        """Lock a note plus all its routing endpoints, closing the read-vs-lock race.
-
-        The endpoint ids (current + new parent/area) are read without a lock to
-        size the set, so a concurrent reassignment could change them between that
-        read and acquisition. We therefore lock the computed set, re-resolve the
-        endpoints *under* the locks, and if a new endpoint appeared, release and
-        retry with the superset. This converges (the id set only grows across a
-        bounded set of real endpoints) and never holds locks while re-reading.
-        """
-        seen: Set[str] = set()
-        while True:
-            related = set(self._related_routing_ids(note_id, project_id, area_id))
-            target = sorted({note_id} | related | seen)
-            with self._note_locks_for(*target):
-                confirmed = set(self._related_routing_ids(note_id, project_id, area_id))
-                if confirmed <= (related | seen):
-                    yield
-                    return
-                # A new endpoint appeared after the unlocked read; widen and retry.
-                seen |= confirmed | related
 
     def initialize(self) -> None:
         """Initialize the service and dependencies."""
@@ -170,13 +112,13 @@ class ZettelService:
     def _ensure_parent_has_part_link(self, parent_id: Optional[str], child_id: str) -> None:
         """Update the parent note once so it reflects the child relationship.
 
-        Takes the parent's per-note lock (a no-op if the caller already holds it)
-        so the parent's HAS_PART read-modify-write isn't clobbered by a
-        concurrent edit to that parent.
+        Serialized by the global write lock (reentrant, so this is safe whether
+        or not the caller already holds it) so the parent's HAS_PART
+        read-modify-write isn't clobbered by a concurrent writer.
         """
         if not parent_id:
             return
-        with self._note_locks_for(parent_id):
+        with self._write_locked():
             parent = self.repository.get(parent_id)
             if not parent:
                 raise ValueError(f"Parent note with ID {parent_id} not found")
@@ -195,8 +137,7 @@ class ZettelService:
             raise ValueError(f"Note with ID {note_id} not found")
         if not area_id or note.note_type == NoteType.AREA or area_id == note.id:
             return note
-        # Already inside a locked update of note.id; use the unlocked impl so we
-        # don't re-enter the non-reentrant per-note lock.
+        # Runs inside a held write lock; call the impl directly.
         note, _ = self._create_link_locked(note.id, area_id, LinkType.REFERENCE)
         return note
 
@@ -354,17 +295,14 @@ class ZettelService:
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
     ) -> Note:
-        """Update an existing note (serialized per note against concurrent edits).
+        """Update an existing note.
 
-        Locks the note plus its current and new parent/area up front, in one
-        stable-ordered acquisition (re-resolved under the locks to avoid a
-        read-vs-lock race), so routing changes that also rewrite a parent's
-        HAS_PART link can't lose writes or deadlock. Note: incoming-link alias
-        refresh after a title change updates other source notes outside this lock
-        set; those are independent single-note writes guarded by their own locks
-        within update_preserving_updated_at's call path.
+        Serialized against all other writers by the global write lock, so the
+        whole read-modify-write (including the cross-note routing updates that
+        rewrite a parent's HAS_PART link, and the incoming-link alias refresh)
+        runs atomically with respect to other mutations.
         """
-        with self._locked_for_routing(note_id, project_id, area_id):
+        with self._write_locked():
             return self._update_note_locked(
                 note_id,
                 title=title,
@@ -376,33 +314,6 @@ class ZettelService:
                 project_id=project_id,
                 area_id=area_id,
             )
-
-    def _related_routing_ids(
-        self, note_id: str, project_id: Any, area_id: Any
-    ) -> List[str]:
-        """Best-effort set of other note ids an update/routing change may mutate.
-
-        Read without a lock purely to size the lock set; the authoritative work
-        re-reads under the held locks. Includes the note's current parent/area
-        and any incoming new project/area routing, so all endpoints of a
-        PART_OF/HAS_PART or area-reference change are locked together.
-        """
-        ids: Set[str] = set()
-        note = self.repository.get(note_id)
-        if note:
-            if note.project_id:
-                ids.add(note.project_id)
-            if note.area_id:
-                ids.add(note.area_id)
-        if isinstance(project_id, str) and project_id:
-            ids.add(project_id)
-            project = self.repository.get(project_id)
-            if project and project.area_id:
-                ids.add(project.area_id)
-        if isinstance(area_id, str) and area_id:
-            ids.add(area_id)
-        ids.discard(note_id)
-        return sorted(ids)
 
     def _update_note_locked(
         self,
@@ -416,7 +327,7 @@ class ZettelService:
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
     ) -> Note:
-        """Update implementation; caller holds the per-note lock."""
+        """Update implementation; caller holds the write lock."""
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -528,7 +439,7 @@ class ZettelService:
 
     def delete_note(self, note_id: str) -> None:
         """Delete a note (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        with self._write_locked():
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
@@ -545,7 +456,7 @@ class ZettelService:
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
         """Add a tag to a note (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        with self._write_locked():
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
@@ -554,7 +465,7 @@ class ZettelService:
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
         """Remove a tag from a note (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        with self._write_locked():
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
@@ -578,9 +489,9 @@ class ZettelService:
 
         Locks both endpoints (in a stable order) so a concurrent edit to either
         note can't interleave with this read-modify-write. Internal callers that
-        already hold a note's lock use _create_link_locked instead.
+        already hold the write lock use _create_link_locked instead.
         """
-        with self._note_locks_for(source_id, target_id):
+        with self._write_locked():
             return self._create_link_locked(
                 source_id,
                 target_id,
@@ -664,7 +575,7 @@ class ZettelService:
         Locks both endpoints in a stable order so a concurrent edit to either
         note can't interleave with this read-modify-write.
         """
-        with self._note_locks_for(source_id, target_id):
+        with self._write_locked():
             source_note = self.repository.get(source_id)
             if not source_note:
                 raise ValueError(f"Source note with ID {source_id} not found")
@@ -699,8 +610,15 @@ class ZettelService:
         return self._get_project_for_routing(project_id)
 
     def rebuild_index(self) -> Optional[Path]:
-        """Rebuild the graph index from files."""
-        return self.repository.rebuild_index()
+        """Rebuild the graph index from files.
+
+        Serialized by the global write lock so a rebuild (which swaps the whole
+        graph DB) can't run concurrently with another write. In daemon mode the
+        facade additionally rejects overlapping writes via maintenance mode; this
+        lock also covers direct (in-process) mode.
+        """
+        with self._write_locked():
+            return self.repository.rebuild_index()
 
     def check_consistency(self) -> Dict[str, Any]:
         """Report drift between the markdown files and the graph index (read-only)."""
@@ -974,7 +892,7 @@ class ZettelService:
         reassignment also rewrites the project's HAS_PART link), in one stable
         order, so cross-note routing updates stay consistent and deadlock-free.
         """
-        with self._locked_for_routing(note_id, project_id, _UNSET):
+        with self._write_locked():
             return self._update_task_locked(
                 note_id,
                 status=status,
@@ -1000,7 +918,7 @@ class ZettelService:
         recurrence_rule: Any = _UNSET,
         tags: Any = _UNSET,
     ) -> Note:
-        """Update-task implementation; caller holds the per-note lock."""
+        """Update-task implementation; caller holds the write lock."""
         task = self.repository.get(note_id)
         if not task:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -1053,20 +971,19 @@ class ZettelService:
             )
 
         if status is not _UNSET:
-            # Already holding this note's lock — call the unlocked impl directly
-            # so we don't re-acquire the non-reentrant lock and deadlock.
+            # Already inside the held write lock — call the impl directly.
             return self._update_task_status_locked(note_id, status)
         return task
 
     def update_task_status(self, note_id: str, new_status: NoteStatus) -> Note:
         """Update task status (serialized per note against concurrent edits)."""
-        with self._note_lock(note_id):
+        with self._write_locked():
             return self._update_task_status_locked(note_id, new_status)
 
     def _update_task_status_locked(
         self, note_id: str, new_status: NoteStatus
     ) -> Note:
-        """Status-update implementation; caller holds the per-note lock.
+        """Status-update implementation; caller holds the write lock.
 
         Spawns a new task when a recurring one is completed.
         """

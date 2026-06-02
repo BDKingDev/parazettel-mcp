@@ -530,13 +530,13 @@ def test_find_similar_notes(zettel_service):
 
 
 def test_concurrent_same_note_updates_stay_consistent(zettel_service):
-    """Per-note locking serializes concurrent full-value updates to one note.
+    """The global write lock serializes concurrent full-value updates to one note.
 
-    The lock guarantees each ``update_note`` runs to completion without
-    interleaving another writer mid-write, so the note never ends up in a torn
-    state and the final value is exactly one writer's complete content/tags
-    (clean last-writer-wins), not a corrupted mix. (It does not merge separate
-    read-modify-write calls — that is a different, compare-and-swap operation.)
+    Each ``update_note`` runs to completion without interleaving another writer
+    mid-write, so the note never ends up in a torn state and the final value is
+    exactly one writer's complete content/tags (clean last-writer-wins), not a
+    corrupted mix. (It does not merge separate read-modify-write calls — that is
+    a different, compare-and-swap operation.)
     """
     import threading
 
@@ -718,3 +718,50 @@ def test_concurrent_task_reassignment_and_parent_edits_stay_consistent(zettel_se
         if link.link_type == LinkType.HAS_PART
     }
     assert task.id not in b_children, "parent B still has a stale HAS_PART link"
+
+
+def test_concurrent_updates_to_different_notes_all_succeed(zettel_service):
+    """Concurrent writes to *different* notes serialize and succeed.
+
+    Kuzu is single-writer (one write transaction process-wide), so without the
+    global write lock two threads updating different notes both open a write
+    transaction and one raises "Cannot start a new write transaction". The lock
+    must make them queue and all complete — every update applied, none dropped.
+    """
+    import threading
+
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    notes = [
+        zettel_service.create_note(
+            title=f"N{i}", content="base", note_type=NoteType.PERMANENT, area_id=area.id
+        )
+        for i in range(6)
+    ]
+
+    barrier = threading.Barrier(len(notes))
+    errors = []
+
+    def hammer(note_id: str, idx: int) -> None:
+        try:
+            barrier.wait()
+            for j in range(10):
+                zettel_service.update_note(note_id, content=f"n{idx}-{j}")
+        except Exception as exc:  # pragma: no cover - surfaced via errors list
+            errors.append((idx, repr(exc)))
+
+    threads = [
+        threading.Thread(target=hammer, args=(n.id, i)) for i, n in enumerate(notes)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not any(t.is_alive() for t in threads), "writes deadlocked"
+    # The key assertion: no "one write transaction at a time" RuntimeError.
+    assert not errors, f"concurrent different-note writes failed: {errors}"
+    # Every note got its last write persisted.
+    for i, n in enumerate(notes):
+        assert f"n{i}-9" in zettel_service.get_note(n.id).content
