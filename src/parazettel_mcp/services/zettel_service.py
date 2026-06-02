@@ -102,6 +102,31 @@ class ZettelService:
                 owned.discard(nid)
                 lock.release()
 
+    @contextmanager
+    def _locked_for_routing(
+        self, note_id: str, project_id: Any, area_id: Any
+    ) -> Iterator[None]:
+        """Lock a note plus all its routing endpoints, closing the read-vs-lock race.
+
+        The endpoint ids (current + new parent/area) are read without a lock to
+        size the set, so a concurrent reassignment could change them between that
+        read and acquisition. We therefore lock the computed set, re-resolve the
+        endpoints *under* the locks, and if a new endpoint appeared, release and
+        retry with the superset. This converges (the id set only grows across a
+        bounded set of real endpoints) and never holds locks while re-reading.
+        """
+        seen: Set[str] = set()
+        while True:
+            related = set(self._related_routing_ids(note_id, project_id, area_id))
+            target = sorted({note_id} | related | seen)
+            with self._note_locks_for(*target):
+                confirmed = set(self._related_routing_ids(note_id, project_id, area_id))
+                if confirmed <= (related | seen):
+                    yield
+                    return
+                # A new endpoint appeared after the unlocked read; widen and retry.
+                seen |= confirmed | related
+
     def initialize(self) -> None:
         """Initialize the service and dependencies."""
         # Nothing to do here for synchronous implementation
@@ -331,13 +356,15 @@ class ZettelService:
     ) -> Note:
         """Update an existing note (serialized per note against concurrent edits).
 
-        Acquires the locks for every note this update may also touch — the note
-        itself plus its current and new parent/area (routing changes update the
-        parent's HAS_PART link too) — up front in one stable-ordered acquisition,
-        so the cross-note routing updates can't lose writes or deadlock.
+        Locks the note plus its current and new parent/area up front, in one
+        stable-ordered acquisition (re-resolved under the locks to avoid a
+        read-vs-lock race), so routing changes that also rewrite a parent's
+        HAS_PART link can't lose writes or deadlock. Note: incoming-link alias
+        refresh after a title change updates other source notes outside this lock
+        set; those are independent single-note writes guarded by their own locks
+        within update_preserving_updated_at's call path.
         """
-        related = self._related_routing_ids(note_id, project_id, area_id)
-        with self._note_locks_for(note_id, *related):
+        with self._locked_for_routing(note_id, project_id, area_id):
             return self._update_note_locked(
                 note_id,
                 title=title,
@@ -947,8 +974,7 @@ class ZettelService:
         reassignment also rewrites the project's HAS_PART link), in one stable
         order, so cross-note routing updates stay consistent and deadlock-free.
         """
-        related = self._related_routing_ids(note_id, project_id, _UNSET)
-        with self._note_locks_for(note_id, *related):
+        with self._locked_for_routing(note_id, project_id, _UNSET):
             return self._update_task_locked(
                 note_id,
                 status=status,

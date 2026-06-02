@@ -711,3 +711,10 @@ def test_concurrent_task_reassignment_and_parent_edits_stay_consistent(zettel_se
         if link.link_type == LinkType.HAS_PART
     }
     assert task.id in a_children, "parent A lost its HAS_PART link to the task"
+    # ...and project B must no longer record the task (the reassignment removed it).
+    b_children = {
+        link.target_id
+        for link in zettel_service.get_note(proj_b.id).links
+        if link.link_type == LinkType.HAS_PART
+    }
+    assert task.id not in b_children, "parent B still has a stale HAS_PART link"

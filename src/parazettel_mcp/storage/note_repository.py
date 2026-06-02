@@ -385,8 +385,12 @@ class NoteRepository(Repository[Note]):
         directory for fsync, so any failure is swallowed — durability of the
         rename is a best-effort guarantee, not a hard one.
         """
+        # O_DIRECTORY (where available) ensures we only open an actual directory
+        # and fail fast otherwise; it doesn't exist on Windows, where this whole
+        # path no-ops via the except below.
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         try:
-            dir_fd = os.open(str(dir_path), os.O_RDONLY)
+            dir_fd = os.open(str(dir_path), flags)
         except OSError:
             return
         try:
