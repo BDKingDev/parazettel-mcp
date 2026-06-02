@@ -121,6 +121,7 @@ class TestMcpServer:
         existing.title = "Atomic notes hold one idea"
         existing.content = "Each note contains exactly one idea for clarity."
         existing.tags = [SimpleNamespace(name="zettelkasten")]
+        existing.note_type = NoteType.PERMANENT
         match = SimpleNamespace(note=existing, score=2.6, matched_terms=set(), matched_context="")
         self.mock_search_service.search_combined.return_value = [match]
 
@@ -173,7 +174,11 @@ class TestMcpServer:
         """A below-threshold match is ignored; the note is still created."""
         weak = SimpleNamespace(
             note=SimpleNamespace(
-                id="weak1", title="Loosely related", content="...", tags=[]
+                id="weak1",
+                title="Loosely related",
+                content="...",
+                tags=[],
+                note_type=NoteType.PERMANENT,
             ),
             score=0.4,
             matched_terms=set(),
@@ -198,6 +203,42 @@ class TestMcpServer:
 
         assert "successfully" in result
         assert "created1" in result
+        self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_note_strong_non_knowledge_match_does_not_block(self):
+        """A strong match that's a task/project/area never blocks a knowledge note."""
+        task_hit = SimpleNamespace(
+            note=SimpleNamespace(
+                id="task1",
+                title="A distinct new idea",
+                content="task body",
+                tags=[],
+                note_type=NoteType.TASK,
+            ),
+            score=5.0,  # well above threshold
+            matched_terms=set(),
+            matched_context="",
+        )
+        self.mock_search_service.search_combined.return_value = [task_hit]
+        mock_note = MagicMock()
+        mock_note.id = "knowledge1"
+        self.mock_zettel_service.create_note.return_value = mock_note
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="A distinct new idea",
+            content="A genuinely new permanent note.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        # The task match is filtered out, so creation proceeds.
+        assert "successfully" in result
+        assert "knowledge1" in result
         self.mock_zettel_service.create_note.assert_called_once()
 
     def test_create_area_note_skips_duplicate_check(self):

@@ -193,6 +193,10 @@ class ZettelkastenMcpServer:
                 continue
             if score < _DEDUP_MIN_SCORE:
                 continue
+            # Only knowledge notes are duplicate candidates — an unrelated task,
+            # project, or area match must never block creating a knowledge note.
+            if result.note.note_type not in _DEDUP_NOTE_TYPES:
+                continue
             candidates.append((result.note, float(score)))
             if len(candidates) >= _DEDUP_MAX_CANDIDATES:
                 break
@@ -209,7 +213,10 @@ class ZettelkastenMcpServer:
             "",
         ]
         for i, (note, score) in enumerate(duplicates, 1):
-            snippet = note.content.replace("\n", " ").strip()
+            # Slice before normalizing so we don't process a huge note body just
+            # to truncate it to 160 chars. A little headroom (200) covers any
+            # whitespace collapsed out of the lead.
+            snippet = note.content[:200].replace("\n", " ").strip()
             if len(snippet) > 160:
                 snippet = snippet[:160] + "..."
             lines.append(f"{i}. {note.title} (ID: {note.id})")
