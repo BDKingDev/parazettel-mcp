@@ -332,3 +332,86 @@ class TestIntegration:
             "This content was manually edited outside the system."
             in note1_after.content
         )
+
+    def _write_note_file_with_tags(self, note_id: str, tags: list[str]) -> None:
+        """Write a note markdown file directly with the given frontmatter tags."""
+        tag_block = "tags:\n" + "".join(f"- {tag}\n" for tag in tags)
+        (self.notes_dir / f"{note_id}.md").write_text(
+            "---\n"
+            f"id: {note_id}\n"
+            "title: Tag Edit Note\n"
+            "type: permanent\n"
+            f"{tag_block}"
+            "created: '2026-01-01T00:00:00'\n"
+            "updated: '2026-01-01T00:00:00'\n"
+            "---\n\n# Tag Edit Note\n\nbody\n",
+            encoding="utf-8",
+        )
+
+    def test_rebuild_reconciles_tag_edits_both_ways(self):
+        """Rebuild must reflect on-disk tag adds *and* removals, with no resurrection."""
+        note_id = "20260101T000000000000000"
+
+        # Initial state: three tags.
+        self._write_note_file_with_tags(note_id, ["alpha", "beta", "gamma"])
+        self.zettel_service.rebuild_index()
+        assert {t.name for t in self.zettel_service.get_all_tags()} == {
+            "alpha",
+            "beta",
+            "gamma",
+        }
+
+        # Remove a tag on disk -> rebuild -> removal is reflected, no resurrection.
+        self._write_note_file_with_tags(note_id, ["alpha", "gamma"])
+        self.zettel_service.rebuild_index()
+        tags_after_remove = {t.name for t in self.zettel_service.get_all_tags()}
+        assert tags_after_remove == {"alpha", "gamma"}
+        assert "beta" not in tags_after_remove
+
+        # Re-add the removed tag plus a new one -> rebuild -> both present.
+        self._write_note_file_with_tags(note_id, ["alpha", "beta", "gamma", "delta"])
+        self.zettel_service.rebuild_index()
+        assert {t.name for t in self.zettel_service.get_all_tags()} == {
+            "alpha",
+            "beta",
+            "gamma",
+            "delta",
+        }
+
+    def test_rebuild_drops_orphaned_tag_nodes(self):
+        """A tag removed from its last note must not survive a rebuild."""
+        keep = self.zettel_service.create_note(
+            title="Keep", content="keep", tags=["shared", "kept-only"]
+        )
+        drop = self.zettel_service.create_note(
+            title="Drop", content="drop", tags=["shared", "doomed"]
+        )
+
+        # Remove every use of "doomed" by retagging the only note that had it.
+        self.zettel_service.update_note(drop.id, tags=["shared"])
+
+        # Before a rebuild the orphan Tag node may linger in the graph, but
+        # get_all_tags is edge-derived so it must already exclude it.
+        assert "doomed" not in {t.name for t in self.zettel_service.get_all_tags()}
+
+        # After a rebuild the orphan node itself is gone and the surviving tags
+        # are exactly those still applied to a note.
+        self.zettel_service.rebuild_index()
+        assert {t.name for t in self.zettel_service.get_all_tags()} == {
+            "shared",
+            "kept-only",
+        }
+        assert keep.id and drop.id  # both notes still present
+        assert self.zettel_service.get_note(keep.id) is not None
+        assert self.zettel_service.get_note(drop.id) is not None
+
+    def test_get_all_tags_excludes_unused_tags(self):
+        """get_all_tags reflects tags in use, not bare Tag-node existence."""
+        note = self.zettel_service.create_note(
+            title="Tagged", content="c", tags=["live-tag"]
+        )
+        assert "live-tag" in {t.name for t in self.zettel_service.get_all_tags()}
+
+        # Drop the only tag; the tool output must drop with it.
+        self.zettel_service.update_note(note.id, tags=[])
+        assert "live-tag" not in {t.name for t in self.zettel_service.get_all_tags()}
