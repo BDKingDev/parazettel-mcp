@@ -79,9 +79,11 @@ class TestSearchService:
         )
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = MagicMock()
-        mock_zettel_service.repository.search.side_effect = [
-            [title_match],
-            [content_match],
+        # search_by_text now fetches candidates AND scores in one pass via
+        # search_scored, which returns (notes, {id: bm25}).
+        mock_zettel_service.repository.search_scored.side_effect = [
+            ([title_match], {"title-note": 2.0}),
+            ([content_match], {"content-note": 1.5}),
         ]
         search_service = SearchService(mock_zettel_service)
 
@@ -93,8 +95,9 @@ class TestSearchService:
         assert [result.note.id for result in content_results] == ["content-note"]
         assert content_results[0].matched_context.startswith("Content: ...")
         assert "python appears" in content_results[0].matched_context.lower()
-        mock_zettel_service.repository.search.assert_any_call(title="python")
-        mock_zettel_service.repository.search.assert_any_call(content="python")
+        # Title-only and content-only searches query their own FTS index.
+        mock_zettel_service.repository.search_scored.assert_any_call(title="python")
+        mock_zettel_service.repository.search_scored.assert_any_call(content="python")
 
     def test_search_by_text_prefilters_candidates_via_repository(self):
         """search_by_text() should use the graph-backed repository prefilter."""
@@ -104,7 +107,7 @@ class TestSearchService:
             content="Python shows up in this content.",
         )
         mock_repository = MagicMock()
-        mock_repository.search.return_value = [matching_note]
+        mock_repository.search_scored.return_value = ([matching_note], {"python-note": 3.0})
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = mock_repository
         search_service = SearchService(mock_zettel_service)
@@ -112,10 +115,10 @@ class TestSearchService:
         results = search_service.search_by_text("python")
 
         assert [result.note.id for result in results] == ["python-note"]
-        mock_repository.search.assert_called_once_with(text="python")
+        mock_repository.search_scored.assert_called_once_with(text="python")
 
     def test_search_by_text_keeps_fts_only_candidates(self, zettel_service):
-        """FTS-only matches should not be dropped by substring-only scoring heuristics."""
+        """FTS-only matches (no literal substring) are kept and BM25-scored, not dropped."""
         note = zettel_service.create_note(
             title="Tooling Overview",
             content="Policies libraries decisions and planning support analysis.",
@@ -123,11 +126,95 @@ class TestSearchService:
         )
 
         search_service = SearchService(zettel_service)
+        # "library" is not a literal substring of the body ("libraries"), so the old
+        # substring heuristic would have flattened this to 0.1; FTS still matches it.
         results = search_service.search_by_text("library")
 
         assert [result.note.id for result in results] == [note.id]
-        assert results[0].score == pytest.approx(0.1)
-        assert results[0].matched_context == "FTS: Tooling Overview"
+        # Ranked by the index's real BM25 score, which is strictly positive.
+        assert results[0].score > 0.0
+        # A matched-context string is always provided for the caller.
+        assert results[0].matched_context
+
+    def test_search_by_text_ranks_by_bm25_not_flat_score(self, zettel_service):
+        """Text results are ordered by BM25 relevance and carry distinct positive scores.
+
+        Regression for the bug where every non-substring FTS hit was flattened to a
+        constant 0.1 score, leaving multi-result queries effectively unranked.
+        """
+        strong = zettel_service.create_note(
+            title="Kubernetes deployment strategies",
+            content=(
+                "Kubernetes deployment patterns: rolling deployment, blue-green "
+                "deployment, and canary deployment for a Kubernetes cluster."
+            ),
+            tags=["k8s"],
+        )
+        weak = zettel_service.create_note(
+            title="Weekly notes",
+            content="A passing mention of one Kubernetes deployment we tried once.",
+            tags=["misc"],
+        )
+
+        search_service = SearchService(zettel_service)
+        results = search_service.search_by_text("kubernetes deployment")
+        ids = [r.note.id for r in results]
+
+        assert strong.id in ids and weak.id in ids
+        # The denser, more relevant note ranks first...
+        assert ids[0] == strong.id
+        # ...with a strictly higher BM25 score than the weak match (not a flat tie).
+        scores = {r.note.id: r.score for r in results}
+        assert scores[strong.id] > scores[weak.id] > 0.0
+
+    def test_search_by_text_uses_single_fts_pass(self):
+        """Candidates and BM25 scores come from one search_scored call, not two FTS queries."""
+        note = SimpleNamespace(id="n1", title="Python", content="python body")
+        mock_repository = MagicMock()
+        mock_repository.search_scored.return_value = ([note], {"n1": 4.0})
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_by_text("python")
+
+        assert results[0].score == 4.0
+        mock_repository.search_scored.assert_called_once_with(text="python")
+        # The old second-query path (text_fts_scores) must not be used when the
+        # one-pass scored API is available.
+        mock_repository.text_fts_scores.assert_not_called()
+        mock_repository.search.assert_not_called()
+
+    def test_search_by_text_falls_back_when_scored_api_absent(self):
+        """Repos without search_scored still work via search + text_fts_scores."""
+        note = SimpleNamespace(id="n1", title="Python", content="python body")
+        mock_repository = MagicMock(spec=["search", "text_fts_scores"])
+        mock_repository.search.return_value = [note]
+        mock_repository.text_fts_scores.return_value = {"n1": 1.0}
+        mock_zettel_service = MagicMock()
+        mock_zettel_service.repository = mock_repository
+        search_service = SearchService(mock_zettel_service)
+
+        results = search_service.search_by_text("python")
+
+        assert [r.note.id for r in results] == ["n1"]
+        mock_repository.search.assert_called_once_with(text="python")
+
+    def test_search_scored_uses_own_index_for_title_only(self, zettel_service):
+        """A title-only search is scored by the title index, not the combined one."""
+        note = zettel_service.create_note(
+            title="Kubernetes deployment guide",
+            content="Body text that does not mention the title keywords at all.",
+            tags=["k8s"],
+        )
+
+        # Title-only candidates + scores in one pass; score must be positive and
+        # come from the title FTS index (the body lacks the query terms).
+        notes, scores = zettel_service.repository.search_scored(
+            title="kubernetes deployment"
+        )
+        assert note.id in [n.id for n in notes]
+        assert scores.get(note.id, 0.0) > 0.0
 
     def test_search_by_tag(self, zettel_service):
         """Test searching for notes by tags."""
@@ -430,7 +517,7 @@ class TestSearchService:
         """search_combined() should include text in the graph-backed prefilter."""
         note = SimpleNamespace(id="note-1", title="Python", content="Python body")
         mock_repository = MagicMock()
-        mock_repository.search.return_value = [note]
+        mock_repository.search_scored.return_value = ([note], {"note-1": 2.5})
         mock_zettel_service = MagicMock()
         mock_zettel_service.repository = mock_repository
         search_service = SearchService(mock_zettel_service)
@@ -443,7 +530,8 @@ class TestSearchService:
         )
 
         assert [result.note.id for result in results] == ["note-1"]
-        mock_repository.search.assert_called_once_with(
+        # Text combined search uses the one-pass scored API.
+        mock_repository.search_scored.assert_called_once_with(
             tags=["python"],
             project_id="project123",
             area_id="area456",
@@ -451,7 +539,7 @@ class TestSearchService:
         )
 
     def test_search_combined_keeps_fts_only_candidates(self, zettel_service):
-        """Combined search should preserve valid FTS matches after repository prefiltering."""
+        """Combined search keeps valid FTS matches and BM25-scores them (no 0.1 floor)."""
         note = zettel_service.create_note(
             title="Tooling Overview",
             content="Policies libraries decisions and planning support analysis.",
@@ -463,8 +551,8 @@ class TestSearchService:
         results = search_service.search_combined(text="library", tags=["tooling"])
 
         assert [result.note.id for result in results] == [note.id]
-        assert results[0].score == pytest.approx(0.1)
-        assert results[0].matched_context == "FTS: Tooling Overview"
+        assert results[0].score > 0.0
+        assert results[0].matched_context
 
     def test_search_combined_filters_non_task_notes_by_project(self, zettel_service):
         """Combined search should honor project_id for non-task notes as well."""

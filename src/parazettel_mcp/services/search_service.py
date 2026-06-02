@@ -18,6 +18,99 @@ class SearchResult:
     matched_context: str
 
 
+def _coerce_score_map(scores: Any) -> Dict[str, float]:
+    """Return a real {id: score} dict, or {} for anything else (e.g. a test mock)."""
+    if isinstance(scores, dict):
+        return scores
+    return {}
+
+
+def _score_text_results(
+    notes: List[Note],
+    query: str,
+    bm25_scores: Dict[str, float],
+    *,
+    include_title: bool = True,
+    include_content: bool = True,
+) -> List[SearchResult]:
+    """Rank text-search notes by BM25 relevance, with lexical hits only as a tiebreaker.
+
+    ``notes`` already arrive in BM25 order from the repository. Each result carries
+    its real BM25 ``score`` (from ``bm25_scores``); a small lexical ``boost`` breaks
+    ties only. The boost weights, strongest first: full-query substring in the title
+    (+1.0), full-query substring in the content (+0.25), each query term present in
+    the title (+0.1), each query term present in the content (+0.02). So an exact
+    title match edges out an equally-ranked partial, and a content term hit can edge
+    out a BM25-equal note with no term hit, while title hits still outrank content
+    hits. The boost never overrides BM25 order, and scores are never collapsed to a
+    flat constant the way the previous substring heuristic did. When ``bm25_scores``
+    is empty (no provider, or a mocked repository in tests) every score is 0.0 and
+    the stable sort preserves the repository order.
+    """
+    bm25_scores = _coerce_score_map(bm25_scores)
+    query_lower = query.lower()
+    terms = {t for t in query_lower.split() if t}
+    ranked: List[Tuple[float, float, SearchResult]] = []
+
+    for note in notes:
+        bm25 = float(bm25_scores.get(note.id, 0.0))
+        matched_terms: Set[str] = set()
+        matched_context = ""
+        boost = 0.0
+
+        title_lower = note.title.lower() if (include_title and note.title) else ""
+        if title_lower:
+            if query_lower and query_lower in title_lower:
+                boost += 1.0
+                matched_context = f"Title: {note.title}"
+            for term in terms:
+                if term in title_lower:
+                    boost += 0.1
+                    matched_terms.add(term)
+
+        content_lower = note.content.lower() if (include_content and note.content) else ""
+        if content_lower:
+            if query_lower and query_lower in content_lower:
+                boost += 0.25
+                if not matched_context:
+                    index = content_lower.find(query_lower)
+                    start = max(0, index - 40)
+                    end = min(len(content_lower), index + len(query_lower) + 40)
+                    matched_context = f"Content: ...{note.content[start:end]}..."
+            for term in terms:
+                if term in content_lower:
+                    if term not in matched_terms:
+                        # Small tiebreaker so a content term hit can edge out a
+                        # BM25-equal note with no term hit at all. Kept below the
+                        # title term boost (0.1) so title hits still rank higher.
+                        boost += 0.02
+                    matched_terms.add(term)
+
+        if not matched_context:
+            if include_title and note.title:
+                matched_context = f"Title: {note.title}"
+            elif include_content and note.content:
+                matched_context = f"Content: {note.content[:80]}"
+
+        ranked.append(
+            (
+                bm25,
+                boost,
+                SearchResult(
+                    note=note,
+                    score=bm25,
+                    matched_terms=matched_terms,
+                    matched_context=matched_context,
+                ),
+            )
+        )
+
+    # Primary key: BM25 score (desc). Secondary: lexical boost (desc), a tiebreaker
+    # only. Python's stable sort preserves the repository's BM25 order within ties.
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [result for _bm25, _boost, result in ranked]
+
+
 class SearchService:
     """Service for searching notes in the Zettelkasten."""
 
@@ -32,91 +125,60 @@ class SearchService:
 
     def _get_text_candidates(
         self, query: str, *, include_content: bool, include_title: bool
-    ) -> List[Note]:
-        """Use the repository to prefilter text-search candidates."""
+    ) -> Tuple[List[Note], Dict[str, float]]:
+        """Prefilter candidates AND fetch their BM25 scores in one repository pass.
+
+        The repository returns scores from the same FTS index that produced the
+        candidate ordering, so a title-only or content-only search is scored by
+        its own index rather than the combined title+content index.
+        """
         if not include_content and not include_title:
-            return []
+            return [], {}
 
         repository = self.zettel_service.repository
         if include_content and include_title:
-            return repository.search(text=query)
-        if include_title:
-            return repository.search(title=query)
-        return repository.search(content=query)
+            search_kwargs = {"text": query}
+        elif include_title:
+            search_kwargs = {"title": query}
+        else:
+            search_kwargs = {"content": query}
+
+        scored = getattr(repository, "search_scored", None)
+        if callable(scored):
+            return scored(**search_kwargs)
+        # Fallback for repositories (or mocks) without the one-pass API: candidates
+        # only, no BM25 scores — _score_text_results then keeps repository order.
+        return repository.search(**search_kwargs), {}
 
     def search_by_text(
         self, query: str, include_content: bool = True, include_title: bool = True
     ) -> List[SearchResult]:
-        """Search for notes by text content."""
+        """Search for notes by text content, ranked by BM25 relevance."""
         if not query:
             return []
 
-        # Normalize query
-        query = query.lower()
-        query_terms = set(query.split())
-
-        # Use the graph index to narrow the candidate set before scoring in Python.
-        all_notes = self._get_text_candidates(
+        # One FTS pass narrows, ranks, and scores the candidate set.
+        all_notes, bm25_scores = self._get_text_candidates(
             query, include_content=include_content, include_title=include_title
         )
-        results = []
+        return _score_text_results(
+            all_notes,
+            query,
+            bm25_scores,
+            include_title=include_title,
+            include_content=include_content,
+        )
 
-        for note in all_notes:
-            score = 0.0
-            matched_terms: Set[str] = set()
-            matched_context = ""
-
-            # Check title
-            if include_title and note.title:
-                title_lower = note.title.lower()
-                # Exact match in title is highest score
-                if query in title_lower:
-                    score += 2.0
-                    matched_context = f"Title: {note.title}"
-                # Check for term matches in title
-                for term in query_terms:
-                    if term in title_lower:
-                        score += 0.5
-                        matched_terms.add(term)
-
-            # Check content
-            if include_content and note.content:
-                content_lower = note.content.lower()
-                # Exact match in content
-                if query in content_lower:
-                    score += 1.0
-                    # Extract a snippet around the match
-                    index = content_lower.find(query)
-                    start = max(0, index - 40)
-                    end = min(len(content_lower), index + len(query) + 40)
-                    snippet = note.content[start:end]
-                    matched_context = f"Content: ...{snippet}..."
-                # Check for term matches in content
-                for term in query_terms:
-                    if term in content_lower:
-                        score += 0.2
-                        matched_terms.add(term)
-
-            # Add to results if score is positive
-            if score == 0:
-                # Repository prefiltering may surface valid FTS matches even when
-                # the old substring heuristics do not. Keep those candidates.
-                score = 0.1
-                matched_context = f"FTS: {note.title}"
-
-            if score > 0:
-                results.append(
-                    SearchResult(
-                        note=note,
-                        score=score,
-                        matched_terms=matched_terms,
-                        matched_context=matched_context,
-                    )
-                )
-
-        # Sort by score (descending)
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results
+    def _text_fts_scores(self, query: str) -> Dict[str, float]:
+        """Fetch BM25 scores from the repository; tolerate repos that lack the API."""
+        repository = self.zettel_service.repository
+        getter = getattr(repository, "text_fts_scores", None)
+        if not callable(getter):
+            return {}
+        try:
+            return _coerce_score_map(getter(query))
+        except Exception:  # pragma: no cover - scoring is best-effort, never fatal
+            return {}
 
     def search_by_tag(self, tags: Union[str, List[str]]) -> List[Note]:
         """Search for notes by tags."""
@@ -222,74 +284,23 @@ class SearchService:
         if text:
             search_kwargs["text"] = text
 
-        all_notes = self.zettel_service.repository.search(**search_kwargs)
-
-        filtered_notes = []
-        for note in all_notes:
-            filtered_notes.append(note)
-
-        # If we have a text query, score the notes
-        results = []
+        repository = self.zettel_service.repository
         if text:
-            text = text.lower()
-            query_terms = set(text.split())
+            # One FTS pass returns BM25-ordered candidates AND their scores.
+            scored = getattr(repository, "search_scored", None)
+            if callable(scored):
+                filtered_notes, bm25_scores = scored(**search_kwargs)
+            else:  # fallback: candidates only, then a separate score lookup
+                filtered_notes = repository.search(**search_kwargs)
+                bm25_scores = self._text_fts_scores(text)
+            return _score_text_results(filtered_notes, text, bm25_scores)
 
-            for note in filtered_notes:
-                score = 0.0
-                matched_terms: Set[str] = set()
-                matched_context = ""
+        filtered_notes = repository.search(**search_kwargs)
 
-                # Check title
-                title_lower = note.title.lower()
-                if text in title_lower:
-                    score += 2.0
-                    matched_context = f"Title: {note.title}"
-
-                for term in query_terms:
-                    if term in title_lower:
-                        score += 0.5
-                        matched_terms.add(term)
-
-                # Check content
-                content_lower = note.content.lower()
-                if text in content_lower:
-                    score += 1.0
-                    index = content_lower.find(text)
-                    start = max(0, index - 40)
-                    end = min(len(content_lower), index + len(text) + 40)
-                    snippet = note.content[start:end]
-                    matched_context = f"Content: ...{snippet}..."
-
-                for term in query_terms:
-                    if term in content_lower:
-                        score += 0.2
-                        matched_terms.add(term)
-
-                if score == 0:
-                    # Repository prefiltering may surface valid FTS matches even
-                    # when the old substring heuristics do not.
-                    score = 0.1
-                    matched_context = f"FTS: {note.title}"
-
-                # Add to results if score is positive
-                if score > 0:
-                    results.append(
-                        SearchResult(
-                            note=note,
-                            score=score,
-                            matched_terms=matched_terms,
-                            matched_context=matched_context,
-                        )
-                    )
-        else:
-            # If no text query, just add all filtered notes with a default score
-            results = [
-                SearchResult(
-                    note=note, score=1.0, matched_terms=set(), matched_context=""
-                )
-                for note in filtered_notes
-            ]
-
-        # Sort by score (descending)
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results
+        # No text query: structural/tag filter only — uniform score, repository order.
+        return [
+            SearchResult(
+                note=note, score=1.0, matched_terms=set(), matched_context=""
+            )
+            for note in filtered_notes
+        ]
