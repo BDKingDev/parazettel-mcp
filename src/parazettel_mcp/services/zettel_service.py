@@ -130,17 +130,6 @@ class ZettelService:
             parent.add_link(child_id, LinkType.HAS_PART)
             self.repository.update(parent)
 
-    def _attach_area_reference_link(self, note_id: str, area_id: Optional[str]) -> Note:
-        """Ensure a newly created note references its assigned area."""
-        note = self.repository.get(note_id)
-        if not note:
-            raise ValueError(f"Note with ID {note_id} not found")
-        if not area_id or note.note_type == NoteType.AREA or area_id == note.id:
-            return note
-        # Runs inside a held write lock; call the impl directly.
-        note, _ = self._create_link_locked(note.id, area_id, LinkType.REFERENCE)
-        return note
-
     def _sync_part_of_link(
         self, note_id: str, previous_parent_id: Optional[str], parent_id: Optional[str]
     ) -> Note:
@@ -234,45 +223,49 @@ class ZettelService:
             raise ValueError("Title is required")
         if not content:
             raise ValueError("Content is required")
-        if area_id and note_type != NoteType.AREA:
-            self._get_area_for_routing(area_id)
 
-        resolved_area_id = area_id
-        if project_id:
-            project = self._get_project_for_routing(project_id)
-            project_area_id = project.area_id
-            if project_area_id:
-                if resolved_area_id and resolved_area_id != project_area_id:
-                    raise ValueError(
-                        f"area_id {resolved_area_id} does not match project "
-                        f"{project_id} area_id {project_area_id}"
-                    )
-                resolved_area_id = project_area_id
-            elif not resolved_area_id:
-                raise ValueError(
-                    f"Project {project_id} does not have an area_id to inherit"
-                )
-
-        # Create note object
-        note = Note(
-            title=title,
-            content=content,
-            note_type=note_type,
-            tags=[Tag(name=tag) for tag in (tags or [])],
-            metadata=metadata or {},
-            source=source,
-            status=status,
-            project_id=project_id,
-            area_id=resolved_area_id,
-        )
-
-        if note_type == NoteType.AREA:
-            note.area_id = note.id
-        else:
-            note = self._seed_routing_links(note, parent_id=project_id)
-
-        # Serialize the write against all other writers (Kuzu is single-writer).
+        # Hold the write lock across routing validation AND the create, so a
+        # concurrent re-route of the project/area between resolving the inherited
+        # area_id and persisting the note can't make it inherit stale routing
+        # (TOCTOU). Reentrant, so the nested create/link calls don't re-deadlock.
         with self._write_locked():
+            if area_id and note_type != NoteType.AREA:
+                self._get_area_for_routing(area_id)
+
+            resolved_area_id = area_id
+            if project_id:
+                project = self._get_project_for_routing(project_id)
+                project_area_id = project.area_id
+                if project_area_id:
+                    if resolved_area_id and resolved_area_id != project_area_id:
+                        raise ValueError(
+                            f"area_id {resolved_area_id} does not match project "
+                            f"{project_id} area_id {project_area_id}"
+                        )
+                    resolved_area_id = project_area_id
+                elif not resolved_area_id:
+                    raise ValueError(
+                        f"Project {project_id} does not have an area_id to inherit"
+                    )
+
+            # Create note object
+            note = Note(
+                title=title,
+                content=content,
+                note_type=note_type,
+                tags=[Tag(name=tag) for tag in (tags or [])],
+                metadata=metadata or {},
+                source=source,
+                status=status,
+                project_id=project_id,
+                area_id=resolved_area_id,
+            )
+
+            if note_type == NoteType.AREA:
+                note.area_id = note.id
+            else:
+                note = self._seed_routing_links(note, parent_id=project_id)
+
             note = self.repository.create(note)
             self._ensure_parent_has_part_link(project_id, note.id)
         return note
@@ -841,38 +834,40 @@ class ZettelService:
             raise ValueError(
                 "Tasks must be associated with a project (project_id required)"
             )
-        project = self._get_project_for_routing(project_id)
-        if project.area_id:
-            if area_id and area_id != project.area_id:
-                raise ValueError(
-                    f"area_id {area_id} does not match project "
-                    f"{project_id} area_id {project.area_id}"
-                )
-            area_id = project.area_id
-        elif not area_id:
-            raise ValueError(
-                "Tasks must resolve to an area from the linked project or explicit area_id"
-            )
-        if area_id:
-            self._get_area_for_routing(area_id)
-        task = Note(
-            title=title,
-            content=content,
-            note_type=NoteType.TASK,
-            tags=[Tag(name=t) for t in (tags or [])],
-            status=status,
-            source=source,
-            due_date=due_date,
-            priority=priority,
-            recurrence_rule=recurrence_rule,
-            estimated_minutes=estimated_minutes,
-            remind_at=remind_at,
-            project_id=project_id,
-            area_id=area_id,
-        )
-        task = self._seed_routing_links(task, parent_id=project_id)
-        # Serialize the write against all other writers (Kuzu is single-writer).
+        # Hold the write lock across routing validation AND the create so a
+        # concurrent re-route of the project can't make the task inherit a stale
+        # area_id between resolution and persistence (TOCTOU).
         with self._write_locked():
+            project = self._get_project_for_routing(project_id)
+            if project.area_id:
+                if area_id and area_id != project.area_id:
+                    raise ValueError(
+                        f"area_id {area_id} does not match project "
+                        f"{project_id} area_id {project.area_id}"
+                    )
+                area_id = project.area_id
+            elif not area_id:
+                raise ValueError(
+                    "Tasks must resolve to an area from the linked project or explicit area_id"
+                )
+            if area_id:
+                self._get_area_for_routing(area_id)
+            task = Note(
+                title=title,
+                content=content,
+                note_type=NoteType.TASK,
+                tags=[Tag(name=t) for t in (tags or [])],
+                status=status,
+                source=source,
+                due_date=due_date,
+                priority=priority,
+                recurrence_rule=recurrence_rule,
+                estimated_minutes=estimated_minutes,
+                remind_at=remind_at,
+                project_id=project_id,
+                area_id=area_id,
+            )
+            task = self._seed_routing_links(task, parent_id=project_id)
             task = self.repository.create(task)
             self._ensure_parent_has_part_link(project_id, task.id)
         return task
@@ -1117,42 +1112,44 @@ class ZettelService:
         Top-level projects require an ``area_id``. Subprojects pass a parent project
         through ``project_id`` and inherit that parent project's ``area_id``.
         """
-        if project_id:
-            parent_project = self._get_project_for_routing(project_id)
-            if not parent_project.area_id:
-                raise ValueError(
-                    f"Project {project_id} does not have an area_id to inherit"
-                )
-            if area_id and area_id != parent_project.area_id:
-                raise ValueError(
-                    f"area_id {area_id} does not match project "
-                    f"{project_id} area_id {parent_project.area_id}"
-                )
-            area_id = parent_project.area_id
-        if not area_id:
-            raise ValueError(
-                "Projects must be associated with an area (area_id required)"
-            )
-        self._get_area_for_routing(area_id)
-        metadata: Dict[str, Any] = {}
-        if outcome:
-            metadata["outcome"] = outcome
-        project = Note(
-            title=title,
-            content=content,
-            note_type=NoteType.PROJECT,
-            tags=[Tag(name=t) for t in (tags or [])],
-            metadata=metadata,
-            due_date=deadline,
-            project_id=project_id,
-            area_id=area_id,
-            source=source,
-        )
-        project = self._seed_routing_links(project, parent_id=area_id)
-        if project_id:
-            project.add_link(project_id, LinkType.PART_OF)
-        # Serialize the write against all other writers (Kuzu is single-writer).
+        # Hold the write lock across routing validation AND the create so a
+        # concurrent re-route of the parent project can't make this project/
+        # subproject inherit stale routing between resolution and persistence.
         with self._write_locked():
+            if project_id:
+                parent_project = self._get_project_for_routing(project_id)
+                if not parent_project.area_id:
+                    raise ValueError(
+                        f"Project {project_id} does not have an area_id to inherit"
+                    )
+                if area_id and area_id != parent_project.area_id:
+                    raise ValueError(
+                        f"area_id {area_id} does not match project "
+                        f"{project_id} area_id {parent_project.area_id}"
+                    )
+                area_id = parent_project.area_id
+            if not area_id:
+                raise ValueError(
+                    "Projects must be associated with an area (area_id required)"
+                )
+            self._get_area_for_routing(area_id)
+            metadata: Dict[str, Any] = {}
+            if outcome:
+                metadata["outcome"] = outcome
+            project = Note(
+                title=title,
+                content=content,
+                note_type=NoteType.PROJECT,
+                tags=[Tag(name=t) for t in (tags or [])],
+                metadata=metadata,
+                due_date=deadline,
+                project_id=project_id,
+                area_id=area_id,
+                source=source,
+            )
+            project = self._seed_routing_links(project, parent_id=area_id)
+            if project_id:
+                project.add_link(project_id, LinkType.PART_OF)
             project = self.repository.create(project)
             self._ensure_parent_has_part_link(area_id, project.id)
             self._ensure_parent_has_part_link(project_id, project.id)

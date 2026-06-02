@@ -764,3 +764,55 @@ def test_concurrent_updates_to_different_notes_all_succeed(zettel_service):
     # Every note got its last write persisted.
     for i, n in enumerate(notes):
         assert f"n{i}-9" in zettel_service.get_note(n.id).content
+
+
+def test_create_holds_write_lock_during_routing_and_create(zettel_service, monkeypatch):
+    """Create paths hold the write lock across routing validation AND the create.
+
+    Guards the TOCTOU window: if routing (project/area resolution) ran outside the
+    lock, a concurrent re-route could make the new note inherit stale routing
+    before it is persisted. Asserting the lock is held when repository.create
+    fires proves validation + create are one atomic critical section.
+    """
+    area = zettel_service.create_note(
+        title="Area", content="area", note_type=NoteType.AREA
+    )
+    project = zettel_service.create_project_note(
+        title="P", content="p", area_id=area.id
+    )
+
+    import threading
+
+    locked_during_create = []
+    real_create = zettel_service.repository.create
+
+    def tracking_create(note):
+        # Probe from ANOTHER thread: a non-owning thread can only fail to acquire
+        # the RLock if some thread currently holds it. If create ran outside the
+        # write lock, this probe would succeed (lock free) -> recorded False.
+        result = {}
+
+        def probe():
+            got = zettel_service._write_lock.acquire(blocking=False)
+            if got:
+                zettel_service._write_lock.release()
+            result["free"] = got
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join()
+        locked_during_create.append(not result["free"])  # True = lock was held
+        return real_create(note)
+
+    monkeypatch.setattr(zettel_service.repository, "create", tracking_create)
+
+    # Exercise all three create paths.
+    zettel_service.create_note(
+        title="N", content="c", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    zettel_service.create_task(title="T", content="t", project_id=project.id)
+    zettel_service.create_project_note(title="P2", content="p2", area_id=area.id)
+
+    assert locked_during_create and all(locked_during_create), (
+        "repository.create ran without the write lock held (TOCTOU window open)"
+    )
