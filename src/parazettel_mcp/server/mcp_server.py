@@ -178,7 +178,11 @@ class ZettelkastenMcpServer:
         """
         query = title.strip()
         if content:
-            query = f"{query} {content.strip()[:200]}"
+            # Slice before strip so a large note body isn't fully stripped just
+            # to take a 200-char lead; only append when the slice is non-empty.
+            content_lead = content[:200].strip()
+            if content_lead:
+                query = f"{query} {content_lead}"
         if not query.strip():
             return []
         try:
