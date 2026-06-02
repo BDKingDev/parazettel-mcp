@@ -1,6 +1,6 @@
 # MCP Testing Guide
 
-A complete walkthrough of all 30 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
+A complete walkthrough of all 31 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
 
 Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each creation call.
 
@@ -816,11 +816,14 @@ Verify deletion: `pzk_get_note {TEMP_NOTE_ID}` should return `Note not found: {T
 Found 1 matching notes:
 
 1. Atomic notes are the foundation of Zettelkasten (ID: {NOTE_ID})
+   Relevance: 1.842
    Tags: zettelkasten, methodology, atomicity, core-principle
    Created: 2026-03-26
-   Preview: Each note contains exactly one idea. This constraint forces clarity...
+   Match: Each note contains exactly one idea. This constraint forces clarity...
 
 ```
+
+For a text `query`, results are ranked by the Kuzu full-text **BM25 relevance score**, and each hit shows a `Relevance:` line (higher = stronger match) so a strong match is distinguishable from a weak one. The `Match:` line shows why the note matched (the matched title/content context); it replaces the `Preview:` line, which is only shown when there is no matched context (e.g. a tag- or type-only filter with no text query).
 
 **Call (by note\_type):**
 
@@ -946,7 +949,7 @@ Found N similar notes for {NOTE_ID}:
 
 ```
 
-Returns empty if no other notes share tags or links.
+Similarity is **content-aware**: it blends a length-aware lexical overlap of the notes' titles and content with the structural signal (shared tags and knowledge links, excluding PARA routing links). So a note can surface as similar through topical word overlap even when it shares no tags or links — which means freshly created notes with no links yet can still be matched. Returns empty only when nothing clears the `threshold`.
 
 ---
 
@@ -1057,7 +1060,7 @@ Returns notes *updated* on or after the start date, sorted by `updated_at`. Usef
 
 ### `pzk_rebuild_index`
 
-Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped file snapshot backup of the current graph database is created before the rebuild starts.
+Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped file snapshot backup of the current graph database is created first; then a fresh index is built into a temporary database and atomically swapped into place (the live index is never cleared in place). Because the rebuilt graph contains exactly what the files declare, it also reconciles hand edits to tags/links and drops orphaned tag nodes.
 
 In daemon mode, rebuild runs as an explicit maintenance operation. Other chats and clients can still connect to the daemon, but normal RPC calls are rejected until the rebuild finishes.
 
@@ -1072,9 +1075,40 @@ Notes processed: N
 Change in note count: 0
 ```
 
+If any `.md` files fail to parse, they are reported instead of being silently dropped, e.g.:
+
+```
+Database index rebuilt successfully.
+Backup created: {BACKUP_PATH}
+Notes processed: N
+Change in note count: 0
+WARNING: 2 file(s) failed to parse and were skipped: broken-one.md, broken-two.md
+```
+
 If the graph database file did not exist yet, the backup line will report that no backup was created.
 
 `Change in note count` will be non-zero only if `.md` files were added or removed outside the MCP server.
+
+### `pzk_check_consistency`
+
+Read-only audit that compares the Markdown files (the source of truth) against the Kuzu graph index and reports the ways they can silently disagree. Unlike `pzk_rebuild_index`, it never modifies either store — run it to decide *whether* a rebuild is needed.
+
+**Call:** *(no parameters)*
+
+**Expected output:** a summary with counts plus any offending note IDs:
+
+```
+total_files: N
+total_indexed: N
+in_sync: N
+missing_from_index: []   # a {id}.md exists on disk but no Note node is indexed
+missing_from_files: []   # a Note node is indexed but its file is gone
+content_drift: []        # both exist but the file body differs from the index
+unreadable_files: []
+consistent: true
+```
+
+When `consistent` is `false`, run `pzk_rebuild_index` to reconcile.
 
 ---
 
@@ -1110,3 +1144,5 @@ If the graph database file did not exist yet, the backup line will report that n
 | `pzk_find_orphaned_notes` | — | — |
 | `pzk_list_notes_by_date` | — | start\_date, end\_date, use\_updated, limit |
 | `pzk_rebuild_index` | — | — |
+| `pzk_check_consistency` | — | — |
+| `pzk_get_notes` | identifiers | — |

@@ -1,5 +1,19 @@
 # Version History
 
+## Unreleased
+
+Merged to `main` after v0.5.1.1; not yet version-bumped.
+
+### Highlights
+
+- **Search ranks by BM25 relevance.** `pzk_search_notes` now orders text results by the Kuzu full-text index's own relevance score (lexical hits act only as a tiebreaker) instead of a substring heuristic that flattened most matches to a constant. Results surface a `Relevance:` score and a `Match:` context line.
+- **`pzk_rebuild_index` rebuilt for safety.** It now builds a fresh index into a temporary database and atomically swaps it in (no in-place clear), fixing a Kuzu bulk-delete segfault on large graphs. It reports unparseable/skipped files instead of dropping them silently, and reliably drops orphaned tag nodes. The pre-rebuild backup no longer races the open DB on Windows (WinError 33).
+- **New `pzk_check_consistency` tool** — read-only audit of file-vs-index drift (missing-from-index, missing-from-files, content drift). `31` MCP tools total.
+- **`pzk_get_all_tags` is edge-derived** — returns only tags actually applied to a note (via `HAS_TAG` edges), so orphaned tag nodes never surface.
+- **`pzk_find_similar_notes` is content-aware** — blends length-aware lexical overlap of title/content with the structural tag/link signal (excluding PARA routing links), so notes with no shared tags or links can still match.
+- **Area reference link syncs on re-route** — changing a note's `area_id` (directly or via project) now rewrites its `## Links` area reference to match.
+- **Actionable daemon-down errors** — the daemon-unavailable message now includes an absolute, runnable command to start the daemon.
+
 ## v0.5.1.1 (Current Release)
 
 **Release Date:** 2026-05-11

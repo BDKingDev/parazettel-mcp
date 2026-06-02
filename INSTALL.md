@@ -142,7 +142,7 @@ If you want the daemon to shut itself down when it has been unused for a while, 
 
 ## Step 6: Verify Installation
 
-Start your MCP client and verify the server is visible. Parazettel currently exposes `30` tools.
+Start your MCP client and verify the server is visible. Parazettel currently exposes `31` tools.
 
 Then run a simple smoke test such as creating an area note or fetching an existing note.
 
