@@ -1274,36 +1274,25 @@ class NoteRepository(Repository[Note]):
         except Exception as exc:
             logger.warning("Could not embed note %s: %s", note.id, exc)
 
-    def vector_search_ids(self, text: str, limit: int = 50) -> List[str]:
-        """Return note ids most semantically similar to *text*, best first.
+    def _search_by_vector(
+        self, query_vector: List[float], limit: int
+    ) -> Dict[str, float]:
+        """Return {note_id: distance} (lower = closer) for a precomputed vector.
 
-        Combines the HNSW index (notes folded in at the last rebuild) with a
-        brute-force cosine pass over the *dirty* set — notes created/updated since
-        then, held in the un-indexed ``PendingEmbedding`` table — so recently
-        changed notes are findable immediately. Fresh dirty vectors override any
-        stale index entry for the same note. Returns an empty list when embeddings
-        are disabled or the query cannot be embedded, so callers cleanly fall back
-        to BM25.
+        Combines the HNSW index (only when it was built with the *current* model;
+        a stale-model index is skipped) with a brute-force pass over the dirty
+        ``PendingEmbedding`` set — its join to ``Note`` drops deleted notes, and
+        its distance matches the configured metric. Dirty vectors override stale
+        index entries for the same id.
         """
-        provider = self._embedding_provider
-        if provider is None or not text or not text.strip():
-            return []
-        try:
-            query_vector = provider.embed_query(text)
-        except Exception as exc:
-            logger.warning("Query embedding failed; skipping vector search: %s", exc)
-            return []
-
-        model_id = provider.model_id
+        if self._embedding_provider is None:
+            return {}
+        model_id = self._embedding_provider.model_id
         metric = (config.embedding_metric or "cosine").strip().lower()
         dist_expr = _BRUTE_FORCE_DISTANCE.get(metric, _BRUTE_FORCE_DISTANCE["cosine"])
         distance_by_id: Dict[str, float] = {}
         try:
             with self._connection() as conn:
-                # HNSW over the indexed vectors — but only if the index was built
-                # with the *current* model; otherwise its vectors are stale and
-                # ranking a new-model query against them is meaningless, so skip
-                # it (the dirty set below, which is current-model, still answers).
                 if (
                     note_vector_index_exists(conn)
                     and self._indexed_embedding_model(conn) == model_id
@@ -1320,10 +1309,6 @@ class NoteRepository(Repository[Note]):
                             distance_by_id[row[0]] = float(row[1])
                     except Exception as exc:
                         logger.warning("HNSW vector query failed: %s", exc)
-                # Brute-force the dirty set (PendingEmbedding). The join to Note
-                # drops rows for deleted notes; filters keep only non-null,
-                # current-model vectors; the distance matches the index metric.
-                # Fresh dirty vectors override any stale HNSW entry for the id.
                 try:
                     brute = conn.execute(
                         "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
@@ -1339,10 +1324,104 @@ class NoteRepository(Repository[Note]):
                     logger.warning("Brute-force vector fallback failed: %s", exc)
         except Exception as exc:
             logger.warning("Vector search failed: %s", exc)
-            return []
+            return {}
+        return distance_by_id
 
-        ordered = sorted(distance_by_id.items(), key=lambda kv: kv[1])
-        return [note_id for note_id, _distance in ordered[:limit]]
+    def vector_search(self, text: str, limit: int = 50) -> List[Tuple[str, float]]:
+        """Nearest notes to *text* as (note_id, distance) pairs, closest first.
+
+        Embeds *text* as a search query, then runs :meth:`_search_by_vector`.
+        Returns ``[]`` when embeddings are disabled or the query cannot be
+        embedded, so callers cleanly fall back to BM25 / lexical behaviour.
+        """
+        provider = self._embedding_provider
+        if provider is None or not text or not text.strip():
+            return []
+        try:
+            query_vector = provider.embed_query(text)
+        except Exception as exc:
+            logger.warning("Query embedding failed; skipping vector search: %s", exc)
+            return []
+        distances = self._search_by_vector(query_vector, limit)
+        return sorted(distances.items(), key=lambda kv: kv[1])[:limit]
+
+    def vector_search_ids(self, text: str, limit: int = 50) -> List[str]:
+        """Nearest note ids to *text*, closest first (see :meth:`vector_search`)."""
+        return [note_id for note_id, _distance in self.vector_search(text, limit)]
+
+    def vector_search_by_vector(
+        self, query_vector: List[float], limit: int = 50
+    ) -> List[Tuple[str, float]]:
+        """Nearest notes to a precomputed embedding, as (note_id, distance) pairs.
+
+        Used by note-to-note similarity, which queries with a note's own stored
+        document vector instead of re-embedding its text as a search query.
+        """
+        if not query_vector:
+            return []
+        distances = self._search_by_vector(query_vector, limit)
+        return sorted(distances.items(), key=lambda kv: kv[1])[:limit]
+
+    def get_note_embedding(self, note_id: str) -> Optional[List[float]]:
+        """Return a note's stored *current-model* document embedding, freshest first.
+
+        Prefers the dirty ``PendingEmbedding`` over the indexed ``Note.embedding``,
+        and only returns a vector produced by the active model — a stale vector
+        from a previous model would be incompatible with ``_search_by_vector``
+        (which searches current-model vectors). Returns ``None`` when embeddings
+        are disabled or no current-model vector is stored yet.
+        """
+        if self._embedding_provider is None:
+            return None
+        model_id = self._embedding_provider.model_id
+        try:
+            with self._connection() as conn:
+                for query in (
+                    "MATCH (p:PendingEmbedding {id: $id}) "
+                    "WHERE p.embedding IS NOT NULL AND p.embedding_model = $model "
+                    "RETURN p.embedding",
+                    "MATCH (n:Note {id: $id}) "
+                    "WHERE n.embedding IS NOT NULL AND n.embedding_model = $model "
+                    "RETURN n.embedding",
+                ):
+                    result = conn.execute(query, {"id": note_id, "model": model_id})
+                    if result.has_next():
+                        vector = result.get_next()[0]
+                        if vector is not None:
+                            return [float(x) for x in vector]
+        except Exception as exc:
+            logger.warning("Could not read embedding for %s: %s", note_id, exc)
+        return None
+
+    def incoming_knowledge_link_ids(
+        self,
+        note_id: str,
+        routing_link_values: Iterable[str],
+        *,
+        exclude_reference: bool = False,
+    ) -> Set[str]:
+        """Source ids of incoming *knowledge* links to *note_id*.
+
+        Excludes PARA/GTD routing link types (``routing_link_values``) and — for
+        an area note (``exclude_reference``) — incoming ``reference`` links, since
+        every member note references its area. Without this, a parent area/project
+        (which every child links to) would count all its children as structurally
+        similar, the scaffolding-dominates-the-graph problem.
+        """
+        where = ["NOT r.link_type IN $routing"]
+        params: Dict[str, Any] = {
+            "id": note_id,
+            "routing": list(routing_link_values),
+        }
+        if exclude_reference:
+            where.append("r.link_type <> $reference")
+            params["reference"] = LinkType.REFERENCE.value
+        query = (
+            "MATCH (s:Note)-[r:LINKS_TO]->(n:Note {id: $id}) "
+            "WHERE " + " AND ".join(where) + " RETURN DISTINCT s.id AS id"
+        )
+        with self._connection() as conn:
+            return set(_result_first_column(conn.execute(query, params)))
 
     def _indexed_embedding_model(self, conn: kuzu.Connection) -> Optional[str]:
         """Return the model id of the embeddings folded into the HNSW index."""
