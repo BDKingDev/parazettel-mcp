@@ -100,3 +100,19 @@ def test_create_vector_index_rejects_bad_metric(tmp_path):
     finally:
         conn.close()
         close_graph_db(path)
+
+
+def test_create_vector_index_normalizes_metric(tmp_path):
+    # A mixed-case/padded metric (as a human might set via env) is accepted.
+    path, conn = _open(tmp_path)
+    try:
+        ensure_embedding_schema(conn, 4)
+        conn.execute(
+            "CREATE (n:Note {id:'a', title:'a', embedding:$e})",
+            parameters={"e": [1.0, 0.0, 0.0, 0.0]},
+        )
+        create_note_vector_index(conn, metric="  COSINE ")
+        assert note_vector_index_exists(conn)
+    finally:
+        conn.close()
+        close_graph_db(path)

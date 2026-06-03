@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 try:  # Protocol is stdlib on 3.8+, but guard for clarity.
     from typing import Protocol, runtime_checkable
@@ -108,6 +108,8 @@ class SentenceTransformerProvider:
     """
 
     def __init__(self, model_name: str, dim: int, *, normalize: bool = True) -> None:
+        if dim <= 0:
+            raise ValueError("embedding_dim must be positive")
         self.model_name = model_name
         self.dim = dim
         self.model_id = f"sentence-transformers:{model_name}:{dim}"
@@ -133,7 +135,7 @@ class SentenceTransformerProvider:
 
     def _encode(self, texts: Sequence[str], *, prompt: str) -> List[List[float]]:
         model = self._ensure_model()
-        kwargs = {"convert_to_numpy": True}
+        kwargs: Dict[str, Any] = {"convert_to_numpy": True}
         if self._has_prompt(prompt):
             kwargs["prompt_name"] = prompt
         vectors = model.encode(list(texts), **kwargs)
@@ -170,6 +172,8 @@ class FastEmbedProvider:
     """
 
     def __init__(self, model_name: str, dim: int, *, normalize: bool = True) -> None:
+        if dim <= 0:
+            raise ValueError("embedding_dim must be positive")
         self.model_name = model_name
         self.dim = dim
         self.model_id = f"fastembed:{model_name}:{dim}"

@@ -121,8 +121,11 @@ class ZettelkastenConfig(BaseModel):
         default=int(os.getenv("PARAZETTEL_EMBEDDING_DIM", "384"))
     )
     # Distance metric for the HNSW index: "cosine", "l2", or "dotproduct".
+    # Normalized (stripped/lowercased) so env values like "COSINE" are accepted.
     embedding_metric: str = Field(
-        default=os.getenv("PARAZETTEL_EMBEDDING_METRIC", "cosine")
+        default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_METRIC", "cosine")
+        .strip()
+        .lower()
     )
 
     def get_absolute_path(self, path: Path) -> Path:

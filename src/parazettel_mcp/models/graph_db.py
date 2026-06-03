@@ -294,6 +294,7 @@ def create_note_vector_index(
     embedding dimension or metric is changed by rebuilding (not recreating in
     place), which Kuzu 0.11.x does not reliably support for same-named indexes.
     """
+    metric = metric.strip().lower()
     if metric not in _VALID_METRICS:
         raise ValueError(
             f"Unsupported embedding metric {metric!r}; expected one of "

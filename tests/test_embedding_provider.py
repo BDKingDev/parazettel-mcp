@@ -43,6 +43,14 @@ def test_hash_provider_rejects_nonpositive_dim():
         HashEmbeddingProvider(dim=0)
 
 
+def test_local_providers_reject_nonpositive_dim():
+    # Fail fast on misconfiguration rather than producing empty vectors later.
+    with pytest.raises(ValueError):
+        SentenceTransformerProvider("some/model", 0)
+    with pytest.raises(ValueError):
+        FastEmbedProvider("some/model", -1)
+
+
 def test_factory_builds_hash_provider():
     cfg = ZettelkastenConfig(
         embedding_enabled=True, embedding_provider="hash", embedding_dim=32

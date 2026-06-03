@@ -67,6 +67,12 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 
+# Optional embedding backends are lazy-imported and only present with the
+# [embeddings] / [embeddings-lite] extras; don't fail type-checking on them.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers.*", "fastembed.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
