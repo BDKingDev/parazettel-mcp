@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
 from parazettel_mcp.services.zettel_service import ZettelService
 
+# Reciprocal Rank Fusion constant (standard default); larger flattens the
+# contribution of top ranks. Vector candidate pool size for fusion.
+_RRF_K = 60
+_VECTOR_TOPK = 50
+
 
 @dataclass
 class SearchResult:
@@ -180,6 +185,85 @@ class SearchService:
         except Exception:  # pragma: no cover - scoring is best-effort, never fatal
             return {}
 
+    def _fuse_hybrid(
+        self,
+        query: str,
+        bm25_results: List[SearchResult],
+        search_kwargs: Dict[str, Any],
+    ) -> List[SearchResult]:
+        """Blend BM25 results with semantic vector hits via Reciprocal Rank Fusion.
+
+        Ordering is fused on *rank* (RRF, which sidesteps BM25-vs-cosine score
+        incompatibility), but every result keeps its BM25 ``score`` so
+        score-threshold consumers (e.g. dedup-on-create) are unaffected;
+        vector-only hits carry score 0.0. When embeddings are disabled or
+        unavailable the vector list is empty and the BM25 ordering is returned
+        unchanged — so search never breaks because of an embedding hiccup.
+        """
+        repository = self.zettel_service.repository
+        vector_search = getattr(repository, "vector_search_ids", None)
+        if not callable(vector_search):
+            return bm25_results
+
+        # With structural filters, fetch a wider candidate pool so the post-filter
+        # intersection isn't starved when the raw top hits are mostly out-of-scope.
+        structural = {k: v for k, v in search_kwargs.items() if k != "text"}
+        vec_limit = _VECTOR_TOPK * 4 if structural else _VECTOR_TOPK
+        try:
+            vector_ids = vector_search(query, limit=vec_limit)
+        except Exception:  # pragma: no cover - vector path is best-effort
+            return bm25_results
+        # Tolerate repositories/mocks without a real list result (e.g. tests with
+        # a MagicMock repository): only fuse when we got an actual id list.
+        if not isinstance(vector_ids, list) or not vector_ids:
+            return bm25_results
+
+        # Apply the same structural filters to vector hits by intersecting with a
+        # filter-only id set (reuses the repository filter logic; no duplication),
+        # then cap back to the fusion budget.
+        if structural:
+            try:
+                allowed = {note.id for note in repository.search(**structural)}
+                vector_ids = [nid for nid in vector_ids if nid in allowed]
+            except Exception:  # pragma: no cover
+                vector_ids = []
+        vector_ids = vector_ids[:_VECTOR_TOPK]
+        if not vector_ids:
+            return bm25_results
+
+        results_by_id: Dict[str, SearchResult] = {
+            r.note.id: r for r in bm25_results
+        }
+        fused: Dict[str, float] = {}
+        for rank, result in enumerate(bm25_results):
+            fused[result.note.id] = fused.get(result.note.id, 0.0) + 1.0 / (
+                _RRF_K + rank + 1
+            )
+        for rank, note_id in enumerate(vector_ids):
+            fused[note_id] = fused.get(note_id, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+        # Materialize results for vector-only hits (semantic matches BM25 missed).
+        for note_id in vector_ids:
+            if note_id in results_by_id:
+                continue
+            note = self.zettel_service.get_note(note_id)
+            if note is None:
+                continue
+            results_by_id[note_id] = SearchResult(
+                note=note,
+                score=0.0,  # no BM25 (lexical) match; surfaced by semantic rank
+                matched_terms=set(),
+                matched_context=(
+                    f"Content: {note.content[:80]}" if note.content else ""
+                ),
+            )
+
+        return sorted(
+            results_by_id.values(),
+            key=lambda r: fused.get(r.note.id, 0.0),
+            reverse=True,
+        )
+
     def search_by_tag(self, tags: Union[str, List[str]]) -> List[Note]:
         """Search for notes by tags."""
         if isinstance(tags, str):
@@ -293,7 +377,9 @@ class SearchService:
             else:  # fallback: candidates only, then a separate score lookup
                 filtered_notes = repository.search(**search_kwargs)
                 bm25_scores = self._text_fts_scores(text)
-            return _score_text_results(filtered_notes, text, bm25_scores)
+            bm25_results = _score_text_results(filtered_notes, text, bm25_scores)
+            # Blend in semantic vector hits (no-op when embeddings are disabled).
+            return self._fuse_hybrid(text, bm25_results, search_kwargs)
 
         filtered_notes = repository.search(**search_kwargs)
 

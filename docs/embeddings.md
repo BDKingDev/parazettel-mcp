@@ -11,15 +11,21 @@ install tier (below). When disabled, the system behaves exactly as before
   extension statically linked). One store, one backup, one atomic swap — no
   sidecar vector DB.
 - **Hybrid retrieval via Reciprocal Rank Fusion.** Keep BM25 for exact terms,
-  add dense vectors for meaning, fuse on *rank* (RRF) to avoid the
-  score-incompatibility problem. Filtered vector search uses
-  `project_graph_cypher` to scope by `note_type` etc.
+  add dense vectors for meaning, fuse on *rank* (RRF, `k=60`) to avoid the
+  score-incompatibility problem. Each result keeps its **BM25 score** so
+  score-threshold consumers (dedup-on-create) are unaffected; vector-only hits
+  carry score 0. Structural filters are applied to vector hits by intersecting
+  with the existing filter query (no duplicated filter logic).
 - **Rebuild-driven index + brute-force fallback.** The HNSW index is (re)built in
-  the existing rebuild → atomic-swap pipeline (also backfills embeddings). Notes
-  changed since the last rebuild are covered at query time by a brute-force
-  cosine pass (`array_cosine_similarity`) over that small dirty set, tracked via
-  `embedded_at` / `embedding_model`. Embeddings are computed *outside* the global
-  write lock and written *under* it.
+  the existing rebuild → atomic-swap pipeline (also backfills `Note.embedding`).
+  Notes changed since the last rebuild can't update `Note.embedding` — once the
+  HNSW index exists Kuzu locks that column against `SET` — so their vectors are
+  written to a separate, un-indexed **`PendingEmbedding`** table, and a
+  brute-force cosine pass (`array_cosine_similarity`) over that small dirty set
+  covers them at query time (fresh vectors override stale index entries). A
+  rebuild repopulates `Note.embedding` from the files and starts the pending
+  table empty. (Embeddings are currently computed under the global write lock;
+  moving the compute outside it is a planned optimization.)
 - **Provider abstraction.** Everything depends only on the small
   `EmbeddingProvider` protocol (`services/embedding_provider.py`); the model and
   runtime are swappable via config.
