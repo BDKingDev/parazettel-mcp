@@ -38,12 +38,17 @@ def test_config(temp_dirs):
     original_backend_mode = config.backend_mode
     original_daemon_host = config.daemon_host
     original_daemon_port = config.daemon_port
+    original_kuzu_buffer = config.kuzu_buffer_pool_bytes
     # Update config for tests
     config.notes_dir = notes_dir
     config.graph_db_path = graph_db_path
     config.backend_mode = "direct"
     config.daemon_host = "127.0.0.1"
     config.daemon_port = 8766
+    # Bound the Kuzu buffer pool so each test's fresh DB stays small — otherwise
+    # Kuzu reserves ~80% of RAM per instance, which makes the suite memory-heavy
+    # and impossible to run in parallel (pytest-xdist) without OOM.
+    config.kuzu_buffer_pool_bytes = 128 * 1024 * 1024
     yield config
     # Restore original config
     config.notes_dir = original_notes_dir
@@ -51,6 +56,7 @@ def test_config(temp_dirs):
     config.backend_mode = original_backend_mode
     config.daemon_host = original_daemon_host
     config.daemon_port = original_daemon_port
+    config.kuzu_buffer_pool_bytes = original_kuzu_buffer
 
 
 @pytest.fixture

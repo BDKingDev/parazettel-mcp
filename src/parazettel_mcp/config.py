@@ -127,6 +127,18 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
+    # Max Kuzu buffer-pool size in bytes. 0 means use Kuzu's default, which is
+    # ~80% of physical RAM *per database instance* — fine for a single long-lived
+    # daemon, but it makes the test suite (one fresh DB per test) memory-heavy and
+    # impossible to parallelize. Set PARAZETTEL_KUZU_BUFFER_POOL_MB (megabytes) to
+    # bound it; a few-thousand-note vault needs only a small pool.
+    kuzu_buffer_pool_bytes: int = Field(
+        default_factory=lambda: max(
+            0, int(os.getenv("PARAZETTEL_KUZU_BUFFER_POOL_MB", "0"))
+        )
+        * 1024
+        * 1024
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""

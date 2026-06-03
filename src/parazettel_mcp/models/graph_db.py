@@ -41,7 +41,9 @@ def _db_cache_key(db_path: Path, read_only: bool = False) -> str:
     return f"{Path(db_path).expanduser().resolve()}::{mode}"
 
 
-def init_graph_db(db_path: Path, read_only: bool = False) -> kuzu.Database:
+def init_graph_db(
+    db_path: Path, read_only: bool = False, buffer_pool_size: int = 0
+) -> kuzu.Database:
     """Create (or open) the Kuzu database at *db_path* and ensure the schema exists.
 
     Args:
@@ -49,6 +51,10 @@ def init_graph_db(db_path: Path, read_only: bool = False) -> kuzu.Database:
                  exist.  Kuzu manages its own internal file structure at this
                  path; do **not** create the path as a directory before calling
                  this function.
+        read_only: Open the database without write access.
+        buffer_pool_size: Max Kuzu buffer-pool size in bytes. ``0`` (default)
+                 leaves Kuzu's own default (~80% of physical RAM per instance);
+                 a positive value bounds it (see ``config.kuzu_buffer_pool_bytes``).
 
     Returns:
         An open :class:`kuzu.Database` instance.
@@ -64,7 +70,12 @@ def init_graph_db(db_path: Path, read_only: bool = False) -> kuzu.Database:
             return db
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        db = kuzu.Database(str(db_path), read_only=read_only)
+        if buffer_pool_size and buffer_pool_size > 0:
+            db = kuzu.Database(
+                str(db_path), read_only=read_only, buffer_pool_size=buffer_pool_size
+            )
+        else:
+            db = kuzu.Database(str(db_path), read_only=read_only)
         if not read_only:
             conn = kuzu.Connection(db)
             try:
