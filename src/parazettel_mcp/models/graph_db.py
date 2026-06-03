@@ -223,3 +223,86 @@ def _create_schema(conn: kuzu.Connection) -> None:
         """
     )
     _ensure_fts_indexes(conn)
+
+
+# --- Semantic embedding schema / HNSW vector index (optional, off by default) ---
+#
+# Kuzu 0.11.x ships the `vector` extension statically linked, so no INSTALL/LOAD
+# is required. These helpers are only invoked when embeddings are enabled; the
+# base Note schema above is untouched otherwise.
+
+NOTE_VECTOR_INDEX = "note_vec"
+_VALID_METRICS = frozenset({"cosine", "l2", "dotproduct"})
+
+
+def ensure_embedding_schema(conn: kuzu.Connection, dim: int) -> None:
+    """Idempotently add the embedding columns to the Note node.
+
+    ``ALTER ... ADD IF NOT EXISTS`` is a no-op when a column already exists, so
+    this is safe to call on every open. The embedding column is ``FLOAT[dim]``;
+    rows created before it existed simply hold NULL until (re)embedded.
+
+    Args:
+        conn: An open writable Kuzu connection.
+        dim: Vector dimensionality; must match the configured embedding model.
+    """
+    dim = int(dim)
+    if dim <= 0:
+        raise ValueError("embedding dim must be positive")
+    conn.execute(f"ALTER TABLE Note ADD IF NOT EXISTS embedding FLOAT[{dim}]")
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedded_at TIMESTAMP")
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedding_model STRING")
+
+
+def note_vector_index_exists(
+    conn: kuzu.Connection, index_name: str = NOTE_VECTOR_INDEX
+) -> bool:
+    """Return True if an HNSW index named *index_name* exists on the Note table."""
+    result = conn.execute("CALL SHOW_INDEXES() RETURN *")
+    while result.has_next():
+        table_name, existing_name, *_ = result.get_next()
+        if table_name == "Note" and existing_name == index_name:
+            return True
+    return False
+
+
+def drop_note_vector_index(
+    conn: kuzu.Connection, index_name: str = NOTE_VECTOR_INDEX
+) -> None:
+    """Drop the Note HNSW index if present (no error when it does not exist).
+
+    Note: Kuzu 0.11.x does not reliably allow recreating an index of the *same
+    name* in the same database after a drop, so this is not used for in-place
+    recreation — dimension/metric changes go through a full rebuild into a fresh
+    database instead.
+    """
+    if note_vector_index_exists(conn, index_name):
+        conn.execute(f"CALL DROP_VECTOR_INDEX('Note', '{index_name}')")
+
+
+def create_note_vector_index(
+    conn: kuzu.Connection,
+    metric: str = "cosine",
+    index_name: str = NOTE_VECTOR_INDEX,
+) -> None:
+    """Create the HNSW index over ``Note.embedding`` if it does not already exist.
+
+    A no-op when the index is already present, so it is safe to call at the end
+    of every rebuild. The embedding column must exist first (see
+    :func:`ensure_embedding_schema`). Because the rebuild pipeline builds into a
+    fresh database, the index is always created exactly once per database; the
+    embedding dimension or metric is changed by rebuilding (not recreating in
+    place), which Kuzu 0.11.x does not reliably support for same-named indexes.
+    """
+    if metric not in _VALID_METRICS:
+        raise ValueError(
+            f"Unsupported embedding metric {metric!r}; expected one of "
+            f"{sorted(_VALID_METRICS)}"
+        )
+    if note_vector_index_exists(conn, index_name):
+        return
+    conn.execute(
+        "CALL CREATE_VECTOR_INDEX("
+        f"'Note', '{index_name}', 'embedding', metric := '{metric}'"
+        ")"
+    )
