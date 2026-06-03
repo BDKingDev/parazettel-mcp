@@ -30,6 +30,8 @@ from parazettel_mcp.config import config
 from parazettel_mcp.models.graph_db import (
     GraphDatabaseReadOnlyError,
     close_graph_db,
+    create_note_vector_index,
+    ensure_embedding_schema,
     force_close_graph_db,
     graph_db_companions,
     init_graph_db,
@@ -44,6 +46,7 @@ from parazettel_mcp.models.schema import (
     NoteType,
     Tag,
 )
+from parazettel_mcp.services.embedding_provider import build_embedding_provider
 from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
@@ -262,6 +265,10 @@ class NoteRepository(Repository[Note]):
         # Names of markdown files that failed to parse on the most recent rebuild.
         # Surfaced to callers so a shrinking corpus is visible instead of silent.
         self.last_rebuild_skipped: List[str] = []
+        # Optional semantic-embedding backend; None when embeddings are disabled
+        # (the default), in which case all embedding code paths are skipped and
+        # behaviour is unchanged. Built from config once; the model loads lazily.
+        self._embedding_provider = build_embedding_provider(config)
         self._open_graph_db(allow_rebuild_if_needed=True)
 
     def close(self) -> None:
@@ -287,6 +294,9 @@ class NoteRepository(Repository[Note]):
             self.db = init_graph_db(self.graph_db_path, read_only=True)
             self.read_only = True
         self._closed = False
+
+        if self._embedding_provider is not None and not self.read_only:
+            self._ensure_embedding_schema()
 
         if allow_rebuild_if_needed and not self.read_only:
             self.rebuild_index_if_needed()
@@ -636,6 +646,8 @@ class NoteRepository(Repository[Note]):
         try:
             conn = kuzu.Connection(db)
             try:
+                if self._embedding_provider is not None:
+                    ensure_embedding_schema(conn, config.embedding_dim)
                 self._ensure_tag_nodes(
                     conn, (tag.name for note in notes for tag in note.tags)
                 )
@@ -651,6 +663,9 @@ class NoteRepository(Repository[Note]):
                         conn,
                         clear_existing=False,
                     )
+                # Pass 3: embed all notes and build the HNSW index (no-op when
+                # embeddings are disabled).
+                self._build_embeddings(conn, notes)
             finally:
                 conn.close()
         finally:
@@ -1146,6 +1161,91 @@ class NoteRepository(Repository[Note]):
             "updated_at": note.updated_at,
         }
 
+    # --- Semantic embeddings (only active when a provider is configured) ------
+
+    def _embedding_text(self, note: Note) -> str:
+        """Return the text embedded for a note: its title plus body."""
+        return f"{note.title or ''}\n\n{note.content or ''}".strip()
+
+    def _ensure_embedding_schema(self) -> None:
+        """Idempotently add the embedding columns to the live graph DB."""
+        try:
+            with self._connection() as conn:
+                ensure_embedding_schema(conn, config.embedding_dim)
+        except Exception as exc:  # never block opening the DB on this
+            logger.warning("Could not ensure embedding schema: %s", exc)
+
+    def _store_embeddings(
+        self,
+        conn: kuzu.Connection,
+        notes: List[Note],
+        vectors: List[List[float]],
+    ) -> None:
+        """Write precomputed vectors onto their Note nodes (column must exist)."""
+        model_id = self._embedding_provider.model_id  # type: ignore[union-attr]
+        now = datetime.datetime.now()
+        for note, vector in zip(notes, vectors):
+            conn.execute(
+                "MATCH (n:Note {id: $id}) "
+                "SET n.embedding = $embedding, n.embedded_at = $embedded_at, "
+                "n.embedding_model = $model",
+                {
+                    "id": note.id,
+                    "embedding": vector,
+                    "embedded_at": now,
+                    "model": model_id,
+                },
+            )
+
+    def _build_embeddings(self, conn: kuzu.Connection, notes: List[Note]) -> None:
+        """Embed every note and build the HNSW index, inside a fresh rebuild DB.
+
+        Best-effort: if embedding fails (e.g. the model dependency is missing),
+        the rebuild still completes without vectors rather than failing — search
+        falls back to BM25. Runs during the exclusive rebuild, so the embedding
+        cost is paid once per rebuild rather than on the hot write path.
+        """
+        provider = self._embedding_provider
+        if provider is None or not notes:
+            return
+        try:
+            vectors = provider.embed_documents([self._embedding_text(n) for n in notes])
+            self._store_embeddings(conn, notes, vectors)
+            create_note_vector_index(conn, config.embedding_metric)
+        except Exception as exc:
+            logger.warning(
+                "Embedding build failed; rebuilt index without vectors "
+                "(search will use BM25): %s",
+                exc,
+            )
+
+    def _set_note_embedding(self, conn: kuzu.Connection, note: Note) -> None:
+        """Embed a single note on create/update and store it (best-effort).
+
+        Keeps the note findable via the brute-force fallback until the next
+        rebuild folds it into the HNSW index. (The embedding is computed here,
+        under the global write lock; moving the compute outside the lock is a
+        planned optimization once search lands.)
+        """
+        provider = self._embedding_provider
+        if provider is None:
+            return
+        try:
+            vector = provider.embed_documents([self._embedding_text(note)])[0]
+            conn.execute(
+                "MATCH (n:Note {id: $id}) "
+                "SET n.embedding = $embedding, n.embedded_at = $embedded_at, "
+                "n.embedding_model = $model",
+                {
+                    "id": note.id,
+                    "embedding": vector,
+                    "embedded_at": datetime.datetime.now(),
+                    "model": provider.model_id,
+                },
+            )
+        except Exception as exc:
+            logger.warning("Could not embed note %s: %s", note.id, exc)
+
     def _index_note(
         self, note: Note, rendered_content: Optional[str] = None
     ) -> None:
@@ -1218,6 +1318,8 @@ class NoteRepository(Repository[Note]):
 
             self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
             self._index_note_relations(note, conn, clear_existing=node_exists)
+            if self._embedding_provider is not None:
+                self._set_note_embedding(conn, note)
 
     def _fetch_notes_by_ids(
         self, conn: kuzu.Connection, ids: List[str]
