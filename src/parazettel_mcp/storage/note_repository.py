@@ -1252,6 +1252,16 @@ class NoteRepository(Repository[Note]):
                 vectors = provider.embed_documents(
                     [self._embedding_text(note) for note in chunk]
                 )
+                if len(vectors) != len(chunk):
+                    # Abort the whole build on a count mismatch rather than storing
+                    # only some chunks and then indexing: that would build the HNSW
+                    # index over a partially-populated column. Raising here is caught
+                    # below, so index creation is skipped and search falls back to
+                    # BM25 (no index over incomplete embeddings).
+                    raise RuntimeError(
+                        f"Embedding provider returned {len(vectors)} vectors for "
+                        f"{len(chunk)} notes; aborting embedding build."
+                    )
                 self._store_embeddings(conn, chunk, vectors)
                 logger.info(
                     "  embedded %d/%d notes", min(start + len(chunk), total), total
