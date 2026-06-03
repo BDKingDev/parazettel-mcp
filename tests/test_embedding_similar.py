@@ -47,6 +47,20 @@ def test_find_similar_surfaces_semantic_twin(test_config, monkeypatch):
         repo.close()
 
 
+def test_semantic_similarity_is_metric_aware(monkeypatch):
+    """Distance->similarity recovers cosine for each metric and clamps to [0, 1]."""
+    sim = ZettelService._semantic_similarity
+    monkeypatch.setattr(config, "embedding_metric", "cosine")
+    assert sim(0.0) == 1.0
+    assert sim(2.0) == 0.0  # opposite vectors clamp at 0
+    monkeypatch.setattr(config, "embedding_metric", "l2")
+    assert sim(0.0) == 1.0
+    assert 0.0 <= sim(2.0) <= 1.0
+    monkeypatch.setattr(config, "embedding_metric", "dotproduct")
+    assert sim(-1.0) == 1.0  # dot=1 -> identical
+    assert sim(1.0) == 0.0   # dot=-1 -> clamped
+
+
 def test_find_similar_semantic_mode_keeps_structural_matches(test_config, monkeypatch):
     """With embeddings on, a shared-tag (structural) match still surfaces."""
     _enable_hash_embeddings(monkeypatch)

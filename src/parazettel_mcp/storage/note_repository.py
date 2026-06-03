@@ -1363,22 +1363,28 @@ class NoteRepository(Repository[Note]):
         return sorted(distances.items(), key=lambda kv: kv[1])[:limit]
 
     def get_note_embedding(self, note_id: str) -> Optional[List[float]]:
-        """Return a note's stored document embedding, freshest copy first.
+        """Return a note's stored *current-model* document embedding, freshest first.
 
-        Prefers the dirty ``PendingEmbedding`` over the indexed ``Note.embedding``;
-        returns ``None`` when embeddings are disabled or none is stored yet.
+        Prefers the dirty ``PendingEmbedding`` over the indexed ``Note.embedding``,
+        and only returns a vector produced by the active model — a stale vector
+        from a previous model would be incompatible with ``_search_by_vector``
+        (which searches current-model vectors). Returns ``None`` when embeddings
+        are disabled or no current-model vector is stored yet.
         """
         if self._embedding_provider is None:
             return None
+        model_id = self._embedding_provider.model_id
         try:
             with self._connection() as conn:
                 for query in (
                     "MATCH (p:PendingEmbedding {id: $id}) "
-                    "WHERE p.embedding IS NOT NULL RETURN p.embedding",
+                    "WHERE p.embedding IS NOT NULL AND p.embedding_model = $model "
+                    "RETURN p.embedding",
                     "MATCH (n:Note {id: $id}) "
-                    "WHERE n.embedding IS NOT NULL RETURN n.embedding",
+                    "WHERE n.embedding IS NOT NULL AND n.embedding_model = $model "
+                    "RETURN n.embedding",
                 ):
-                    result = conn.execute(query, {"id": note_id})
+                    result = conn.execute(query, {"id": note_id, "model": model_id})
                     if result.has_next():
                         vector = result.get_next()[0]
                         if vector is not None:
@@ -1386,6 +1392,36 @@ class NoteRepository(Repository[Note]):
         except Exception as exc:
             logger.warning("Could not read embedding for %s: %s", note_id, exc)
         return None
+
+    def incoming_knowledge_link_ids(
+        self,
+        note_id: str,
+        routing_link_values: Iterable[str],
+        *,
+        exclude_reference: bool = False,
+    ) -> Set[str]:
+        """Source ids of incoming *knowledge* links to *note_id*.
+
+        Excludes PARA/GTD routing link types (``routing_link_values``) and — for
+        an area note (``exclude_reference``) — incoming ``reference`` links, since
+        every member note references its area. Without this, a parent area/project
+        (which every child links to) would count all its children as structurally
+        similar, the scaffolding-dominates-the-graph problem.
+        """
+        where = ["NOT r.link_type IN $routing"]
+        params: Dict[str, Any] = {
+            "id": note_id,
+            "routing": list(routing_link_values),
+        }
+        if exclude_reference:
+            where.append("r.link_type <> $reference")
+            params["reference"] = LinkType.REFERENCE.value
+        query = (
+            "MATCH (s:Note)-[r:LINKS_TO]->(n:Note {id: $id}) "
+            "WHERE " + " AND ".join(where) + " RETURN DISTINCT s.id AS id"
+        )
+        with self._connection() as conn:
+            return set(_result_first_column(conn.execute(query, params)))
 
     def _indexed_embedding_model(self, conn: kuzu.Connection) -> Optional[str]:
         """Return the model id of the embeddings folded into the HNSW index."""

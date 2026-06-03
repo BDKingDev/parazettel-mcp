@@ -657,7 +657,11 @@ class ZettelService:
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
-        if getattr(self.repository, "_embedding_provider", None) is not None:
+        # Gate on the public config flag (not a repository internal). Guard on the
+        # vector API so an alternate/mock repository without it cleanly falls back.
+        if config.embedding_enabled and hasattr(
+            self.repository, "vector_search_by_vector"
+        ):
             return self._find_similar_semantic(note, threshold)
         return self._find_similar_lexical(note, threshold)
 
@@ -672,10 +676,35 @@ class ZettelService:
         """
         note_tags = {tag.name for tag in note.tags}
         note_links = self._knowledge_link_targets(note)
-        incoming_notes = self.repository.find_linked_notes(note.id, "incoming")
+        # Incoming *knowledge* links only — routing edges (part_of/has_part/...,
+        # and member->area references for an area) are excluded so scaffolding
+        # parents don't make every child look structurally similar.
+        note_incoming = self.repository.incoming_knowledge_link_ids(
+            note.id,
+            [link_type.value for link_type in self._ROUTING_LINK_TYPES],
+            exclude_reference=(note.note_type == NoteType.AREA),
+        )
         routing_ids = {note.area_id, note.project_id} - {None}
-        note_incoming = {n.id for n in incoming_notes if n.id not in routing_ids}
+        note_incoming = note_incoming - routing_ids
         return note_tags, note_links, note_incoming
+
+    @staticmethod
+    def _semantic_similarity(distance: float) -> float:
+        """Convert a vector index *distance* to a cosine similarity in [0, 1].
+
+        Provider embeddings are L2-normalized, so cosine similarity is recoverable
+        from any configured metric: cosine distance is ``1 - cos``; an L2 distance
+        ``d`` gives ``cos = 1 - d^2/2``; a dot-product distance is ``-cos``. Result
+        is clamped to [0, 1] so blending and thresholding stay well-defined.
+        """
+        metric = (config.embedding_metric or "cosine").strip().lower()
+        if metric == "l2":
+            similarity = 1.0 - (distance * distance) / 2.0
+        elif metric == "dotproduct":
+            similarity = -distance
+        else:  # cosine
+            similarity = 1.0 - distance
+        return max(0.0, min(1.0, similarity))
 
     def _structural_similarity(
         self,
@@ -751,10 +780,9 @@ class ZettelService:
             ):
                 if other_id == note.id:
                     continue
-                # Cosine distance -> similarity in [0, 1].
-                semantic_sim[other_id] = max(0.0, 1.0 - float(distance))
+                semantic_sim[other_id] = self._semantic_similarity(float(distance))
 
-        candidates = self._structural_candidate_notes(note)
+        candidates = self._structural_candidate_notes(note, note_links, note_incoming)
         for other_id in semantic_sim:
             if other_id not in candidates:
                 other = self.repository.get(other_id)
@@ -773,15 +801,25 @@ class ZettelService:
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
-    def _structural_candidate_notes(self, note: Note) -> Dict[str, Note]:
-        """Notes sharing a tag or knowledge link with *note* (struct. neighbourhood)."""
+    def _structural_candidate_notes(
+        self, note: Note, note_links: Set[str], note_incoming: Set[str]
+    ) -> Dict[str, Note]:
+        """Notes sharing a tag or *knowledge* link with *note* (struct. neighbourhood).
+
+        Uses the already routing-filtered knowledge-link sets (``note_links`` /
+        ``note_incoming``) rather than raw ``find_linked_notes`` edges, so an
+        area/project parent does not pull every child into the candidate set.
+        """
         candidates: Dict[str, Note] = {}
         for tag in note.tags:
             for other in self.repository.search(tag=tag.name):
                 candidates[other.id] = other
-        for direction in ("incoming", "outgoing"):
-            for other in self.repository.find_linked_notes(note.id, direction):
-                candidates[other.id] = other
+        for other_id in note_links | note_incoming:
+            if other_id == note.id or other_id in candidates:
+                continue
+            other = self.repository.get(other_id)
+            if other is not None:
+                candidates[other_id] = other
         candidates.pop(note.id, None)
         return candidates
 
