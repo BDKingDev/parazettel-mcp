@@ -1,21 +1,25 @@
-"""Tests for configuration parsing (env -> ZettelkastenConfig fields)."""
+"""Tests for the resource-tuning defaults (code constants, not env-configurable)."""
 
-from parazettel_mcp.config import ZettelkastenConfig
-
-
-def test_kuzu_buffer_pool_defaults_to_zero(monkeypatch):
-    """Unset PARAZETTEL_KUZU_BUFFER_POOL_MB -> 0 (use Kuzu's own default)."""
-    monkeypatch.delenv("PARAZETTEL_KUZU_BUFFER_POOL_MB", raising=False)
-    assert ZettelkastenConfig().kuzu_buffer_pool_bytes == 0
+from parazettel_mcp.config import (
+    DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_KUZU_BUFFER_POOL_BYTES,
+    ZettelkastenConfig,
+)
 
 
-def test_kuzu_buffer_pool_mb_converts_to_bytes(monkeypatch):
-    """A megabyte value is converted to bytes."""
-    monkeypatch.setenv("PARAZETTEL_KUZU_BUFFER_POOL_MB", "256")
-    assert ZettelkastenConfig().kuzu_buffer_pool_bytes == 256 * 1024 * 1024
+def test_kuzu_buffer_pool_field_uses_constant():
+    """The buffer-pool field defaults to the code constant (0 = Kuzu default)."""
+    assert ZettelkastenConfig().kuzu_buffer_pool_bytes == DEFAULT_KUZU_BUFFER_POOL_BYTES
 
 
-def test_kuzu_buffer_pool_negative_clamped_to_zero(monkeypatch):
-    """A negative value is clamped to 0 rather than producing a negative size."""
-    monkeypatch.setenv("PARAZETTEL_KUZU_BUFFER_POOL_MB", "-5")
-    assert ZettelkastenConfig().kuzu_buffer_pool_bytes == 0
+def test_daemon_idle_timeout_field_uses_constant():
+    """The idle-timeout field defaults to the code constant."""
+    assert (
+        ZettelkastenConfig().daemon_idle_timeout_seconds
+        == DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
+    )
+
+
+def test_daemon_idle_timeout_constant_is_one_hour():
+    """Guard the chosen idle-timeout so an accidental edit is caught."""
+    assert DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS == 3600.0

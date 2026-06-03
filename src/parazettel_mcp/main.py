@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from parazettel_mcp.config import config
+from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
 from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
@@ -102,7 +102,7 @@ def parse_args():
         "--daemon-idle-timeout",
         help="Idle seconds before the local daemon shuts itself down (0 disables)",
         type=float,
-        default=float(os.environ.get("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "0")),
+        default=DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS,
     )
     return parser.parse_args()
 

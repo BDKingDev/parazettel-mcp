@@ -18,6 +18,19 @@ if _REPO_ENV_PATH.exists():
     load_dotenv(_REPO_ENV_PATH, override=False)
 
 
+# --- Resource-tuning defaults (code constants, not environment-configurable) ---
+# Max Kuzu buffer-pool size in bytes. 0 = Kuzu's own default (~80% of physical
+# RAM *per database instance*) — fine for one long-lived daemon. The test suite
+# bounds this to a small value via the conftest fixture so per-test databases
+# stay tiny and the suite can run in parallel.
+DEFAULT_KUZU_BUFFER_POOL_BYTES = 0
+# Seconds of inactivity after which the daemon shuts itself down (it is
+# auto-restarted on the next request). A non-zero default means a daemon left
+# behind when an MCP client exits without reaping it reaps itself instead of
+# holding the Kuzu DB and embedding model forever.
+DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 3600.0
+
+
 class ZettelkastenConfig(BaseModel):
     """Configuration for the Zettelkasten server."""
 
@@ -67,8 +80,10 @@ class ZettelkastenConfig(BaseModel):
     daemon_rpc_timeout_seconds: float = Field(
         default=float(os.getenv("PARAZETTEL_DAEMON_RPC_TIMEOUT_SECONDS", "300"))
     )
+    # Idle shutdown timeout (see DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS). Overridable
+    # per-launch via the --daemon-idle-timeout CLI flag; 0 keeps it always-on.
     daemon_idle_timeout_seconds: float = Field(
-        default=float(os.getenv("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "0"))
+        default=DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
     )
     daemon_runtime_dir: Path = Field(
         default_factory=lambda: Path(
@@ -127,18 +142,8 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
-    # Max Kuzu buffer-pool size in bytes. 0 means use Kuzu's default, which is
-    # ~80% of physical RAM *per database instance* — fine for a single long-lived
-    # daemon, but it makes the test suite (one fresh DB per test) memory-heavy and
-    # impossible to parallelize. Set PARAZETTEL_KUZU_BUFFER_POOL_MB (megabytes) to
-    # bound it; a few-thousand-note vault needs only a small pool.
-    kuzu_buffer_pool_bytes: int = Field(
-        default_factory=lambda: max(
-            0, int(os.getenv("PARAZETTEL_KUZU_BUFFER_POOL_MB", "0"))
-        )
-        * 1024
-        * 1024
-    )
+    # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
+    kuzu_buffer_pool_bytes: int = Field(default=DEFAULT_KUZU_BUFFER_POOL_BYTES)
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""
