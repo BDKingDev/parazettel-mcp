@@ -127,6 +127,12 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
+    # Batch size for bulk embedding (e.g. during a rebuild). Kept small so the
+    # transformer attention tensor (batch x heads x seq^2) stays bounded — large
+    # models OOM at the embedding library's default (256 -> ~4GB for mxbai@512).
+    embedding_batch_size: int = Field(
+        default_factory=lambda: int(os.getenv("PARAZETTEL_EMBEDDING_BATCH_SIZE", "16"))
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""

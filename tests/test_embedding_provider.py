@@ -110,3 +110,24 @@ def test_fastembed_provider_reports_missing_dependency(monkeypatch):
     provider = FastEmbedProvider("BAAI/bge-small-en-v1.5", 384)
     with pytest.raises(RuntimeError, match=r"parazettel-mcp\[embeddings-lite\]"):
         provider.embed_documents(["text"])
+
+
+def test_batch_size_clamped_and_passed_through_factory():
+    """batch_size is clamped to >=1 and the factory forwards config's value."""
+    assert FastEmbedProvider("m", 8, batch_size=0)._batch_size == 1
+    cfg = ZettelkastenConfig(
+        embedding_enabled=True, embedding_provider="fastembed", embedding_batch_size=8
+    )
+    assert build_embedding_provider(cfg)._batch_size == 8
+
+
+def test_fastembed_passes_batch_size_to_model():
+    """embed_documents forwards the configured batch_size to the embedding lib."""
+    from unittest.mock import MagicMock
+
+    provider = FastEmbedProvider("m", 4, batch_size=7)
+    model = MagicMock()
+    model.passage_embed.return_value = [[1.0, 0.0, 0.0, 0.0]]
+    provider._model = model  # skip the lazy download
+    provider.embed_documents(["hello"])
+    assert model.passage_embed.call_args.kwargs.get("batch_size") == 7
