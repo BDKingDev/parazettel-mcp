@@ -79,6 +79,14 @@ _GRAPH_BATCH_SIZE = 100
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
 
+# Brute-force distance expressions (lower = closer) matching each HNSW metric, so
+# the fallback's ordering is consistent with the index instead of always cosine.
+_BRUTE_FORCE_DISTANCE = {
+    "cosine": "1.0 - array_cosine_similarity(p.embedding, $q)",
+    "l2": "array_distance(p.embedding, $q)",
+    "dotproduct": "-array_dot_product(p.embedding, $q)",
+}
+
 _NOTE_SELECT = (
     "n.id AS id, n.title AS title, n.content AS content, n.note_type AS note_type, "
     "n.status AS status, n.source AS source, n.due_date AS due_date, "
@@ -1188,6 +1196,17 @@ class NoteRepository(Repository[Note]):
         Runs during the fresh rebuild *before* the HNSW index is created, so the
         column is still writable; these vectors are then folded into the index.
         """
+        if len(vectors) != len(notes):
+            # A provider returning the wrong count would silently leave some
+            # notes unembedded (or drop vectors); skip rather than build the
+            # index over a partially-populated column.
+            logger.warning(
+                "Embedding provider returned %d vectors for %d notes; "
+                "skipping embedding storage for this rebuild.",
+                len(vectors),
+                len(notes),
+            )
+            return
         model_id = self._embedding_provider.model_id  # type: ignore[union-attr]
         now = datetime.datetime.now()
         for note, vector in zip(notes, vectors):
@@ -1275,10 +1294,20 @@ class NoteRepository(Repository[Note]):
             logger.warning("Query embedding failed; skipping vector search: %s", exc)
             return []
 
+        model_id = provider.model_id
+        metric = (config.embedding_metric or "cosine").strip().lower()
+        dist_expr = _BRUTE_FORCE_DISTANCE.get(metric, _BRUTE_FORCE_DISTANCE["cosine"])
         distance_by_id: Dict[str, float] = {}
         try:
             with self._connection() as conn:
-                if note_vector_index_exists(conn):
+                # HNSW over the indexed vectors — but only if the index was built
+                # with the *current* model; otherwise its vectors are stale and
+                # ranking a new-model query against them is meaningless, so skip
+                # it (the dirty set below, which is current-model, still answers).
+                if (
+                    note_vector_index_exists(conn)
+                    and self._indexed_embedding_model(conn) == model_id
+                ):
                     try:
                         hnsw = conn.execute(
                             "CALL QUERY_VECTOR_INDEX("
@@ -1291,19 +1320,21 @@ class NoteRepository(Repository[Note]):
                             distance_by_id[row[0]] = float(row[1])
                     except Exception as exc:
                         logger.warning("HNSW vector query failed: %s", exc)
-                # Brute-force the dirty set (PendingEmbedding); fresh vectors
-                # override any stale HNSW entry for the same id.
+                # Brute-force the dirty set (PendingEmbedding). The join to Note
+                # drops rows for deleted notes; filters keep only non-null,
+                # current-model vectors; the distance matches the index metric.
+                # Fresh dirty vectors override any stale HNSW entry for the id.
                 try:
                     brute = conn.execute(
-                        "MATCH (p:PendingEmbedding) "
-                        "RETURN p.id AS id, "
-                        "array_cosine_similarity(p.embedding, $q) AS sim "
-                        "ORDER BY sim DESC LIMIT $k",
-                        {"q": query_vector, "k": limit},
+                        "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
+                        "WHERE p.embedding IS NOT NULL AND p.embedding_model = $model "
+                        f"RETURN p.id AS id, {dist_expr} AS dist "
+                        "ORDER BY dist LIMIT $k",
+                        {"q": query_vector, "model": model_id, "k": limit},
                     )
                     while brute.has_next():
                         row = brute.get_next()
-                        distance_by_id[row[0]] = 1.0 - float(row[1])
+                        distance_by_id[row[0]] = float(row[1])
                 except Exception as exc:
                     logger.warning("Brute-force vector fallback failed: %s", exc)
         except Exception as exc:
@@ -1312,6 +1343,19 @@ class NoteRepository(Repository[Note]):
 
         ordered = sorted(distance_by_id.items(), key=lambda kv: kv[1])
         return [note_id for note_id, _distance in ordered[:limit]]
+
+    def _indexed_embedding_model(self, conn: kuzu.Connection) -> Optional[str]:
+        """Return the model id of the embeddings folded into the HNSW index."""
+        try:
+            result = conn.execute(
+                "MATCH (n:Note) WHERE n.embedding_model IS NOT NULL "
+                "RETURN n.embedding_model LIMIT 1"
+            )
+            if result.has_next():
+                return result.get_next()[0]
+        except Exception:  # pragma: no cover - best-effort
+            return None
+        return None
 
     def _index_note(
         self, note: Note, rendered_content: Optional[str] = None

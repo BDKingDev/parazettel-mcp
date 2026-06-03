@@ -14,6 +14,7 @@ from parazettel_mcp.storage.note_repository import NoteRepository
 
 
 def _rows(result):
+    """Drain a Kuzu QueryResult into a list of rows."""
     out = []
     while result.has_next():
         out.append(result.get_next())
@@ -21,6 +22,7 @@ def _rows(result):
 
 
 def _enable_hash_embeddings(monkeypatch, dim=16):
+    """Enable the deterministic hash embedding provider for the test process."""
     monkeypatch.setattr(config, "embedding_enabled", True)
     monkeypatch.setattr(config, "embedding_provider", "hash")
     monkeypatch.setattr(config, "embedding_dim", dim)
@@ -28,6 +30,7 @@ def _enable_hash_embeddings(monkeypatch, dim=16):
 
 
 def test_create_stores_embedding(test_config, monkeypatch):
+    """create() writes the vector to PendingEmbedding and it is searchable."""
     _enable_hash_embeddings(monkeypatch)
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     try:
@@ -60,6 +63,7 @@ def test_create_stores_embedding(test_config, monkeypatch):
 
 
 def test_rebuild_builds_index_and_vector_query_works(test_config, monkeypatch):
+    """rebuild backfills Note.embedding, builds the HNSW index, and it queries."""
     _enable_hash_embeddings(monkeypatch)
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     try:
@@ -105,6 +109,7 @@ def test_rebuild_builds_index_and_vector_query_works(test_config, monkeypatch):
 
 
 def test_disabled_by_default_adds_no_embedding_column(test_config):
+    """With embeddings off, no embedding column/index is added (schema untouched)."""
     # No embedding flags set -> embeddings disabled -> schema untouched.
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     try:

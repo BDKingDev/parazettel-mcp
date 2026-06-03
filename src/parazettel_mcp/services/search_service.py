@@ -204,8 +204,13 @@ class SearchService:
         vector_search = getattr(repository, "vector_search_ids", None)
         if not callable(vector_search):
             return bm25_results
+
+        # With structural filters, fetch a wider candidate pool so the post-filter
+        # intersection isn't starved when the raw top hits are mostly out-of-scope.
+        structural = {k: v for k, v in search_kwargs.items() if k != "text"}
+        vec_limit = _VECTOR_TOPK * 4 if structural else _VECTOR_TOPK
         try:
-            vector_ids = vector_search(query, limit=_VECTOR_TOPK)
+            vector_ids = vector_search(query, limit=vec_limit)
         except Exception:  # pragma: no cover - vector path is best-effort
             return bm25_results
         # Tolerate repositories/mocks without a real list result (e.g. tests with
@@ -214,14 +219,15 @@ class SearchService:
             return bm25_results
 
         # Apply the same structural filters to vector hits by intersecting with a
-        # filter-only id set (reuses the repository filter logic; no duplication).
-        structural = {k: v for k, v in search_kwargs.items() if k != "text"}
+        # filter-only id set (reuses the repository filter logic; no duplication),
+        # then cap back to the fusion budget.
         if structural:
             try:
                 allowed = {note.id for note in repository.search(**structural)}
                 vector_ids = [nid for nid in vector_ids if nid in allowed]
             except Exception:  # pragma: no cover
                 vector_ids = []
+        vector_ids = vector_ids[:_VECTOR_TOPK]
         if not vector_ids:
             return bm25_results
 

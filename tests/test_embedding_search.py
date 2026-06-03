@@ -16,6 +16,7 @@ from parazettel_mcp.storage.note_repository import NoteRepository
 
 
 def _enable_hash_embeddings(monkeypatch, dim=16):
+    """Enable the deterministic hash embedding provider for the test process."""
     monkeypatch.setattr(config, "embedding_enabled", True)
     monkeypatch.setattr(config, "embedding_provider", "hash")
     monkeypatch.setattr(config, "embedding_dim", dim)
@@ -23,6 +24,7 @@ def _enable_hash_embeddings(monkeypatch, dim=16):
 
 
 def _note(nid, title, content):
+    """Build a permanent Note with a fixed id for fusion tests."""
     return Note(id=nid, title=title, content=content, note_type=NoteType.PERMANENT)
 
 
@@ -45,11 +47,29 @@ def test_vector_search_fallback_finds_unindexed_note(test_config, monkeypatch):
 
 
 def test_vector_search_empty_when_disabled(test_config):
+    """vector_search_ids returns [] when embeddings are disabled."""
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     try:
         repo.create(Note(title="A", content="a", note_type=NoteType.PERMANENT))
         assert repo._embedding_provider is None
         assert repo.vector_search_ids("anything") == []
+    finally:
+        repo.close()
+
+
+def test_vector_search_excludes_deleted_note(test_config, monkeypatch):
+    """A deleted note's lingering pending embedding is not returned (Note join)."""
+    _enable_hash_embeddings(monkeypatch)
+    repo = NoteRepository(notes_dir=test_config.notes_dir)
+    try:
+        note = repo.create(
+            Note(title="Ephemeral", content="temporary body",
+                 note_type=NoteType.PERMANENT)
+        )
+        text = repo._embedding_text(note)
+        assert note.id in repo.vector_search_ids(text)  # findable before delete
+        repo.delete(note.id)
+        assert note.id not in repo.vector_search_ids(text)  # gone after delete
     finally:
         repo.close()
 
@@ -83,6 +103,7 @@ def test_fuse_hybrid_adds_vector_only_hits_and_preserves_bm25_score():
 
 
 def test_fuse_hybrid_returns_bm25_unchanged_when_no_vector_hits():
+    """With no vector hits, fusion returns the BM25 results unchanged."""
     zettel = MagicMock()
     zettel.repository.vector_search_ids.return_value = []
     service = SearchService(zettel_service=zettel)
@@ -94,6 +115,7 @@ def test_fuse_hybrid_returns_bm25_unchanged_when_no_vector_hits():
 
 
 def test_search_combined_degrades_to_bm25_when_disabled(test_config):
+    """search_combined returns plain BM25 results when embeddings are disabled."""
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     service = SearchService(zettel_service=ZettelService(repository=repo))
     try:
@@ -109,6 +131,7 @@ def test_search_combined_degrades_to_bm25_when_disabled(test_config):
 
 
 def test_search_combined_hybrid_preserves_bm25_match(test_config, monkeypatch):
+    """With embeddings on, hybrid search still surfaces the BM25 lexical match."""
     _enable_hash_embeddings(monkeypatch)
     repo = NoteRepository(notes_dir=test_config.notes_dir)
     service = SearchService(zettel_service=ZettelService(repository=repo))
