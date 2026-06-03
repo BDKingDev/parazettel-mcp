@@ -657,70 +657,133 @@ class ZettelService:
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
+        if getattr(self.repository, "_embedding_provider", None) is not None:
+            return self._find_similar_semantic(note, threshold)
+        return self._find_similar_lexical(note, threshold)
 
-        all_notes = self.repository.get_all()
-        results = []
+    def _similarity_context(
+        self, note: Note
+    ) -> Tuple[Set[str], Set[str], Set[str]]:
+        """Return (tag names, knowledge-link targets, incoming-link ids) for *note*.
 
+        PARA/GTD routing links are excluded from both the link targets and the
+        incoming set: a parent area/project links to every child via has_part, so
+        counting those gives unrelated siblings a spurious structural floor.
+        """
         note_tags = {tag.name for tag in note.tags}
-        # Only genuine knowledge links count toward structural similarity. PARA
-        # routing links (a note's reference to its area, and part_of/has_part to
-        # its project/area) are shared by EVERY note in the same area/project, so
-        # counting them gives unrelated notes a spurious structural floor — the
-        # same scaffolding-dominates-the-graph problem seen in find_central_notes.
         note_links = self._knowledge_link_targets(note)
-        note_tokens = self._content_tokens(note)
-
-        incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
-        # Exclude the note's own project/area from incoming overlap for the same
-        # reason (a parent project/area links to all of its children via has_part).
+        incoming_notes = self.repository.find_linked_notes(note.id, "incoming")
         routing_ids = {note.area_id, note.project_id} - {None}
         note_incoming = {n.id for n in incoming_notes if n.id not in routing_ids}
+        return note_tags, note_links, note_incoming
 
-        # Lexical contribution is capped below a full structural match so a pure
-        # word-overlap neighbour cannot outrank a real tag/link relationship.
-        lexical_weight = 0.6
+    def _structural_similarity(
+        self,
+        other: Note,
+        note_tags: Set[str],
+        note_links: Set[str],
+        note_incoming: Set[str],
+    ) -> float:
+        """Structural overlap (tags + knowledge links) of *other* with the ref note."""
+        other_tags = {tag.name for tag in other.tags}
+        tag_overlap = len(note_tags & other_tags)
+        other_links = self._knowledge_link_targets(other)
+        link_overlap = len(note_links & other_links)
+        incoming_overlap = 1 if other.id in note_incoming else 0
+        outgoing_overlap = 1 if other.id in note_links else 0
+        total_possible = (
+            max(len(note_tags), len(other_tags)) * 0.4
+            + max(len(note_links), len(other_links)) * 0.2
+            + 1 * 0.2  # possible incoming link
+            + 1 * 0.2  # possible outgoing link
+        )
+        if total_possible == 0:
+            return 0.0
+        return (
+            (tag_overlap * 0.4)
+            + (link_overlap * 0.2)
+            + (incoming_overlap * 0.2)
+            + (outgoing_overlap * 0.2)
+        ) / total_possible
 
-        for other_note in all_notes:
-            if other_note.id == note_id:
+    def _find_similar_lexical(
+        self, note: Note, threshold: float
+    ) -> List[Tuple[Note, float]]:
+        """Structural + length-aware lexical overlap over all notes (no embeddings).
+
+        Lexical is capped below a full structural match (``_LEXICAL_WEIGHT``) so a
+        pure word-overlap neighbour cannot outrank a real tag/link relationship.
+        """
+        note_tags, note_links, note_incoming = self._similarity_context(note)
+        note_tokens = self._content_tokens(note)
+        results: List[Tuple[Note, float]] = []
+        for other in self.repository.get_all():
+            if other.id == note.id:
                 continue
-
-            other_tags = {tag.name for tag in other_note.tags}
-            tag_overlap = len(note_tags.intersection(other_tags))
-
-            other_links = self._knowledge_link_targets(other_note)
-            link_overlap = len(note_links.intersection(other_links))
-
-            incoming_overlap = 1 if other_note.id in note_incoming else 0
-            outgoing_overlap = 1 if other_note.id in note_links else 0
-
-            # Structural similarity (unchanged weighting).
-            total_possible = (
-                max(len(note_tags), len(other_tags)) * 0.4
-                + max(len(note_links), len(other_links)) * 0.2
-                + 1 * 0.2  # Possible incoming link
-                + 1 * 0.2  # Possible outgoing link
+            structural = self._structural_similarity(
+                other, note_tags, note_links, note_incoming
             )
-            if total_possible == 0:
-                structural = 0.0
-            else:
-                structural = (
-                    (tag_overlap * 0.4)
-                    + (link_overlap * 0.2)
-                    + (incoming_overlap * 0.2)
-                    + (outgoing_overlap * 0.2)
-                ) / total_possible
-
-            # Lexical similarity: length-aware overlap over title+content words.
-            other_tokens = self._content_tokens(other_note)
-            lexical = self._lexical_overlap(note_tokens, other_tokens)
-
-            similarity = max(structural, lexical_weight * lexical)
-
+            lexical = self._lexical_overlap(note_tokens, self._content_tokens(other))
+            similarity = max(structural, self._LEXICAL_WEIGHT * lexical)
             if similarity >= threshold:
-                results.append((other_note, similarity))
-
+                results.append((other, similarity))
         results.sort(key=lambda x: x[1], reverse=True)
         return results
+
+    def _find_similar_semantic(
+        self, note: Note, threshold: float
+    ) -> List[Tuple[Note, float]]:
+        """Structural + embedding-cosine similarity over a bounded candidate set.
+
+        Candidates are the union of the note's structural neighbourhood (notes
+        sharing a tag or knowledge link) and its HNSW semantic top-K, so the rest
+        of the vault is never scanned. The semantic signal uses the note's own
+        stored document vector; if it has none yet (embeddings just enabled, no
+        rebuild) the result simply degrades to the structural signal.
+        """
+        note_tags, note_links, note_incoming = self._similarity_context(note)
+
+        semantic_sim: Dict[str, float] = {}
+        query_vector = self.repository.get_note_embedding(note.id)
+        if query_vector:
+            for other_id, distance in self.repository.vector_search_by_vector(
+                query_vector, self._SEMANTIC_TOPK
+            ):
+                if other_id == note.id:
+                    continue
+                # Cosine distance -> similarity in [0, 1].
+                semantic_sim[other_id] = max(0.0, 1.0 - float(distance))
+
+        candidates = self._structural_candidate_notes(note)
+        for other_id in semantic_sim:
+            if other_id not in candidates:
+                other = self.repository.get(other_id)
+                if other is not None:
+                    candidates[other_id] = other
+
+        results: List[Tuple[Note, float]] = []
+        for other in candidates.values():
+            structural = self._structural_similarity(
+                other, note_tags, note_links, note_incoming
+            )
+            semantic = semantic_sim.get(other.id, 0.0)
+            similarity = max(structural, self._SEMANTIC_WEIGHT * semantic)
+            if similarity >= threshold:
+                results.append((other, similarity))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def _structural_candidate_notes(self, note: Note) -> Dict[str, Note]:
+        """Notes sharing a tag or knowledge link with *note* (struct. neighbourhood)."""
+        candidates: Dict[str, Note] = {}
+        for tag in note.tags:
+            for other in self.repository.search(tag=tag.name):
+                candidates[other.id] = other
+        for direction in ("incoming", "outgoing"):
+            for other in self.repository.find_linked_notes(note.id, direction):
+                candidates[other.id] = other
+        candidates.pop(note.id, None)
+        return candidates
 
     # Link types that express PARA/GTD routing rather than a knowledge
     # relationship. These connect a note to its area/project (shared by every
@@ -764,6 +827,15 @@ class ZettelService:
     # short notes sharing one or two common words should not register as similar;
     # real topical overlap shows several shared distinctive terms.
     _LEXICAL_MIN_SHARED = 3
+
+    # Content-signal weights for find_similar_notes: the content score is capped
+    # below a full structural (tag/link) match so a content-only neighbour cannot
+    # outrank a real relationship. Semantic (embeddings) is weighted a little
+    # higher than lexical since it captures meaning, not just shared words.
+    _LEXICAL_WEIGHT = 0.6
+    _SEMANTIC_WEIGHT = 0.75
+    # How many HNSW neighbours to pull as semantic candidates.
+    _SEMANTIC_TOPK = 50
 
     @classmethod
     def _lexical_overlap(cls, tokens_a: Set[str], tokens_b: Set[str]) -> float:
