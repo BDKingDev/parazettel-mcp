@@ -131,3 +131,62 @@ def test_fastembed_passes_batch_size_to_model():
     provider._model = model  # skip the lazy download
     provider.embed_documents(["hello"])
     assert model.passage_embed.call_args.kwargs.get("batch_size") == 7
+
+
+def test_factory_forwards_device():
+    """The factory forwards config.embedding_device to the provider."""
+    cfg = ZettelkastenConfig(
+        embedding_enabled=True,
+        embedding_provider="fastembed",
+        embedding_device="cuda",
+    )
+    assert build_embedding_provider(cfg)._device == "cuda"
+    # Default stays on CPU when unset.
+    cfg_cpu = ZettelkastenConfig(embedding_enabled=True, embedding_provider="fastembed")
+    assert build_embedding_provider(cfg_cpu)._device == "cpu"
+
+
+def _fake_fastembed(monkeypatch, captured):
+    """Install a fake `fastembed` whose TextEmbedding records its kwargs."""
+    import sys
+    import types
+
+    class FakeTextEmbedding:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def passage_embed(self, texts, **kwargs):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    module = types.ModuleType("fastembed")
+    module.TextEmbedding = FakeTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", module)
+
+
+def test_fastembed_cuda_selects_provider_and_preloads(monkeypatch):
+    """device='cuda' selects the CUDA execution provider and preloads DLLs."""
+    import sys
+    import types
+
+    captured: dict = {}
+    preloaded = {"called": False}
+    _fake_fastembed(monkeypatch, captured)
+
+    ort = types.ModuleType("onnxruntime")
+    ort.preload_dlls = lambda: preloaded.__setitem__("called", True)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+
+    FastEmbedProvider("m", 4, device="cuda").embed_documents(["hello"])
+    assert captured.get("providers") == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert preloaded["called"] is True
+
+
+def test_fastembed_cpu_default_omits_providers(monkeypatch):
+    """Default device='cpu' passes no providers (fastembed's CPU default)."""
+    captured: dict = {}
+    _fake_fastembed(monkeypatch, captured)
+    FastEmbedProvider("m", 4).embed_documents(["hello"])
+    assert "providers" not in captured
