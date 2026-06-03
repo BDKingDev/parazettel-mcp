@@ -93,6 +93,40 @@ class ZettelkastenConfig(BaseModel):
             "{links}\n"
         )
     )
+    # Embedding / semantic search configuration (disabled by default).
+    # When enabled, note bodies are embedded into a dense vector stored on the
+    # Note node and indexed with Kuzu's native HNSW vector index, enabling
+    # hybrid (BM25 + semantic) retrieval. See services/embedding_provider.py.
+    embedding_enabled: bool = Field(
+        default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_ENABLED", "false")
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on")
+    )
+    # Provider that turns text into vectors:
+    #   "fastembed" (lite, default) – ONNX, no PyTorch; [embeddings-lite] extra
+    #   "sentence-transformers"     – PyTorch; widest model support; [embeddings]
+    #   "hash"                      – deterministic, dependency-free; tests only
+    embedding_provider: str = Field(
+        default=os.getenv("PARAZETTEL_EMBEDDING_PROVIDER", "fastembed")
+    )
+    # Model identifier passed to the provider. Default is a small on-device model;
+    # for the full tier use e.g. "google/embeddinggemma-300m" (dim 768).
+    embedding_model: str = Field(
+        default=os.getenv("PARAZETTEL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+    )
+    # Output dimensionality. Must match the model (Matryoshka models may be
+    # truncated to a supported smaller dimension). bge-small=384, EmbeddingGemma=768.
+    embedding_dim: int = Field(
+        default=int(os.getenv("PARAZETTEL_EMBEDDING_DIM", "384"))
+    )
+    # Distance metric for the HNSW index: "cosine", "l2", or "dotproduct".
+    # Normalized (stripped/lowercased) so env values like "COSINE" are accepted.
+    embedding_metric: str = Field(
+        default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_METRIC", "cosine")
+        .strip()
+        .lower()
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""

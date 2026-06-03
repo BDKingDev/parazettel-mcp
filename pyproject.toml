@@ -19,7 +19,7 @@ classifiers = [
 dependencies = [
     "mcp[cli]>=1.2.0",
     "tomli; python_version < '3.11'",
-    "kuzu>=0.7.0",
+    "kuzu>=0.11.3,<0.12",
     "pydantic>=2.0.0",
     "python-frontmatter>=1.0.0",
     "markdown>=3.4.0",
@@ -36,6 +36,17 @@ dev = [
 ]
 migration = [
     "sqlalchemy>=2.0.0",
+]
+# Optional semantic embeddings (PARAZETTEL_EMBEDDING_ENABLED=true). Two tiers:
+# "lite" = fastembed (ONNX, no PyTorch — small, fast, recommended default);
+# full   = sentence-transformers (PyTorch — widest model support incl.
+# EmbeddingGemma, which needs a recent release). Neither is needed while
+# embeddings are disabled or the "hash" provider is used.
+embeddings-lite = [
+    "fastembed>=0.4.0",
+]
+embeddings = [
+    "sentence-transformers>=5.0.0",
 ]
 
 [tool.setuptools]
@@ -55,6 +66,12 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
+
+# Optional embedding backends are lazy-imported and only present with the
+# [embeddings] / [embeddings-lite] extras; don't fail type-checking on them.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers.*", "fastembed.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
