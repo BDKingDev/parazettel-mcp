@@ -239,8 +239,17 @@ def ensure_embedding_schema(conn: kuzu.Connection, dim: int) -> None:
     """Idempotently add the embedding columns to the Note node.
 
     ``ALTER ... ADD IF NOT EXISTS`` is a no-op when a column already exists, so
-    this is safe to call on every open. The embedding column is ``FLOAT[dim]``;
-    rows created before it existed simply hold NULL until (re)embedded.
+    this is safe to call on every open. ``Note.embedding`` (``FLOAT[dim]``) holds
+    the vectors folded into the HNSW index by a rebuild; rows without one hold
+    NULL.
+
+    Dirty embeddings for notes created/updated *since* the last rebuild live in a
+    separate, **un-indexed** ``PendingEmbedding`` table. This is required, not
+    cosmetic: once the HNSW index exists on ``Note.embedding`` Kuzu locks that
+    column against ``SET``, so per-note writes cannot land there — they go to
+    ``PendingEmbedding`` instead, and the brute-force fallback reads from it. A
+    rebuild repopulates ``Note.embedding`` from the files and starts from an
+    empty pending table (the freshly built DB has none).
 
     Args:
         conn: An open writable Kuzu connection.
@@ -252,6 +261,11 @@ def ensure_embedding_schema(conn: kuzu.Connection, dim: int) -> None:
     conn.execute(f"ALTER TABLE Note ADD IF NOT EXISTS embedding FLOAT[{dim}]")
     conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedded_at TIMESTAMP")
     conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedding_model STRING")
+    conn.execute(
+        "CREATE NODE TABLE IF NOT EXISTS PendingEmbedding("
+        f"id STRING PRIMARY KEY, embedding FLOAT[{dim}], "
+        "embedded_at TIMESTAMP, embedding_model STRING)"
+    )
 
 
 def note_vector_index_exists(

@@ -28,6 +28,7 @@ import kuzu
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.graph_db import (
+    NOTE_VECTOR_INDEX,
     GraphDatabaseReadOnlyError,
     close_graph_db,
     create_note_vector_index,
@@ -35,6 +36,7 @@ from parazettel_mcp.models.graph_db import (
     force_close_graph_db,
     graph_db_companions,
     init_graph_db,
+    note_vector_index_exists,
     swap_graph_db_file,
 )
 from parazettel_mcp.models.schema import (
@@ -1181,7 +1183,11 @@ class NoteRepository(Repository[Note]):
         notes: List[Note],
         vectors: List[List[float]],
     ) -> None:
-        """Write precomputed vectors onto their Note nodes (column must exist)."""
+        """Write precomputed vectors onto their Note nodes (column must exist).
+
+        Runs during the fresh rebuild *before* the HNSW index is created, so the
+        column is still writable; these vectors are then folded into the index.
+        """
         model_id = self._embedding_provider.model_id  # type: ignore[union-attr]
         now = datetime.datetime.now()
         for note, vector in zip(notes, vectors):
@@ -1220,12 +1226,15 @@ class NoteRepository(Repository[Note]):
             )
 
     def _set_note_embedding(self, conn: kuzu.Connection, note: Note) -> None:
-        """Embed a single note on create/update and store it (best-effort).
+        """Embed a single note on create/update into the dirty pending table.
 
-        Keeps the note findable via the brute-force fallback until the next
-        rebuild folds it into the HNSW index. (The embedding is computed here,
-        under the global write lock; moving the compute outside the lock is a
-        planned optimization once search lands.)
+        The vector goes to the un-indexed ``PendingEmbedding`` table — once the
+        HNSW index exists, ``Note.embedding`` is locked against ``SET``, so per-note
+        writes must land here. The brute-force fallback reads it until the next
+        rebuild folds the note into the index. Best-effort: a failure (e.g. a
+        missing model) is logged and never blocks note creation. (The embedding is
+        computed here under the global write lock; moving the compute outside the
+        lock is a planned optimization.)
         """
         provider = self._embedding_provider
         if provider is None:
@@ -1233,9 +1242,9 @@ class NoteRepository(Repository[Note]):
         try:
             vector = provider.embed_documents([self._embedding_text(note)])[0]
             conn.execute(
-                "MATCH (n:Note {id: $id}) "
-                "SET n.embedding = $embedding, n.embedded_at = $embedded_at, "
-                "n.embedding_model = $model",
+                "MERGE (p:PendingEmbedding {id: $id}) "
+                "SET p.embedding = $embedding, p.embedded_at = $embedded_at, "
+                "p.embedding_model = $model",
                 {
                     "id": note.id,
                     "embedding": vector,
@@ -1245,6 +1254,64 @@ class NoteRepository(Repository[Note]):
             )
         except Exception as exc:
             logger.warning("Could not embed note %s: %s", note.id, exc)
+
+    def vector_search_ids(self, text: str, limit: int = 50) -> List[str]:
+        """Return note ids most semantically similar to *text*, best first.
+
+        Combines the HNSW index (notes folded in at the last rebuild) with a
+        brute-force cosine pass over the *dirty* set — notes created/updated since
+        then, held in the un-indexed ``PendingEmbedding`` table — so recently
+        changed notes are findable immediately. Fresh dirty vectors override any
+        stale index entry for the same note. Returns an empty list when embeddings
+        are disabled or the query cannot be embedded, so callers cleanly fall back
+        to BM25.
+        """
+        provider = self._embedding_provider
+        if provider is None or not text or not text.strip():
+            return []
+        try:
+            query_vector = provider.embed_query(text)
+        except Exception as exc:
+            logger.warning("Query embedding failed; skipping vector search: %s", exc)
+            return []
+
+        distance_by_id: Dict[str, float] = {}
+        try:
+            with self._connection() as conn:
+                if note_vector_index_exists(conn):
+                    try:
+                        hnsw = conn.execute(
+                            "CALL QUERY_VECTOR_INDEX("
+                            f"'Note', '{NOTE_VECTOR_INDEX}', $q, $k"
+                            ") RETURN node.id AS id, distance ORDER BY distance",
+                            {"q": query_vector, "k": limit},
+                        )
+                        while hnsw.has_next():
+                            row = hnsw.get_next()
+                            distance_by_id[row[0]] = float(row[1])
+                    except Exception as exc:
+                        logger.warning("HNSW vector query failed: %s", exc)
+                # Brute-force the dirty set (PendingEmbedding); fresh vectors
+                # override any stale HNSW entry for the same id.
+                try:
+                    brute = conn.execute(
+                        "MATCH (p:PendingEmbedding) "
+                        "RETURN p.id AS id, "
+                        "array_cosine_similarity(p.embedding, $q) AS sim "
+                        "ORDER BY sim DESC LIMIT $k",
+                        {"q": query_vector, "k": limit},
+                    )
+                    while brute.has_next():
+                        row = brute.get_next()
+                        distance_by_id[row[0]] = 1.0 - float(row[1])
+                except Exception as exc:
+                    logger.warning("Brute-force vector fallback failed: %s", exc)
+        except Exception as exc:
+            logger.warning("Vector search failed: %s", exc)
+            return []
+
+        ordered = sorted(distance_by_id.items(), key=lambda kv: kv[1])
+        return [note_id for note_id, _distance in ordered[:limit]]
 
     def _index_note(
         self, note: Note, rendered_content: Optional[str] = None

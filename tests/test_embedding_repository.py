@@ -38,11 +38,14 @@ def test_create_stores_embedding(test_config, monkeypatch):
                 note_type=NoteType.PERMANENT,
             )
         )
+        # On create (no rebuild yet) the vector lands in the un-indexed
+        # PendingEmbedding table, and the note is immediately vector-searchable
+        # via the brute-force fallback.
         conn = kuzu.Connection(repo.db)
         try:
             row = conn.execute(
-                "MATCH (n:Note {id: $id}) "
-                "RETURN n.embedding, n.embedding_model, n.embedded_at",
+                "MATCH (p:PendingEmbedding {id: $id}) "
+                "RETURN p.embedding, p.embedding_model, p.embedded_at",
                 {"id": saved.id},
             ).get_next()
             embedding, model, embedded_at = row
@@ -51,6 +54,7 @@ def test_create_stores_embedding(test_config, monkeypatch):
             assert embedded_at is not None
         finally:
             conn.close()
+        assert saved.id in repo.vector_search_ids(repo._embedding_text(saved))
     finally:
         repo.close()
 
