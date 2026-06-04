@@ -76,6 +76,10 @@ def init_graph_db(
     """
     if buffer_pool_size is None:
         buffer_pool_size = _DEFAULT_BUFFER_POOL_SIZE
+    if buffer_pool_size < 0:
+        # A negative value would fall through to Kuzu's large default below,
+        # silently defeating the memory bound — reject it explicitly.
+        raise ValueError("buffer_pool_size must be >= 0")
     db_path = Path(db_path).expanduser().resolve()
     cache_key = _db_cache_key(db_path, read_only=read_only)
 
