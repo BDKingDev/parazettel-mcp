@@ -256,6 +256,33 @@ class TestMcpServer:
         assert "dup-rr-9" in result
         self.mock_zettel_service.create_note.assert_not_called()
 
+    def test_create_note_rerank_nonnumeric_score_falls_back(self):
+        """A non-numeric reranker score must not crash — fall back to BM25 candidates."""
+        existing = SimpleNamespace(
+            id="dup-rr-nan", title="A reworded duplicate",
+            content="same claim, other words", tags=[], note_type=NoteType.PERMANENT,
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+        # Reranker returns a same-length list of non-numeric values.
+        self.server._reranker = SimpleNamespace(score=lambda q, docs: ["bad" for _ in docs])
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="The same idea", content="Identical claim.",
+            note_type="permanent", source="transcript", area_id="area123",
+        )
+
+        # Falls back to the BM25 candidate (blocks), no crash / generic error.
+        assert "Not created" in result
+        assert "dup-rr-nan" in result
+        self.mock_zettel_service.create_note.assert_not_called()
+
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""
         weak = SimpleNamespace(

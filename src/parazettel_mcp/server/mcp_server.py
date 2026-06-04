@@ -241,13 +241,23 @@ class ZettelkastenMcpServer:
             logger.warning("Dedup rerank skipped (reranker failed): %s", exc)
             return candidates
         if len(scores) != len(candidates):
+            logger.warning(
+                "Dedup rerank skipped (unexpected score count): expected %d, got %d",
+                len(candidates),
+                len(scores),
+            )
             return candidates
         threshold = config.dedup_rerank_min_score
-        return [
-            (note, bm25)
-            for (note, bm25), rerank_score in zip(candidates, scores)
-            if rerank_score >= threshold
-        ]
+        confirmed: List[Tuple[Note, float]] = []
+        for (note, bm25), rerank_score in zip(candidates, scores):
+            if not isinstance(rerank_score, (int, float)):
+                # A non-numeric score would crash the threshold compare; stay
+                # best-effort and fall back to the BM25 candidates.
+                logger.warning("Dedup rerank skipped (non-numeric score %r)", rerank_score)
+                return candidates
+            if rerank_score >= threshold:
+                confirmed.append((note, bm25))
+        return confirmed
 
     @staticmethod
     def _format_duplicate_warning(
