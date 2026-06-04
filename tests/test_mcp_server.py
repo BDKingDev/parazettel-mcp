@@ -82,8 +82,10 @@ class TestMcpServer:
         """limit<=0 returns a clear validation message instead of delegating to
         the service and reporting the misleading 'no notes found'."""
         tool = self.registered_tools["pzk_find_similar_to_text"]
-        result = tool(text="a draft claim", limit=0)
-        assert "Limit must be greater than 0." in result
+        zero_result = tool(text="a draft claim", limit=0)
+        negative_result = tool(text="a draft claim", limit=-1)
+        assert "Limit must be greater than 0." in zero_result
+        assert "Limit must be greater than 0." in negative_result
         self.mock_zettel_service.find_similar_to_text.assert_not_called()
 
     def test_create_note_tool(self):
