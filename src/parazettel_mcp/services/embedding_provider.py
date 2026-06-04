@@ -26,6 +26,7 @@ BM25 / lexical behaviour.
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -33,6 +34,8 @@ try:  # Protocol is stdlib on 3.8+, but guard for clarity.
     from typing import Protocol, runtime_checkable
 except ImportError:  # pragma: no cover
     from typing_extensions import Protocol, runtime_checkable  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -251,7 +254,23 @@ class FastEmbedProvider:
             if providers:
                 self._preload_cuda_dlls()
                 kwargs["providers"] = providers
-            self._model = TextEmbedding(**kwargs)
+            try:
+                self._model = TextEmbedding(**kwargs)
+            except Exception as exc:
+                # A CUDA providers list fails on a CPU-only onnxruntime build or
+                # when the GPU runtime libs are missing. Honour the documented
+                # "falls back to CPU" contract by retrying without `providers`
+                # rather than disabling embeddings entirely. Re-raise if we were
+                # already on the CPU path (no providers) — that's a real error.
+                if "providers" not in kwargs:
+                    raise
+                logger.warning(
+                    "fastembed CUDA init failed (%s); falling back to the CPU "
+                    "execution provider.",
+                    exc,
+                )
+                kwargs.pop("providers")
+                self._model = TextEmbedding(**kwargs)
         return self._model
 
     def _finalize(self, raw) -> List[List[float]]:  # type: ignore[no-untyped-def]
