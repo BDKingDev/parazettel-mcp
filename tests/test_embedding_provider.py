@@ -133,6 +133,19 @@ def test_fastembed_passes_batch_size_to_model():
     assert model.passage_embed.call_args.kwargs.get("batch_size") == 7
 
 
+def test_sentence_transformer_passes_batch_size_to_model():
+    """embed_documents forwards the configured batch_size to model.encode()."""
+    from unittest.mock import MagicMock
+
+    provider = SentenceTransformerProvider("m", 4, batch_size=9)
+    model = MagicMock()
+    model.prompts = {}  # no task prompts -> no prompt_name kwarg
+    model.encode.return_value = [[1.0, 0.0, 0.0, 0.0]]
+    provider._model = model  # skip the lazy SentenceTransformer load
+    provider.embed_documents(["hello"])
+    assert model.encode.call_args.kwargs.get("batch_size") == 9
+
+
 def test_factory_forwards_device(monkeypatch):
     """The factory forwards config.embedding_device to the provider."""
     # ZettelkastenConfig reads PARAZETTEL_EMBEDDING_DEVICE at construction, so

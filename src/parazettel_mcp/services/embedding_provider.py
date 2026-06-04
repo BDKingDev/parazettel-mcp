@@ -73,12 +73,14 @@ class HashEmbeddingProvider:
     """
 
     def __init__(self, dim: int = 768) -> None:
+        """Set the output dimensionality (must be positive) and the model id."""
         if dim <= 0:
             raise ValueError("embedding_dim must be positive")
         self.dim = dim
         self.model_id = f"hash:deterministic:{dim}"
 
     def _embed(self, text: str) -> List[float]:
+        """Hash *text* into a deterministic unit vector of length ``dim``."""
         out: List[float] = []
         counter = 0
         # Expand a stream of SHA-256 digests into `dim` floats in [-1, 1).
@@ -93,9 +95,11 @@ class HashEmbeddingProvider:
         return _l2_normalize(out)
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embed each document deterministically (order-preserving)."""
         return [self._embed(t) for t in texts]
 
     def embed_query(self, text: str) -> List[float]:
+        """Embed a query with the same deterministic hash as documents."""
         return self._embed(text)
 
 
@@ -119,6 +123,7 @@ class SentenceTransformerProvider:
         batch_size: int = 16,
         device: str = "cpu",
     ) -> None:
+        """Configure the model name, output dim, normalization, and batch size."""
         if dim <= 0:
             raise ValueError("embedding_dim must be positive")
         self.model_name = model_name
@@ -130,6 +135,7 @@ class SentenceTransformerProvider:
         self._model = None  # lazy-loaded on first use
 
     def _ensure_model(self):  # type: ignore[no-untyped-def]
+        """Lazily load the SentenceTransformer model, or explain the missing extra."""
         if self._model is None:
             try:
                 from sentence_transformers import SentenceTransformer
@@ -150,10 +156,12 @@ class SentenceTransformerProvider:
         return self._model
 
     def _has_prompt(self, name: str) -> bool:
+        """Return whether the loaded model defines a task prompt named *name*."""
         prompts = getattr(self._model, "prompts", None) or {}
         return name in prompts
 
     def _encode(self, texts: Sequence[str], *, prompt: str) -> List[List[float]]:
+        """Encode texts with the given task prompt, truncate to ``dim``, normalize."""
         model = self._ensure_model()
         kwargs: Dict[str, Any] = {
             "convert_to_numpy": True,
@@ -176,11 +184,13 @@ class SentenceTransformerProvider:
         return out
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embed note bodies using the model's ``document`` task prompt."""
         if not texts:
             return []
         return self._encode(texts, prompt="document")
 
     def embed_query(self, text: str) -> List[float]:
+        """Embed a search query using the model's ``query`` task prompt."""
         return self._encode([text], prompt="query")[0]
 
 
@@ -211,6 +221,7 @@ class FastEmbedProvider:
         batch_size: int = 16,
         device: str = "cpu",
     ) -> None:
+        """Configure the model name, output dim, normalization, and batch size."""
         if dim <= 0:
             raise ValueError("embedding_dim must be positive")
         self.model_name = model_name
@@ -239,6 +250,7 @@ class FastEmbedProvider:
             pass
 
     def _ensure_model(self):  # type: ignore[no-untyped-def]
+        """Lazily load the fastembed model, or explain the missing extra."""
         if self._model is None:
             try:
                 from fastembed import TextEmbedding
@@ -274,6 +286,7 @@ class FastEmbedProvider:
         return self._model
 
     def _finalize(self, raw) -> List[List[float]]:  # type: ignore[no-untyped-def]
+        """Truncate each raw vector to ``dim`` and L2-normalize for cosine."""
         out: List[List[float]] = []
         for row in raw:
             v = [float(x) for x in list(row)[: self.dim]]
@@ -287,6 +300,7 @@ class FastEmbedProvider:
         return out
 
     def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        """Embed note bodies as passages, batched to bound the attention tensor."""
         if not texts:
             return []
         model = self._ensure_model()
@@ -303,6 +317,7 @@ class FastEmbedProvider:
         return self._finalize(raw)
 
     def embed_query(self, text: str) -> List[float]:
+        """Embed a search query, using the model's query prefix when available."""
         model = self._ensure_model()
         query_embed = getattr(model, "query_embed", None)
         raw = (
