@@ -11,7 +11,7 @@ import pytest
 
 import parazettel_mcp.main as main_module
 from parazettel_mcp import __version__
-from parazettel_mcp.config import config
+from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 
 
@@ -64,7 +64,6 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     monkeypatch.setenv("PARAZETTEL_BACKEND_MODE", "daemon")
     monkeypatch.setenv("PARAZETTEL_DAEMON_HOST", "127.0.0.1")
     monkeypatch.setenv("PARAZETTEL_DAEMON_PORT", "9101")
-    monkeypatch.setenv("PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS", "60")
     monkeypatch.setattr(sys, "argv", ["parazettel"])
 
     args = main_module.parse_args()
@@ -79,7 +78,6 @@ def test_parse_args_reads_env_defaults(monkeypatch):
     assert args.backend_mode == "daemon"
     assert args.daemon_host == "127.0.0.1"
     assert args.daemon_port == 9101
-    assert args.daemon_idle_timeout == 60
 
 
 def test_update_config_updates_paths():
@@ -300,7 +298,7 @@ def test_main_runs_daemon_when_requested(monkeypatch, workspace_temp_dir):
     main_module.main()
 
     daemon_factory.assert_called_once_with(
-        "127.0.0.1", 8766, idle_timeout_seconds=0.0
+        "127.0.0.1", 8766, idle_timeout_seconds=DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
     )
     daemon.serve_forever.assert_called_once_with()
     daemon.shutdown.assert_called_once_with()

@@ -295,8 +295,9 @@ class NoteRepository(Repository[Note]):
     def _open_graph_db(self, *, allow_rebuild_if_needed: bool) -> None:
         """Open the configured graph DB, optionally running startup rebuild checks."""
         self.read_only = False
+        bufpool = config.kuzu_buffer_pool_bytes
         try:
-            self.db = init_graph_db(self.graph_db_path)
+            self.db = init_graph_db(self.graph_db_path, buffer_pool_size=bufpool)
         except Exception as exc:
             if not self._is_graph_lock_error(exc):
                 raise
@@ -304,7 +305,9 @@ class NoteRepository(Repository[Note]):
                 "Graph DB at %s is already open elsewhere; falling back to read-only mode.",
                 self.graph_db_path,
             )
-            self.db = init_graph_db(self.graph_db_path, read_only=True)
+            self.db = init_graph_db(
+                self.graph_db_path, read_only=True, buffer_pool_size=bufpool
+            )
             self.read_only = True
         self._closed = False
 
@@ -655,7 +658,9 @@ class NoteRepository(Repository[Note]):
         issued. ``init_graph_db`` creates the schema (and FTS indexes), and the
         handle is fully released afterwards so the file can be swapped in.
         """
-        db = init_graph_db(db_path)
+        db = init_graph_db(
+            db_path, buffer_pool_size=config.kuzu_buffer_pool_bytes
+        )
         try:
             conn = kuzu.Connection(db)
             try:
