@@ -48,8 +48,10 @@ For shared-daemon mode, also configure:
 export PARAZETTEL_BACKEND_MODE="daemon"
 export PARAZETTEL_DAEMON_HOST="127.0.0.1"
 export PARAZETTEL_DAEMON_PORT="8766"
-export PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS="1800"
 ```
+
+The daemon auto-shuts down after an idle period (default 3600s); override it with
+`--daemon-idle-timeout <seconds>` at startup (`0` keeps it always-on).
 
 Legacy compatibility:
 
@@ -138,7 +140,7 @@ python -m parazettel_mcp.main --daemon-status
 python -m parazettel_mcp.main --stop-daemon
 ```
 
-If you want the daemon to shut itself down when it has been unused for a while, keep `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` set to a non-zero value. That is safer than tying shutdown directly to one editor session closing.
+The daemon shuts itself down after an idle period (default 3600s), which is safer than tying shutdown directly to one editor session closing. Override the window with `--daemon-idle-timeout <seconds>` at startup (pass `0` to keep it always-on).
 
 ## Step 6: Verify Installation
 
