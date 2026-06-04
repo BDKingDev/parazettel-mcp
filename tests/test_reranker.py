@@ -34,7 +34,13 @@ def test_score_empty_documents_returns_empty():
 
 
 def _fake_cross_encoder(monkeypatch, captured, scores):
-    """Install a fake fastembed TextCrossEncoder that records its calls."""
+    """Install a fake fastembed TextCrossEncoder that records its calls.
+
+    Registers the parent packages too: ``from fastembed.rerank.cross_encoder
+    import TextCrossEncoder`` needs ``fastembed`` and ``fastembed.rerank`` to
+    resolve, so stubbing only the leaf module would still fail when fastembed
+    isn't installed (the default when tests run with only the ``dev`` extra).
+    """
 
     class FakeCrossEncoder:
         def __init__(self, **kwargs):
@@ -45,9 +51,17 @@ def _fake_cross_encoder(monkeypatch, captured, scores):
             captured["docs"] = list(documents)
             return list(scores)
 
-    module = types.ModuleType("fastembed.rerank.cross_encoder")
-    module.TextCrossEncoder = FakeCrossEncoder
-    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", module)
+    fastembed = types.ModuleType("fastembed")
+    fastembed.__path__ = []  # mark as a package so submodule imports resolve
+    rerank = types.ModuleType("fastembed.rerank")
+    rerank.__path__ = []
+    cross_encoder = types.ModuleType("fastembed.rerank.cross_encoder")
+    cross_encoder.TextCrossEncoder = FakeCrossEncoder
+    fastembed.rerank = rerank
+    rerank.cross_encoder = cross_encoder
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed)
+    monkeypatch.setitem(sys.modules, "fastembed.rerank", rerank)
+    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", cross_encoder)
 
 
 def test_score_forwards_query_and_documents(monkeypatch):

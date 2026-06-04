@@ -215,7 +215,9 @@ class ZettelkastenMcpServer:
     @staticmethod
     def _dedup_text(title: str, content: str) -> str:
         """Combine title + a content lead into the text the reranker compares."""
-        body = (content or "").strip()[:600]
+        # Slice before strip so a large note body isn't fully stripped just to
+        # take a 600-char lead (mirrors _find_duplicate_candidates' content lead).
+        body = (content or "")[:600].strip()
         return f"{(title or '').strip()}\n{body}".strip()
 
     def _rerank_confirm(
