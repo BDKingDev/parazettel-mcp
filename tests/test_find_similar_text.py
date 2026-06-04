@@ -60,3 +60,10 @@ def test_filters_below_threshold(monkeypatch):
     res = ZettelService(repository=repo).find_similar_to_text("draft", threshold=0.5)
 
     assert [n.id for n, _ in res] == ["n1"]  # n2 (cos 0.3) filtered out
+
+
+def test_find_similar_to_text_is_in_daemon_rpc_allowlist():
+    """Daemon-mode RPC dispatch must allow the method (direct-mode tests miss it)."""
+    from parazettel_mcp.daemon.server import ALLOWED_SERVICE_METHODS
+
+    assert "find_similar_to_text" in ALLOWED_SERVICE_METHODS["zettel_service"]
