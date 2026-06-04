@@ -133,6 +133,16 @@ class ZettelkastenConfig(BaseModel):
     embedding_batch_size: int = Field(
         default_factory=lambda: int(os.getenv("PARAZETTEL_EMBEDDING_BATCH_SIZE", "16"))
     )
+    # Execution device for local embedding inference: "cpu" (default) or "cuda".
+    # "cuda" requires the GPU install extra (fastembed-gpu/onnxruntime-gpu via
+    # [embeddings-lite-gpu]; a CUDA build of torch for sentence-transformers) — the
+    # provider then selects the CUDA execution provider and preloads its runtime
+    # DLLs. Falls back to CPU within the provider if the GPU runtime is missing.
+    embedding_device: str = Field(
+        default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_DEVICE", "cpu")
+        .strip()
+        .lower()
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""
