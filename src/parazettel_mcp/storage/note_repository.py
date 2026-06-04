@@ -1249,10 +1249,13 @@ class NoteRepository(Repository[Note]):
         if provider is None or not notes:
             return
         try:
-            vectors = provider.embed_documents([self._embedding_text(n) for n in notes])
-            title_vectors = provider.embed_documents(
-                [self._title_text(n) for n in notes]
-            )
+            # One provider round-trip for both vectors: embed doc texts then title
+            # texts in a single batch, then split (halves remote calls/latency).
+            doc_texts = [self._embedding_text(n) for n in notes]
+            title_texts = [self._title_text(n) for n in notes]
+            all_vectors = provider.embed_documents(doc_texts + title_texts)
+            vectors = all_vectors[: len(notes)]
+            title_vectors = all_vectors[len(notes):]
             self._store_embeddings(conn, notes, vectors, title_vectors)
             create_note_vector_index(conn, config.embedding_metric)
             create_note_vector_index(
@@ -1283,8 +1286,9 @@ class NoteRepository(Repository[Note]):
         if provider is None:
             return
         try:
-            vector = provider.embed_documents([self._embedding_text(note)])[0]
-            title_vector = provider.embed_documents([self._title_text(note)])[0]
+            vector, title_vector = provider.embed_documents(
+                [self._embedding_text(note), self._title_text(note)]
+            )
             conn.execute(
                 "MERGE (p:PendingEmbedding {id: $id}) "
                 "SET p.embedding = $embedding, p.title_embedding = $title_embedding, "

@@ -90,6 +90,29 @@ def test_vector_search_matches_on_pending_title_vector(test_config, monkeypatch)
         repo.close()
 
 
+def test_vector_search_pending_overrides_stale_title_index(test_config, monkeypatch):
+    """An indexed note that is then edited surfaces via its CURRENT (pending)
+    vector, not the stale HNSW entry — the pending-overrides-index contract."""
+    _enable_hash_embeddings(monkeypatch)
+    repo = NoteRepository(notes_dir=test_config.notes_dir)
+    try:
+        n = repo.create(
+            Note(title="zzz placeholder heading", content="unrelated body",
+                 note_type=NoteType.PERMANENT)
+        )
+        for t, b in [("A", "alpha"), ("B", "beta")]:
+            repo.create(Note(title=t, content=b, note_type=NoteType.PERMANENT))
+        repo.rebuild_index()  # n is indexed under its placeholder title
+        n.title = "frantic intake"
+        repo.update(n)  # now dirty: pending title vector = query vector
+        hits = dict(repo.vector_search("frantic intake", limit=10))
+        assert n.id in hits
+        # ~0 only if the pending (current) vector overrides the stale index entry.
+        assert hits[n.id] < 1e-3
+    finally:
+        repo.close()
+
+
 def test_vector_search_empty_when_disabled(test_config):
     """vector_search_ids returns [] when embeddings are disabled."""
     repo = NoteRepository(notes_dir=test_config.notes_dir)
