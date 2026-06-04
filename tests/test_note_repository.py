@@ -810,7 +810,9 @@ def test_repository_falls_back_to_read_only_when_graph_db_locked(monkeypatch):
     close_calls = []
     repository = None
 
-    def fake_init_graph_db(db_path: Path, read_only: bool = False):
+    def fake_init_graph_db(
+        db_path: Path, read_only: bool = False, buffer_pool_size: int = 0
+    ):
         init_calls.append((Path(db_path), read_only))
         if not read_only:
             raise RuntimeError(f"Could not set lock on file {db_path}")

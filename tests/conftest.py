@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 from parazettel_mcp.config import config
+from parazettel_mcp.models import graph_db
 from parazettel_mcp.services.zettel_service import ZettelService
 from parazettel_mcp.storage.note_repository import NoteRepository
 
@@ -52,12 +53,21 @@ def test_config(temp_dirs):
     original_backend_mode = config.backend_mode
     original_daemon_host = config.daemon_host
     original_daemon_port = config.daemon_port
+    original_kuzu_buffer = config.kuzu_buffer_pool_bytes
+    original_default_buffer = graph_db._DEFAULT_BUFFER_POOL_SIZE
     # Update config for tests
     config.notes_dir = notes_dir
     config.graph_db_path = graph_db_path
     config.backend_mode = "direct"
     config.daemon_host = "127.0.0.1"
     config.daemon_port = 8766
+    # Bound the Kuzu buffer pool so each test's fresh DB stays small — otherwise
+    # Kuzu reserves ~80% of RAM per instance, which makes the suite memory-heavy
+    # and impossible to run in parallel (pytest-xdist) without OOM. Bound both the
+    # config value (threaded into NoteRepository) and the module default (so direct
+    # init_graph_db(path) callers, e.g. test_embedding_schema, stay light too).
+    config.kuzu_buffer_pool_bytes = 128 * 1024 * 1024
+    graph_db._DEFAULT_BUFFER_POOL_SIZE = 128 * 1024 * 1024
     yield config
     # Restore original config
     config.notes_dir = original_notes_dir
@@ -65,6 +75,8 @@ def test_config(temp_dirs):
     config.backend_mode = original_backend_mode
     config.daemon_host = original_daemon_host
     config.daemon_port = original_daemon_port
+    config.kuzu_buffer_pool_bytes = original_kuzu_buffer
+    graph_db._DEFAULT_BUFFER_POOL_SIZE = original_default_buffer
 
 
 @pytest.fixture
