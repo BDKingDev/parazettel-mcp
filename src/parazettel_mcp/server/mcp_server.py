@@ -925,6 +925,53 @@ class ZettelkastenMcpServer:
             except Exception as e:
                 return self.format_error_response(e)
 
+        # Find notes similar to arbitrary text (pre-create semantic check)
+        @self.mcp.tool(name="pzk_find_similar_to_text")
+        def pzk_find_similar_to_text(
+            text: str, threshold: float = 0.5, limit: int = 10
+        ) -> str:
+            """Find existing notes semantically similar to raw text.
+
+            Unlike pzk_find_similar_notes (which needs an existing note ID), this
+            embeds arbitrary text — use it to check a DRAFT note for
+            cross-vocabulary duplicates/overlaps BEFORE creating it (catching
+            near-duplicates that keyword search misses, exactly when it matters).
+            Returns calibrated cosine similarities (0.0-1.0), highest first.
+            Requires embeddings enabled; otherwise fall back to pzk_search_notes.
+
+            Args:
+                text: The draft claim (title and/or body) to check — semantic,
+                    not keyword.
+                threshold: Minimum cosine similarity to return (0.0-1.0).
+                limit: Maximum number of results to return.
+            """
+            try:
+                if not text or not text.strip():
+                    return "Error: text is required."
+                similar = self.zettel_service.find_similar_to_text(
+                    text, threshold, limit
+                )
+                if not similar:
+                    return (
+                        f"No semantically similar notes found (threshold {threshold}). "
+                        "If embeddings are disabled, use pzk_search_notes instead."
+                    )
+                output = f"Found {len(similar)} semantically similar notes:\n\n"
+                for i, (note, similarity) in enumerate(similar, 1):
+                    output += f"{i}. {note.title} (ID: {note.id})\n"
+                    output += f"   Similarity: {similarity:.2f}\n"
+                    if note.tags:
+                        output += (
+                            f"   Tags: {', '.join(tag.name for tag in note.tags)}\n"
+                        )
+                    content_preview = note.content[:100].replace("\n", " ")
+                    if len(note.content) > 100:
+                        content_preview += "..."
+                    output += f"   Preview: {content_preview}\n\n"
+                return output
+            except Exception as e:
+                return self.format_error_response(e)
+
         # Find central notes
         @self.mcp.tool(name="pzk_find_central_notes")
         def pzk_find_central_notes(limit: int = 10) -> str:
