@@ -310,14 +310,19 @@ def create_note_vector_index(
     index_name: str = NOTE_VECTOR_INDEX,
     column: str = "embedding",
 ) -> None:
-    """Create the HNSW index over ``Note.embedding`` if it does not already exist.
+    """Create an HNSW index over a ``Note`` vector column if it doesn't exist.
 
-    A no-op when the index is already present, so it is safe to call at the end
-    of every rebuild. The embedding column must exist first (see
+    Defaults to ``index_name=NOTE_VECTOR_INDEX`` over ``Note.embedding`` (the doc
+    vector); pass ``index_name``/``column`` to build a second index over another
+    vector column, e.g. ``NOTE_TITLE_VECTOR_INDEX`` over ``title_embedding`` for
+    dual-vector recall. Kuzu supports multiple HNSW indexes on one node table.
+
+    A no-op when the named index is already present, so it is safe to call at the
+    end of every rebuild. The target column must exist first (see
     :func:`ensure_embedding_schema`). Because the rebuild pipeline builds into a
-    fresh database, the index is always created exactly once per database; the
-    embedding dimension or metric is changed by rebuilding (not recreating in
-    place), which Kuzu 0.11.x does not reliably support for same-named indexes.
+    fresh database, each index is created exactly once per database; the embedding
+    dimension or metric is changed by rebuilding (not recreating in place), which
+    Kuzu 0.11.x does not reliably support for same-named indexes.
     """
     metric = metric.strip().lower()
     if metric not in _VALID_METRICS:

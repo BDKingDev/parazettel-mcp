@@ -1254,6 +1254,16 @@ class NoteRepository(Repository[Note]):
             doc_texts = [self._embedding_text(n) for n in notes]
             title_texts = [self._title_text(n) for n in notes]
             all_vectors = provider.embed_documents(doc_texts + title_texts)
+            if len(all_vectors) != 2 * len(notes):
+                # A wrong count would split into mismatched halves, leave the
+                # embedding columns unpopulated (_store_embeddings bails), and
+                # then the indexes below would still be built over NULLs. Abort
+                # the whole build instead (caught below → no index created, search
+                # falls back to BM25 — never an index over incomplete embeddings).
+                raise RuntimeError(
+                    f"Embedding provider returned {len(all_vectors)} vectors for "
+                    f"{2 * len(notes)} expected (doc+title); aborting embedding build."
+                )
             vectors = all_vectors[: len(notes)]
             title_vectors = all_vectors[len(notes):]
             self._store_embeddings(conn, notes, vectors, title_vectors)
@@ -1328,6 +1338,13 @@ class NoteRepository(Repository[Note]):
             if note_id not in target or dist < target[note_id]:
                 target[note_id] = dist
 
+        # Over-fetch per source: the doc- and title-index top-k can overlap, and
+        # HNSW recall is approximate, so taking only `limit` from each can yield
+        # fewer than `limit` distinct notes (or miss a true match). Fetch a wider
+        # band from each source; the caller re-sorts the merged map by distance
+        # and truncates to `limit`.
+        fetch_k = max(1, limit) * 2
+
         index_dist: Dict[str, float] = {}
         pending_dist: Dict[str, float] = {}
         try:
@@ -1343,7 +1360,7 @@ class NoteRepository(Repository[Note]):
                                 "CALL QUERY_VECTOR_INDEX("
                                 f"'Note', '{index_name}', $q, $k"
                                 ") RETURN node.id AS id, distance ORDER BY distance",
-                                {"q": query_vector, "k": limit},
+                                {"q": query_vector, "k": fetch_k},
                             )
                             while hnsw.has_next():
                                 row = hnsw.get_next()
@@ -1362,7 +1379,7 @@ class NoteRepository(Repository[Note]):
                             "AND p.embedding_model = $model "
                             f"RETURN p.id AS id, {expr} AS dist "
                             "ORDER BY dist LIMIT $k",
-                            {"q": query_vector, "model": model_id, "k": limit},
+                            {"q": query_vector, "model": model_id, "k": fetch_k},
                         )
                         while brute.has_next():
                             row = brute.get_next()
