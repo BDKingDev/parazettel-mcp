@@ -15,15 +15,28 @@ Kuzu DATE values so that NULL is representable without a sentinel and round-trip
 through Python cleanly.
 """
 
+import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import kuzu
 
+logger = logging.getLogger(__name__)
+
 _DB_CACHE_LOCK = threading.Lock()
 _DB_CACHE: Dict[str, Tuple[kuzu.Database, int]] = {}
+# Buffer-pool size each cached handle was opened with. Kuzu fixes the pool size
+# at Database creation and allows only one handle per path, so a later call with
+# a different size cannot change it — we track it only to warn on a mismatch.
+_DB_CACHE_BUFFER_POOL: Dict[str, int] = {}
+
+# Process-wide fallback buffer-pool size for callers that don't pass one
+# explicitly. ``0`` keeps Kuzu's own default (~80% of RAM) in production; the
+# test suite bounds this so direct ``init_graph_db(path)`` callers stay light
+# under pytest-xdist without having to thread the size through every call site.
+_DEFAULT_BUFFER_POOL_SIZE = 0
 _NOTE_FTS_INDEXES = {
     "note_text_fts": ["title", "content"],
     "note_title_fts": ["title"],
@@ -42,7 +55,7 @@ def _db_cache_key(db_path: Path, read_only: bool = False) -> str:
 
 
 def init_graph_db(
-    db_path: Path, read_only: bool = False, buffer_pool_size: int = 0
+    db_path: Path, read_only: bool = False, buffer_pool_size: Optional[int] = None
 ) -> kuzu.Database:
     """Create (or open) the Kuzu database at *db_path* and ensure the schema exists.
 
@@ -52,13 +65,17 @@ def init_graph_db(
                  path; do **not** create the path as a directory before calling
                  this function.
         read_only: Open the database without write access.
-        buffer_pool_size: Max Kuzu buffer-pool size in bytes. ``0`` (default)
-                 leaves Kuzu's own default (~80% of physical RAM per instance);
-                 a positive value bounds it (see ``config.kuzu_buffer_pool_bytes``).
+        buffer_pool_size: Max Kuzu buffer-pool size in bytes. ``None`` (default)
+                 falls back to ``_DEFAULT_BUFFER_POOL_SIZE`` (``0`` in production,
+                 i.e. Kuzu's own ~80%-of-RAM default; bounded in tests). ``0``
+                 explicitly requests Kuzu's default; a positive value bounds it
+                 (see ``config.kuzu_buffer_pool_bytes``).
 
     Returns:
         An open :class:`kuzu.Database` instance.
     """
+    if buffer_pool_size is None:
+        buffer_pool_size = _DEFAULT_BUFFER_POOL_SIZE
     db_path = Path(db_path).expanduser().resolve()
     cache_key = _db_cache_key(db_path, read_only=read_only)
 
@@ -66,6 +83,17 @@ def init_graph_db(
         cached = _DB_CACHE.get(cache_key)
         if cached is not None:
             db, refcount = cached
+            requested = buffer_pool_size if buffer_pool_size and buffer_pool_size > 0 else 0
+            existing = _DB_CACHE_BUFFER_POOL.get(cache_key, 0)
+            if requested and requested != existing:
+                # The pool size is fixed at first open; a reused handle keeps it.
+                logger.warning(
+                    "Graph DB %s already open with buffer_pool_size=%d; ignoring "
+                    "requested buffer_pool_size=%d (Kuzu allows one handle per path).",
+                    db_path,
+                    existing,
+                    requested,
+                )
             _DB_CACHE[cache_key] = (db, refcount + 1)
             return db
 
@@ -83,6 +111,7 @@ def init_graph_db(
             finally:
                 conn.close()
         _DB_CACHE[cache_key] = (db, 1)
+        _DB_CACHE_BUFFER_POOL[cache_key] = buffer_pool_size if buffer_pool_size > 0 else 0
         return db
 
 
@@ -99,6 +128,7 @@ def close_graph_db(db_path: Path, read_only: bool = False) -> None:
             _DB_CACHE[cache_key] = (db, refcount - 1)
             return
         del _DB_CACHE[cache_key]
+        _DB_CACHE_BUFFER_POOL.pop(cache_key, None)
 
     db.close()
 
@@ -115,6 +145,7 @@ def force_close_graph_db(db_path: Path) -> None:
         for mode in ("rw", "ro"):
             cache_key = f"{resolved}::{mode}"
             cached = _DB_CACHE.pop(cache_key, None)
+            _DB_CACHE_BUFFER_POOL.pop(cache_key, None)
             if cached is not None:
                 cached[0].close()
 
