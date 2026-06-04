@@ -45,6 +45,45 @@ install tier (below). When disabled, the system behaves exactly as before
 - `PARAZETTEL_EMBEDDING_MODEL`
 - `PARAZETTEL_EMBEDDING_DIM` (must match the model; Matryoshka models may truncate)
 - `PARAZETTEL_EMBEDDING_METRIC` (`cosine` | `l2` | `dotproduct`)
+- `PARAZETTEL_EMBEDDING_BATCH_SIZE` (default `16`) — bulk-embedding batch size.
+  Keep it small for large models: the attention tensor is `batch x heads x seq^2`,
+  so e.g. mxbai-large at the embedding library's default of 256 needs ~4 GB per
+  batch and OOMs; 16 keeps it ~256 MB.
+- `FASTEMBED_CACHE_PATH` (fastembed only) — a **persistent** directory for the
+  ONNX model so it isn't re-downloaded on every daemon restart (the default is a
+  temp dir that may be cleared).
+
+## Choosing a model
+
+`dim` must match the model. Storage/latency are non-issues at a few-thousand
+short notes (1024-d ≈ 9 MB; queries are tens of ms warm), so pick on quality vs
+footprint. "Beefier" does **not** require the heavy tier — fastembed (lite, ONNX,
+no PyTorch, no HF gating) includes large models too:
+
+| Model | Tier | dim | Notes |
+| --- | --- | --- | --- |
+| `BAAI/bge-small-en-v1.5` | lite | 384 | default; smallest footprint |
+| `BAAI/bge-base-en-v1.5` | lite | 768 | solid step up |
+| `nomic-ai/nomic-embed-text-v1.5` | lite | 768 | fast on CPU, Matryoshka |
+| `mixedbread-ai/mxbai-embed-large-v1` | lite | 1024 | top lite-tier quality |
+| `google/embeddinggemma-300m` | full | 768 | strong, but ~2 GB PyTorch **and** HF-gated (needs a token) |
+
+EmbeddingGemma is gated (accept Google's license + a HuggingFace token) and only
+runs on the full/torch tier; the beefy fastembed models avoid both.
+
+## Enabling on a vault (runbook)
+
+1. Install a tier: `pip install 'parazettel-mcp[embeddings-lite]'` (or
+   `[embeddings]` for the full/sentence-transformers tier).
+2. Set the env on the MCP server definition (e.g. `~/.claude.json`
+   `mcpServers.parazettel.env` and/or `~/.codex/config.toml`) — *not* a
+   session-level settings file: `PARAZETTEL_EMBEDDING_ENABLED=true`, the
+   provider/model/dim/metric, and a persistent `FASTEMBED_CACHE_PATH`.
+3. Restart the daemon so it loads the embedding code, the env, and the model.
+4. Run `pzk_rebuild_index` once to backfill embeddings and build the HNSW index.
+   Large bulk embeds are memory-bound — keep `PARAZETTEL_EMBEDDING_BATCH_SIZE`
+   small. Changing the model or dim later requires another rebuild (re-embeds the
+   whole vault), so choose before the first rebuild.
 
 ## Phased delivery (one PR each)
 
