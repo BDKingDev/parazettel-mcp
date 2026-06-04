@@ -232,6 +232,10 @@ def _create_schema(conn: kuzu.Connection) -> None:
 # base Note schema above is untouched otherwise.
 
 NOTE_VECTOR_INDEX = "note_vec"
+# Second HNSW index over the note *title* embedding. Querying both indexes and
+# keeping the closer (max-cosine) rescues multi-facet notes whose body dilutes
+# the doc vector but whose title (the atomic claim) is a strong match.
+NOTE_TITLE_VECTOR_INDEX = "note_title_vec"
 _VALID_METRICS = frozenset({"cosine", "l2", "dotproduct"})
 
 
@@ -259,12 +263,18 @@ def ensure_embedding_schema(conn: kuzu.Connection, dim: int) -> None:
     if dim <= 0:
         raise ValueError("embedding dim must be positive")
     conn.execute(f"ALTER TABLE Note ADD IF NOT EXISTS embedding FLOAT[{dim}]")
+    conn.execute(f"ALTER TABLE Note ADD IF NOT EXISTS title_embedding FLOAT[{dim}]")
     conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedded_at TIMESTAMP")
     conn.execute("ALTER TABLE Note ADD IF NOT EXISTS embedding_model STRING")
     conn.execute(
         "CREATE NODE TABLE IF NOT EXISTS PendingEmbedding("
         f"id STRING PRIMARY KEY, embedding FLOAT[{dim}], "
+        f"title_embedding FLOAT[{dim}], "
         "embedded_at TIMESTAMP, embedding_model STRING)"
+    )
+    # Existing pending tables (created before the title vector) need the column.
+    conn.execute(
+        f"ALTER TABLE PendingEmbedding ADD IF NOT EXISTS title_embedding FLOAT[{dim}]"
     )
 
 
@@ -298,6 +308,7 @@ def create_note_vector_index(
     conn: kuzu.Connection,
     metric: str = "cosine",
     index_name: str = NOTE_VECTOR_INDEX,
+    column: str = "embedding",
 ) -> None:
     """Create the HNSW index over ``Note.embedding`` if it does not already exist.
 
@@ -318,6 +329,6 @@ def create_note_vector_index(
         return
     conn.execute(
         "CALL CREATE_VECTOR_INDEX("
-        f"'Note', '{index_name}', 'embedding', metric := '{metric}'"
+        f"'Note', '{index_name}', '{column}', metric := '{metric}'"
         ")"
     )
