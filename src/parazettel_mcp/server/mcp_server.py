@@ -948,6 +948,8 @@ class ZettelkastenMcpServer:
             try:
                 if not text or not text.strip():
                     return "Error: text is required."
+                if limit <= 0:
+                    return "Limit must be greater than 0."
                 similar = self.zettel_service.find_similar_to_text(
                     text, threshold, limit
                 )

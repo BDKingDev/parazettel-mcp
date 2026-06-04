@@ -45,7 +45,8 @@ def test_converts_distance_to_cosine_and_sorts(monkeypatch):
 
     # cosine = 1 - distance -> n1=0.9, n2=0.6; both clear 0.5, sorted high->low.
     assert [n.id for n, _ in res] == ["n1", "n2"]
-    assert res[0][1] == 0.9
+    # 1 - 0.1 isn't exactly representable, so compare with a tolerance like n2.
+    assert abs(res[0][1] - 0.9) < 1e-9
     assert abs(res[1][1] - 0.6) < 1e-9
 
 
