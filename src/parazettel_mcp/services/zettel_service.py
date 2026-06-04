@@ -679,12 +679,12 @@ class ZettelService:
         Returns ``[]`` when embeddings are disabled or the repository has no vector
         search, so callers fall back to BM25 (``search_combined`` / search_notes).
         """
-        if not text or not text.strip():
+        if not text or not text.strip() or limit <= 0:
             return []
         if not (config.embedding_enabled and hasattr(self.repository, "vector_search")):
             return []
         results: List[Tuple[Note, float]] = []
-        for note_id, distance in self.repository.vector_search(text, max(1, limit)):
+        for note_id, distance in self.repository.vector_search(text, limit):
             note = self.repository.get(note_id)
             if note is None:
                 continue

@@ -67,3 +67,13 @@ def test_find_similar_to_text_is_in_daemon_rpc_allowlist():
     from parazettel_mcp.daemon.server import ALLOWED_SERVICE_METHODS
 
     assert "find_similar_to_text" in ALLOWED_SERVICE_METHODS["zettel_service"]
+
+
+def test_returns_empty_for_nonpositive_limit(monkeypatch):
+    """A non-positive limit is rejected explicitly, not coerced to 1."""
+    monkeypatch.setattr(config, "embedding_enabled", True)
+    repo = MagicMock()
+    svc = ZettelService(repository=repo)
+    assert svc.find_similar_to_text("x", limit=0) == []
+    assert svc.find_similar_to_text("x", limit=-5) == []
+    repo.vector_search.assert_not_called()
