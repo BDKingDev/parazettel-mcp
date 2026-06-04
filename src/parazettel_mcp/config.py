@@ -142,6 +142,22 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
+    # Batch size for bulk embedding (e.g. during a rebuild). Kept small so the
+    # transformer attention tensor (batch x heads x seq^2) stays bounded — large
+    # models OOM at the embedding library's default (256 -> ~4GB for mxbai@512).
+    embedding_batch_size: int = Field(
+        default_factory=lambda: int(os.getenv("PARAZETTEL_EMBEDDING_BATCH_SIZE", "16"))
+    )
+    # Execution device for local embedding inference: "cpu" (default) or "cuda".
+    # "cuda" requires the GPU install extra (fastembed-gpu/onnxruntime-gpu via
+    # [embeddings-lite-gpu]; a CUDA build of torch for sentence-transformers) — the
+    # provider then selects the CUDA execution provider and preloads its runtime
+    # DLLs. Falls back to CPU within the provider if the GPU runtime is missing.
+    embedding_device: str = Field(
+        default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_DEVICE", "cpu")
+        .strip()
+        .lower()
+    )
     # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
     kuzu_buffer_pool_bytes: int = Field(default=DEFAULT_KUZU_BUFFER_POOL_BYTES)
 

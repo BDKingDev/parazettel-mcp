@@ -75,6 +75,9 @@ _GRAPH_BACKUP_COPY_ATTEMPTS = 8
 _GRAPH_BACKUP_BACKOFF_SECONDS = 0.05
 _RETRYABLE_GRAPH_COPY_WINERRORS = {5, 32, 33}
 _GRAPH_BATCH_SIZE = 100
+# Notes per progress-logged chunk during the bulk embed (within each chunk the
+# provider further batches at embedding_batch_size). Purely for log granularity.
+_EMBED_LOG_CHUNK = 200
 # Cap how many skipped filenames are inlined into the rebuild warning log so a
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
@@ -1238,10 +1241,44 @@ class NoteRepository(Repository[Note]):
         provider = self._embedding_provider
         if provider is None or not notes:
             return
+        total = len(notes)
         try:
-            vectors = provider.embed_documents([self._embedding_text(n) for n in notes])
-            self._store_embeddings(conn, notes, vectors)
+            logger.info(
+                "Embedding %d notes (provider=%s, batch=%d)...",
+                total,
+                provider.model_id,
+                # Log the configured batch size (clamped like the providers do)
+                # rather than reaching into a provider-private attribute.
+                max(1, int(getattr(config, "embedding_batch_size", 16))),
+            )
+            # Chunk the bulk embed so progress is visible during the (slow) embed
+            # phase — a single embed_documents call over the whole vault is opaque
+            # and can run for many minutes on CPU.
+            for start in range(0, total, _EMBED_LOG_CHUNK):
+                chunk = notes[start : start + _EMBED_LOG_CHUNK]
+                vectors = provider.embed_documents(
+                    [self._embedding_text(note) for note in chunk]
+                )
+                if len(vectors) != len(chunk):
+                    # Abort the whole build on a count mismatch rather than storing
+                    # only some chunks and then indexing: that would build the HNSW
+                    # index over a partially-populated column. Raising here is caught
+                    # below, so index creation is skipped and search falls back to
+                    # BM25 (no index over incomplete embeddings).
+                    raise RuntimeError(
+                        f"Embedding provider returned {len(vectors)} vectors for "
+                        f"{len(chunk)} notes; aborting embedding build."
+                    )
+                self._store_embeddings(conn, chunk, vectors)
+                logger.info(
+                    "  embedded %d/%d notes", min(start + len(chunk), total), total
+                )
             create_note_vector_index(conn, config.embedding_metric)
+            logger.info(
+                "Built HNSW vector index over %d notes (metric=%s)",
+                total,
+                config.embedding_metric,
+            )
         except Exception as exc:
             logger.warning(
                 "Embedding build failed; rebuilt index without vectors "
