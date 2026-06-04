@@ -40,7 +40,7 @@ python -m parazettel_mcp.main --daemon-status
 python -m parazettel_mcp.main --stop-daemon
 ```
 
-If you want the daemon to shut itself down after inactivity during manual testing, set `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` or pass `--daemon-idle-timeout` when starting it manually.
+The daemon shuts itself down after an idle period (default 3600s) during manual testing; override the window by passing `--daemon-idle-timeout <seconds>` when starting it manually (`0` keeps it always-on).
 
 For automated tests, continue using isolated temporary test data. Do not point integration tests at your real vault unless you intentionally want a live-vault check.
 

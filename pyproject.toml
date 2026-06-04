@@ -30,6 +30,7 @@ dependencies = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
     "black>=23.0.0",
     "isort>=5.12.0",
     "mypy>=1.0.0",
@@ -44,6 +45,18 @@ migration = [
 # embeddings are disabled or the "hash" provider is used.
 embeddings-lite = [
     "fastembed>=0.4.0",
+]
+# Lite tier on the GPU: fastembed-gpu pulls onnxruntime-gpu, and the nvidia-*
+# wheels supply the CUDA 12 / cuDNN 9 runtime so no system CUDA toolkit is
+# needed (the provider calls onnxruntime.preload_dlls() to locate them). The
+# CUDA 12 build runs on newer CUDA drivers. Set PARAZETTEL_EMBEDDING_DEVICE=cuda.
+embeddings-lite-gpu = [
+    "fastembed-gpu>=0.4.0",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
 ]
 embeddings = [
     "sentence-transformers>=5.0.0",

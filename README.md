@@ -223,10 +223,9 @@ python -m parazettel_mcp.main --daemon-status
 python -m parazettel_mcp.main --stop-daemon
 ```
 
-If you want the daemon to shut itself down after inactivity, set:
-
-- `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS`
-- or `--daemon-idle-timeout`
+The daemon shuts itself down after an idle period (default 3600s). Override the
+window with `--daemon-idle-timeout <seconds>` when starting it (pass `0` to keep
+it always-on).
 
 An idle timeout is the safest approximation to “close the daemon once all sessions are gone,” because one chat closing should not kill the daemon while another chat is still using it.
 
@@ -246,7 +245,7 @@ Key runtime settings:
 - `PARAZETTEL_BACKEND_MODE` / `--backend-mode`: `direct` or `daemon`
 - `PARAZETTEL_DAEMON_HOST` / `--daemon-host`: local daemon bind/connect host
 - `PARAZETTEL_DAEMON_PORT` / `--daemon-port`: local daemon bind/connect port
-- `PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS` / `--daemon-idle-timeout`: optional idle shutdown window for the daemon
+- `--daemon-idle-timeout`: daemon idle-shutdown window in seconds (default 3600; `0` keeps it always-on). Set in code, not via env var.
 - `PARAZETTEL_MCP_TRANSPORT` / `--transport`: MCP transport, `stdio` or `sse`
 
 ```bash

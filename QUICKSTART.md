@@ -31,8 +31,10 @@ For shared daemon mode:
 export PARAZETTEL_BACKEND_MODE="daemon"
 export PARAZETTEL_DAEMON_HOST="127.0.0.1"
 export PARAZETTEL_DAEMON_PORT="8766"
-export PARAZETTEL_DAEMON_IDLE_TIMEOUT_SECONDS="1800"
 ```
+
+The daemon auto-shuts down after an idle period (default 3600s); override it with
+`--daemon-idle-timeout <seconds>` at startup (`0` keeps it always-on).
 
 ## 4. Start the Shared Daemon
 

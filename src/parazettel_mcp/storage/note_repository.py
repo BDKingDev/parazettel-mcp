@@ -76,6 +76,9 @@ _GRAPH_BACKUP_COPY_ATTEMPTS = 8
 _GRAPH_BACKUP_BACKOFF_SECONDS = 0.05
 _RETRYABLE_GRAPH_COPY_WINERRORS = {5, 32, 33}
 _GRAPH_BATCH_SIZE = 100
+# Notes per progress-logged chunk during the bulk embed (within each chunk the
+# provider further batches at embedding_batch_size). Purely for log granularity.
+_EMBED_LOG_CHUNK = 200
 # Cap how many skipped filenames are inlined into the rebuild warning log so a
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
@@ -299,8 +302,9 @@ class NoteRepository(Repository[Note]):
     def _open_graph_db(self, *, allow_rebuild_if_needed: bool) -> None:
         """Open the configured graph DB, optionally running startup rebuild checks."""
         self.read_only = False
+        bufpool = config.kuzu_buffer_pool_bytes
         try:
-            self.db = init_graph_db(self.graph_db_path)
+            self.db = init_graph_db(self.graph_db_path, buffer_pool_size=bufpool)
         except Exception as exc:
             if not self._is_graph_lock_error(exc):
                 raise
@@ -308,7 +312,9 @@ class NoteRepository(Repository[Note]):
                 "Graph DB at %s is already open elsewhere; falling back to read-only mode.",
                 self.graph_db_path,
             )
-            self.db = init_graph_db(self.graph_db_path, read_only=True)
+            self.db = init_graph_db(
+                self.graph_db_path, read_only=True, buffer_pool_size=bufpool
+            )
             self.read_only = True
         self._closed = False
 
@@ -659,7 +665,9 @@ class NoteRepository(Repository[Note]):
         issued. ``init_graph_db`` creates the schema (and FTS indexes), and the
         handle is fully released afterwards so the file can be swapped in.
         """
-        db = init_graph_db(db_path)
+        db = init_graph_db(
+            db_path, buffer_pool_size=config.kuzu_buffer_pool_bytes
+        )
         try:
             conn = kuzu.Connection(db)
             try:
@@ -1248,31 +1256,55 @@ class NoteRepository(Repository[Note]):
         provider = self._embedding_provider
         if provider is None or not notes:
             return
+        total = len(notes)
         try:
-            # One provider round-trip for both vectors: embed doc texts then title
-            # texts in a single batch, then split (halves remote calls/latency).
-            doc_texts = [self._embedding_text(n) for n in notes]
-            title_texts = [self._title_text(n) for n in notes]
-            all_vectors = provider.embed_documents(doc_texts + title_texts)
-            if len(all_vectors) != 2 * len(notes):
-                # A wrong count would split into mismatched halves, leave the
-                # embedding columns unpopulated (_store_embeddings bails), and
-                # then the indexes below would still be built over NULLs. Abort
-                # the whole build instead (caught below → no index created, search
-                # falls back to BM25 — never an index over incomplete embeddings).
-                raise RuntimeError(
-                    f"Embedding provider returned {len(all_vectors)} vectors for "
-                    f"{2 * len(notes)} expected (doc+title); aborting embedding build."
+            logger.info(
+                "Embedding %d notes (provider=%s, batch=%d)...",
+                total,
+                provider.model_id,
+                # Log the configured batch size (clamped like the providers do)
+                # rather than reaching into a provider-private attribute.
+                max(1, int(getattr(config, "embedding_batch_size", 16))),
+            )
+            # Chunk the bulk embed so progress is visible during the (slow) embed
+            # phase — a single embed_documents call over the whole vault is opaque
+            # and can run for many minutes on CPU. Each chunk embeds its doc texts
+            # then its title texts in one provider round-trip, then splits the
+            # result (halves remote calls/latency vs. embedding them separately).
+            for start in range(0, total, _EMBED_LOG_CHUNK):
+                chunk = notes[start : start + _EMBED_LOG_CHUNK]
+                doc_texts = [self._embedding_text(note) for note in chunk]
+                title_texts = [self._title_text(note) for note in chunk]
+                all_vectors = provider.embed_documents(doc_texts + title_texts)
+                if len(all_vectors) != 2 * len(chunk):
+                    # A wrong count would split into mismatched halves, leave the
+                    # embedding columns unpopulated (_store_embeddings bails), and
+                    # then the indexes below would still be built over NULLs. Abort
+                    # the whole build instead (caught below → no index created,
+                    # search falls back to BM25 — never an index over incomplete
+                    # embeddings).
+                    raise RuntimeError(
+                        f"Embedding provider returned {len(all_vectors)} vectors "
+                        f"for {2 * len(chunk)} expected (doc+title); aborting "
+                        "embedding build."
+                    )
+                vectors = all_vectors[: len(chunk)]
+                title_vectors = all_vectors[len(chunk):]
+                self._store_embeddings(conn, chunk, vectors, title_vectors)
+                logger.info(
+                    "  embedded %d/%d notes", min(start + len(chunk), total), total
                 )
-            vectors = all_vectors[: len(notes)]
-            title_vectors = all_vectors[len(notes):]
-            self._store_embeddings(conn, notes, vectors, title_vectors)
             create_note_vector_index(conn, config.embedding_metric)
             create_note_vector_index(
                 conn,
                 config.embedding_metric,
                 index_name=NOTE_TITLE_VECTOR_INDEX,
                 column="title_embedding",
+            )
+            logger.info(
+                "Built HNSW vector index over %d notes (metric=%s)",
+                total,
+                config.embedding_metric,
             )
         except Exception as exc:
             logger.warning(
