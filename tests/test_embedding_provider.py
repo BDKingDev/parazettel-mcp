@@ -144,3 +144,122 @@ def test_sentence_transformer_passes_batch_size_to_model():
     provider._model = model  # skip the lazy SentenceTransformer load
     provider.embed_documents(["hello"])
     assert model.encode.call_args.kwargs.get("batch_size") == 9
+
+
+def test_factory_forwards_device(monkeypatch):
+    """The factory forwards config.embedding_device to the provider."""
+    # ZettelkastenConfig reads PARAZETTEL_EMBEDDING_DEVICE at construction, so
+    # clear it to keep the CPU-default assertion independent of the runner's env.
+    monkeypatch.delenv("PARAZETTEL_EMBEDDING_DEVICE", raising=False)
+    cfg = ZettelkastenConfig(
+        embedding_enabled=True,
+        embedding_provider="fastembed",
+        embedding_device="cuda",
+    )
+    assert build_embedding_provider(cfg)._device == "cuda"
+    # Default stays on CPU when unset (env cleared above).
+    cfg_cpu = ZettelkastenConfig(embedding_enabled=True, embedding_provider="fastembed")
+    assert build_embedding_provider(cfg_cpu)._device == "cpu"
+
+
+def _fake_fastembed(monkeypatch, captured):
+    """Install a fake `fastembed` whose TextEmbedding records its kwargs."""
+    import sys
+    import types
+
+    class FakeTextEmbedding:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def passage_embed(self, texts, **kwargs):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    module = types.ModuleType("fastembed")
+    module.TextEmbedding = FakeTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", module)
+
+
+def test_fastembed_cuda_selects_provider_and_preloads(monkeypatch):
+    """device='cuda' selects the CUDA execution provider and preloads DLLs."""
+    import sys
+    import types
+
+    captured: dict = {}
+    preloaded = {"called": False}
+    _fake_fastembed(monkeypatch, captured)
+
+    ort = types.ModuleType("onnxruntime")
+    ort.preload_dlls = lambda: preloaded.__setitem__("called", True)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+
+    FastEmbedProvider("m", 4, device="cuda").embed_documents(["hello"])
+    assert captured.get("providers") == [
+        "CUDAExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert preloaded["called"] is True
+
+
+def test_fastembed_cpu_default_omits_providers(monkeypatch):
+    """Default device='cpu' passes no providers (fastembed's CPU default)."""
+    captured: dict = {}
+    _fake_fastembed(monkeypatch, captured)
+    FastEmbedProvider("m", 4).embed_documents(["hello"])
+    assert "providers" not in captured
+
+
+def test_fastembed_cuda_init_failure_falls_back_to_cpu(monkeypatch):
+    """A CUDA init failure (missing GPU runtime) retries without `providers`
+    and succeeds on CPU rather than disabling embeddings entirely."""
+    import sys
+    import types
+
+    inits: list = []
+
+    class FlakyTextEmbedding:
+        def __init__(self, **kwargs):
+            inits.append(kwargs)
+            # Simulate a CPU-only onnxruntime build: the CUDA providers list
+            # raises, but the no-providers (CPU) retry succeeds.
+            if "providers" in kwargs:
+                raise RuntimeError("CUDAExecutionProvider is not available")
+
+        def passage_embed(self, texts, **kwargs):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    module = types.ModuleType("fastembed")
+    module.TextEmbedding = FlakyTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", module)
+    ort = types.ModuleType("onnxruntime")
+    ort.preload_dlls = lambda: None
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+
+    vectors = FastEmbedProvider("m", 4, device="cuda").embed_documents(["hello"])
+
+    assert vectors  # embeddings still produced (did not error out)
+    # First attempt requested CUDA; the retry dropped providers (CPU).
+    assert "providers" in inits[0]
+    assert "providers" not in inits[1]
+
+
+def test_sentence_transformer_cuda_forwards_device(monkeypatch):
+    """device='cuda' forwards device='cuda' to the SentenceTransformer ctor."""
+    import sys
+    import types
+
+    captured: dict = {}
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name, **kwargs):
+            captured["model_name"] = model_name
+            captured["kwargs"] = kwargs
+
+        def encode(self, texts, **kwargs):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    module = types.ModuleType("sentence_transformers")
+    module.SentenceTransformer = FakeSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", module)
+
+    SentenceTransformerProvider("m", 4, device="cuda").embed_documents(["hello"])
+    assert captured["kwargs"].get("device") == "cuda"

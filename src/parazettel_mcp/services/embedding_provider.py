@@ -26,6 +26,7 @@ BM25 / lexical behaviour.
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -33,6 +34,8 @@ try:  # Protocol is stdlib on 3.8+, but guard for clarity.
     from typing import Protocol, runtime_checkable
 except ImportError:  # pragma: no cover
     from typing_extensions import Protocol, runtime_checkable  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -118,6 +121,7 @@ class SentenceTransformerProvider:
         *,
         normalize: bool = True,
         batch_size: int = 16,
+        device: str = "cpu",
     ) -> None:
         """Configure the model name, output dim, normalization, and batch size."""
         if dim <= 0:
@@ -127,6 +131,7 @@ class SentenceTransformerProvider:
         self.model_id = f"sentence-transformers:{model_name}:{dim}"
         self._normalize = normalize
         self._batch_size = max(1, int(batch_size))
+        self._device = (device or "cpu").strip().lower()
         self._model = None  # lazy-loaded on first use
 
     def _ensure_model(self):  # type: ignore[no-untyped-def]
@@ -140,7 +145,14 @@ class SentenceTransformerProvider:
                     "but the package is not installed. Install the optional "
                     "dependency group: pip install 'parazettel-mcp[embeddings]'"
                 ) from exc
-            self._model = SentenceTransformer(self.model_name)
+            st_kwargs: Dict[str, Any] = {}
+            # "auto" lets sentence-transformers pick (CUDA if a CUDA torch is
+            # present); "cuda"/"gpu" force the GPU; "cpu" pins to CPU.
+            if self._device in ("cuda", "gpu"):
+                st_kwargs["device"] = "cuda"
+            elif self._device == "cpu":
+                st_kwargs["device"] = "cpu"
+            self._model = SentenceTransformer(self.model_name, **st_kwargs)
         return self._model
 
     def _has_prompt(self, name: str) -> bool:
@@ -192,6 +204,14 @@ class FastEmbedProvider:
     used so query and document text are embedded asymmetrically.
     """
 
+    # ONNX Runtime execution providers per device. CUDA needs the GPU extra
+    # (onnxruntime-gpu via [embeddings-lite-gpu]); CPU is kept as a fallback so a
+    # missing GPU runtime degrades to CPU instead of erroring.
+    _DEVICE_PROVIDERS = {
+        "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "gpu": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    }
+
     def __init__(
         self,
         model_name: str,
@@ -199,6 +219,7 @@ class FastEmbedProvider:
         *,
         normalize: bool = True,
         batch_size: int = 16,
+        device: str = "cpu",
     ) -> None:
         """Configure the model name, output dim, normalization, and batch size."""
         if dim <= 0:
@@ -208,7 +229,25 @@ class FastEmbedProvider:
         self.model_id = f"fastembed:{model_name}:{dim}"
         self._normalize = normalize
         self._batch_size = max(1, int(batch_size))
+        self._device = (device or "cpu").strip().lower()
         self._model = None  # lazy-loaded on first use
+
+    @staticmethod
+    def _preload_cuda_dlls() -> None:
+        """Best-effort load of the CUDA/cuDNN DLLs shipped in the nvidia-* wheels.
+
+        onnxruntime-gpu locates its CUDA runtime from the installed ``nvidia-*``
+        pip packages only after an explicit preload; this is a no-op on a
+        CPU-only onnxruntime build, so it is always safe to call.
+        """
+        try:
+            import onnxruntime
+
+            preload = getattr(onnxruntime, "preload_dlls", None)
+            if preload is not None:
+                preload()
+        except Exception:  # pragma: no cover - preload is best-effort
+            pass
 
     def _ensure_model(self):  # type: ignore[no-untyped-def]
         """Lazily load the fastembed model, or explain the missing extra."""
@@ -219,9 +258,31 @@ class FastEmbedProvider:
                 raise RuntimeError(
                     "Embeddings are enabled with provider 'fastembed' but the "
                     "package is not installed. Install the optional dependency "
-                    "group: pip install 'parazettel-mcp[embeddings-lite]'"
+                    "group: pip install 'parazettel-mcp[embeddings-lite]' "
+                    "(or [embeddings-lite-gpu] for CUDA)."
                 ) from exc
-            self._model = TextEmbedding(model_name=self.model_name)
+            kwargs: Dict[str, Any] = {"model_name": self.model_name}
+            providers = self._DEVICE_PROVIDERS.get(self._device)
+            if providers:
+                self._preload_cuda_dlls()
+                kwargs["providers"] = providers
+            try:
+                self._model = TextEmbedding(**kwargs)
+            except Exception as exc:
+                # A CUDA providers list fails on a CPU-only onnxruntime build or
+                # when the GPU runtime libs are missing. Honour the documented
+                # "falls back to CPU" contract by retrying without `providers`
+                # rather than disabling embeddings entirely. Re-raise if we were
+                # already on the CPU path (no providers) — that's a real error.
+                if "providers" not in kwargs:
+                    raise
+                logger.warning(
+                    "fastembed CUDA init failed (%s); falling back to the CPU "
+                    "execution provider.",
+                    exc,
+                )
+                kwargs.pop("providers")
+                self._model = TextEmbedding(**kwargs)
         return self._model
 
     def _finalize(self, raw) -> List[List[float]]:  # type: ignore[no-untyped-def]
@@ -274,11 +335,14 @@ def build_embedding_provider(config) -> Optional[EmbeddingProvider]:  # type: ig
     name = (config.embedding_provider or "").strip().lower()
     dim = config.embedding_dim
     batch_size = getattr(config, "embedding_batch_size", 16)
+    device = getattr(config, "embedding_device", "cpu")
     if name in ("fastembed", "fast-embed", "lite"):
-        return FastEmbedProvider(config.embedding_model, dim, batch_size=batch_size)
+        return FastEmbedProvider(
+            config.embedding_model, dim, batch_size=batch_size, device=device
+        )
     if name in ("sentence-transformers", "sentence_transformers", "st"):
         return SentenceTransformerProvider(
-            config.embedding_model, dim, batch_size=batch_size
+            config.embedding_model, dim, batch_size=batch_size, device=device
         )
     if name == "hash":
         return HashEmbeddingProvider(dim)

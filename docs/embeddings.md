@@ -36,6 +36,7 @@ install tier (below). When disabled, the system behaves exactly as before
 | --- | --- | --- | --- | --- |
 | base | *(none)* | `hash` | — | 0 ML deps (smoke/test only; not semantic) |
 | **lite** (default) | `pip install 'parazettel-mcp[embeddings-lite]'` | `fastembed` | `BAAI/bge-small-en-v1.5` (384d) | ONNX, ~200 MB, no PyTorch, no HF gating |
+| lite-gpu | `pip install 'parazettel-mcp[embeddings-lite-gpu]'` | `fastembed` | (same as lite) | lite + onnxruntime-gpu + CUDA 12 wheels; set `PARAZETTEL_EMBEDDING_DEVICE=cuda` |
 | full | `pip install 'parazettel-mcp[embeddings]'` | `sentence-transformers` | `google/embeddinggemma-300m` (768d) | PyTorch ~2 GB, top quality, HF-gated |
 
 ## Config (env vars)
@@ -45,6 +46,9 @@ install tier (below). When disabled, the system behaves exactly as before
 - `PARAZETTEL_EMBEDDING_MODEL`
 - `PARAZETTEL_EMBEDDING_DIM` (must match the model; Matryoshka models may truncate)
 - `PARAZETTEL_EMBEDDING_METRIC` (`cosine` | `l2` | `dotproduct`)
+- `PARAZETTEL_EMBEDDING_DEVICE` (default `cpu`; `cuda` to run on an NVIDIA GPU) —
+  needs the GPU install (`[embeddings-lite-gpu]`, or a CUDA torch build for the
+  full tier). See **GPU acceleration** below.
 - `PARAZETTEL_EMBEDDING_BATCH_SIZE` (default `16`) — bulk-embedding batch size.
   Keep it small for large models: the attention tensor is `batch x heads x seq^2`,
   so e.g. mxbai-large at the embedding library's default of 256 needs ~4 GB per
@@ -70,6 +74,34 @@ no PyTorch, no HF gating) includes large models too:
 
 EmbeddingGemma is gated (accept Google's license + a HuggingFace token) and only
 runs on the full/torch tier; the beefy fastembed models avoid both.
+
+## GPU acceleration
+
+Local embedding inference runs on CPU by default. On an NVIDIA GPU it is ~2-3
+orders of magnitude faster per document (e.g. ~1 ms/doc vs ~hundreds of ms on
+CPU), which turns a multi-minute full-vault rebuild into seconds and makes a
+heavier model — or a create-time cross-encoder reranker — practical.
+
+Lite tier (fastembed / ONNX Runtime):
+
+1. `pip install 'parazettel-mcp[embeddings-lite-gpu]'`. This pulls
+   `onnxruntime-gpu` plus the `nvidia-*-cu12` runtime wheels (CUDA 12 + cuDNN 9),
+   so **no system CUDA toolkit is required**. The CUDA 12 build runs on newer
+   CUDA drivers (drivers are backward-compatible).
+2. Set `PARAZETTEL_EMBEDDING_DEVICE=cuda` on the server env (alongside the other
+   `PARAZETTEL_EMBEDDING_*` vars).
+3. Restart the daemon. The provider selects the `CUDAExecutionProvider` and calls
+   `onnxruntime.preload_dlls()` so ORT finds the CUDA/cuDNN DLLs in the nvidia-*
+   wheels. If the GPU runtime is unavailable it falls back to CPU rather than
+   failing. Confirm with `onnxruntime.get_available_providers()` (should list
+   `CUDAExecutionProvider`).
+
+Full tier (sentence-transformers / PyTorch): install a CUDA build of torch and
+set `PARAZETTEL_EMBEDDING_DEVICE=cuda`; the provider passes `device="cuda"` to
+`SentenceTransformer`.
+
+The GPU's larger memory also lifts the CPU 4 GB-attention limit, so
+`PARAZETTEL_EMBEDDING_BATCH_SIZE` can be raised well above 16 on GPU.
 
 ## Enabling on a vault (runbook)
 
