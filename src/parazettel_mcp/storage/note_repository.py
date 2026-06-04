@@ -28,6 +28,7 @@ import kuzu
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.graph_db import (
+    NOTE_TITLE_VECTOR_INDEX,
     NOTE_VECTOR_INDEX,
     GraphDatabaseReadOnlyError,
     close_graph_db,
@@ -88,6 +89,12 @@ _BRUTE_FORCE_DISTANCE = {
     "cosine": "1.0 - array_cosine_similarity(p.embedding, $q)",
     "l2": "array_distance(p.embedding, $q)",
     "dotproduct": "-array_dot_product(p.embedding, $q)",
+}
+# Same distances over the dirty-set's *title* vector (dual-vector recall).
+_BRUTE_FORCE_DISTANCE_TITLE = {
+    "cosine": "1.0 - array_cosine_similarity(p.title_embedding, $q)",
+    "l2": "array_distance(p.title_embedding, $q)",
+    "dotproduct": "-array_dot_product(p.title_embedding, $q)",
 }
 
 _NOTE_SELECT = (
@@ -1185,6 +1192,11 @@ class NoteRepository(Repository[Note]):
         """Return the text embedded for a note: its title plus body."""
         return f"{note.title or ''}\n\n{note.content or ''}".strip()
 
+    @staticmethod
+    def _title_text(note: Note) -> str:
+        """Return the note's title — embedded as a second 'atomic claim' vector."""
+        return (note.title or "").strip()
+
     def _ensure_embedding_schema(self) -> None:
         """Idempotently add the embedding columns to the live graph DB."""
         try:
@@ -1198,33 +1210,36 @@ class NoteRepository(Repository[Note]):
         conn: kuzu.Connection,
         notes: List[Note],
         vectors: List[List[float]],
+        title_vectors: List[List[float]],
     ) -> None:
-        """Write precomputed vectors onto their Note nodes (column must exist).
+        """Write precomputed doc + title vectors onto their Note nodes.
 
-        Runs during the fresh rebuild *before* the HNSW index is created, so the
-        column is still writable; these vectors are then folded into the index.
+        Runs during the fresh rebuild *before* the HNSW indexes are created, so the
+        columns are still writable; these vectors are then folded into the indexes.
         """
-        if len(vectors) != len(notes):
+        if len(vectors) != len(notes) or len(title_vectors) != len(notes):
             # A provider returning the wrong count would silently leave some
             # notes unembedded (or drop vectors); skip rather than build the
             # index over a partially-populated column.
             logger.warning(
-                "Embedding provider returned %d vectors for %d notes; "
-                "skipping embedding storage for this rebuild.",
+                "Embedding provider returned %d doc / %d title vectors for %d "
+                "notes; skipping embedding storage for this rebuild.",
                 len(vectors),
+                len(title_vectors),
                 len(notes),
             )
             return
         model_id = self._embedding_provider.model_id  # type: ignore[union-attr]
         now = datetime.datetime.now()
-        for note, vector in zip(notes, vectors):
+        for note, vector, title_vector in zip(notes, vectors, title_vectors):
             conn.execute(
                 "MATCH (n:Note {id: $id}) "
-                "SET n.embedding = $embedding, n.embedded_at = $embedded_at, "
-                "n.embedding_model = $model",
+                "SET n.embedding = $embedding, n.title_embedding = $title_embedding, "
+                "n.embedded_at = $embedded_at, n.embedding_model = $model",
                 {
                     "id": note.id,
                     "embedding": vector,
+                    "title_embedding": title_vector,
                     "embedded_at": now,
                     "model": model_id,
                 },
@@ -1253,27 +1268,39 @@ class NoteRepository(Repository[Note]):
             )
             # Chunk the bulk embed so progress is visible during the (slow) embed
             # phase — a single embed_documents call over the whole vault is opaque
-            # and can run for many minutes on CPU.
+            # and can run for many minutes on CPU. Each chunk embeds its doc texts
+            # then its title texts in one provider round-trip, then splits the
+            # result (halves remote calls/latency vs. embedding them separately).
             for start in range(0, total, _EMBED_LOG_CHUNK):
                 chunk = notes[start : start + _EMBED_LOG_CHUNK]
-                vectors = provider.embed_documents(
-                    [self._embedding_text(note) for note in chunk]
-                )
-                if len(vectors) != len(chunk):
-                    # Abort the whole build on a count mismatch rather than storing
-                    # only some chunks and then indexing: that would build the HNSW
-                    # index over a partially-populated column. Raising here is caught
-                    # below, so index creation is skipped and search falls back to
-                    # BM25 (no index over incomplete embeddings).
+                doc_texts = [self._embedding_text(note) for note in chunk]
+                title_texts = [self._title_text(note) for note in chunk]
+                all_vectors = provider.embed_documents(doc_texts + title_texts)
+                if len(all_vectors) != 2 * len(chunk):
+                    # A wrong count would split into mismatched halves, leave the
+                    # embedding columns unpopulated (_store_embeddings bails), and
+                    # then the indexes below would still be built over NULLs. Abort
+                    # the whole build instead (caught below → no index created,
+                    # search falls back to BM25 — never an index over incomplete
+                    # embeddings).
                     raise RuntimeError(
-                        f"Embedding provider returned {len(vectors)} vectors for "
-                        f"{len(chunk)} notes; aborting embedding build."
+                        f"Embedding provider returned {len(all_vectors)} vectors "
+                        f"for {2 * len(chunk)} expected (doc+title); aborting "
+                        "embedding build."
                     )
-                self._store_embeddings(conn, chunk, vectors)
+                vectors = all_vectors[: len(chunk)]
+                title_vectors = all_vectors[len(chunk):]
+                self._store_embeddings(conn, chunk, vectors, title_vectors)
                 logger.info(
                     "  embedded %d/%d notes", min(start + len(chunk), total), total
                 )
             create_note_vector_index(conn, config.embedding_metric)
+            create_note_vector_index(
+                conn,
+                config.embedding_metric,
+                index_name=NOTE_TITLE_VECTOR_INDEX,
+                column="title_embedding",
+            )
             logger.info(
                 "Built HNSW vector index over %d notes (metric=%s)",
                 total,
@@ -1301,14 +1328,17 @@ class NoteRepository(Repository[Note]):
         if provider is None:
             return
         try:
-            vector = provider.embed_documents([self._embedding_text(note)])[0]
+            vector, title_vector = provider.embed_documents(
+                [self._embedding_text(note), self._title_text(note)]
+            )
             conn.execute(
                 "MERGE (p:PendingEmbedding {id: $id}) "
-                "SET p.embedding = $embedding, p.embedded_at = $embedded_at, "
-                "p.embedding_model = $model",
+                "SET p.embedding = $embedding, p.title_embedding = $title_embedding, "
+                "p.embedded_at = $embedded_at, p.embedding_model = $model",
                 {
                     "id": note.id,
                     "embedding": vector,
+                    "title_embedding": title_vector,
                     "embedded_at": datetime.datetime.now(),
                     "model": provider.model_id,
                 },
@@ -1331,42 +1361,71 @@ class NoteRepository(Repository[Note]):
             return {}
         model_id = self._embedding_provider.model_id
         metric = (config.embedding_metric or "cosine").strip().lower()
-        dist_expr = _BRUTE_FORCE_DISTANCE.get(metric, _BRUTE_FORCE_DISTANCE["cosine"])
-        distance_by_id: Dict[str, float] = {}
+        doc_expr = _BRUTE_FORCE_DISTANCE.get(metric, _BRUTE_FORCE_DISTANCE["cosine"])
+        title_expr = _BRUTE_FORCE_DISTANCE_TITLE.get(
+            metric, _BRUTE_FORCE_DISTANCE_TITLE["cosine"]
+        )
+
+        def merge_min(target: Dict[str, float], note_id: str, dist: float) -> None:
+            if note_id not in target or dist < target[note_id]:
+                target[note_id] = dist
+
+        # Over-fetch per source: the doc- and title-index top-k can overlap, and
+        # HNSW recall is approximate, so taking only `limit` from each can yield
+        # fewer than `limit` distinct notes (or miss a true match). Fetch a wider
+        # band from each source; the caller re-sorts the merged map by distance
+        # and truncates to `limit`.
+        fetch_k = max(1, limit) * 2
+
+        index_dist: Dict[str, float] = {}
+        pending_dist: Dict[str, float] = {}
         try:
             with self._connection() as conn:
-                if (
-                    note_vector_index_exists(conn)
-                    and self._indexed_embedding_model(conn) == model_id
-                ):
+                # Query the doc index and the title index; keep the closer of the
+                # two per note (a note surfaces if its body OR its title matches).
+                if self._indexed_embedding_model(conn) == model_id:
+                    for index_name in (NOTE_VECTOR_INDEX, NOTE_TITLE_VECTOR_INDEX):
+                        if not note_vector_index_exists(conn, index_name):
+                            continue
+                        try:
+                            hnsw = conn.execute(
+                                "CALL QUERY_VECTOR_INDEX("
+                                f"'Note', '{index_name}', $q, $k"
+                                ") RETURN node.id AS id, distance ORDER BY distance",
+                                {"q": query_vector, "k": fetch_k},
+                            )
+                            while hnsw.has_next():
+                                row = hnsw.get_next()
+                                merge_min(index_dist, row[0], float(row[1]))
+                        except Exception as exc:
+                            logger.warning(
+                                "HNSW vector query (%s) failed: %s", index_name, exc
+                            )
+                # Brute-force the dirty set over both doc and title vectors.
+                for column, expr in (("embedding", doc_expr),
+                                     ("title_embedding", title_expr)):
                     try:
-                        hnsw = conn.execute(
-                            "CALL QUERY_VECTOR_INDEX("
-                            f"'Note', '{NOTE_VECTOR_INDEX}', $q, $k"
-                            ") RETURN node.id AS id, distance ORDER BY distance",
-                            {"q": query_vector, "k": limit},
+                        brute = conn.execute(
+                            "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
+                            f"WHERE p.{column} IS NOT NULL "
+                            "AND p.embedding_model = $model "
+                            f"RETURN p.id AS id, {expr} AS dist "
+                            "ORDER BY dist LIMIT $k",
+                            {"q": query_vector, "model": model_id, "k": fetch_k},
                         )
-                        while hnsw.has_next():
-                            row = hnsw.get_next()
-                            distance_by_id[row[0]] = float(row[1])
+                        while brute.has_next():
+                            row = brute.get_next()
+                            merge_min(pending_dist, row[0], float(row[1]))
                     except Exception as exc:
-                        logger.warning("HNSW vector query failed: %s", exc)
-                try:
-                    brute = conn.execute(
-                        "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
-                        "WHERE p.embedding IS NOT NULL AND p.embedding_model = $model "
-                        f"RETURN p.id AS id, {dist_expr} AS dist "
-                        "ORDER BY dist LIMIT $k",
-                        {"q": query_vector, "model": model_id, "k": limit},
-                    )
-                    while brute.has_next():
-                        row = brute.get_next()
-                        distance_by_id[row[0]] = float(row[1])
-                except Exception as exc:
-                    logger.warning("Brute-force vector fallback failed: %s", exc)
+                        logger.warning(
+                            "Brute-force vector fallback (%s) failed: %s", column, exc
+                        )
         except Exception as exc:
             logger.warning("Vector search failed: %s", exc)
             return {}
+        # Dirty (pending) vectors override stale index entries for the same id.
+        distance_by_id = dict(index_dist)
+        distance_by_id.update(pending_dist)
         return distance_by_id
 
     def vector_search(self, text: str, limit: int = 50) -> List[Tuple[str, float]]:
