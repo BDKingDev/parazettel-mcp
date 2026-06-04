@@ -54,6 +54,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "check_consistency",
         "export_note",
         "find_similar_notes",
+        "find_similar_to_text",
         "create_task",
         "update_task",
         "update_task_status",

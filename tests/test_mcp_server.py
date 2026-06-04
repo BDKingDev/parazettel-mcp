@@ -80,6 +80,16 @@ class TestMcpServer:
 
         self.mock_mcp.run.assert_called_once_with(transport="sse")
 
+    def test_find_similar_to_text_rejects_nonpositive_limit(self):
+        """limit<=0 returns a clear validation message instead of delegating to
+        the service and reporting the misleading 'no notes found'."""
+        tool = self.registered_tools["pzk_find_similar_to_text"]
+        zero_result = tool(text="a draft claim", limit=0)
+        negative_result = tool(text="a draft claim", limit=-1)
+        assert "Limit must be greater than 0." in zero_result
+        assert "Limit must be greater than 0." in negative_result
+        self.mock_zettel_service.find_similar_to_text.assert_not_called()
+
     def test_create_note_tool(self):
         """Test the pzk_create_note tool."""
         # Check the tool is registered

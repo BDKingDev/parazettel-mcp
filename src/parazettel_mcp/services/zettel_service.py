@@ -665,6 +665,35 @@ class ZettelService:
             return self._find_similar_semantic(note, threshold)
         return self._find_similar_lexical(note, threshold)
 
+    def find_similar_to_text(
+        self, text: str, threshold: float = 0.5, limit: int = 10
+    ) -> List[Tuple[Note, float]]:
+        """Find existing notes semantically similar to raw *text* (no note needed).
+
+        Unlike :meth:`find_similar_notes`, the input need not be a stored note:
+        the text is embedded as a search query and existing notes are returned as
+        ``(Note, cosine_similarity)`` sorted high→low. Use this for a pre-create
+        cross-vocabulary duplicate/overlap check on a *draft* candidate, which
+        note-to-note similarity can't do because the draft has no ID yet.
+
+        Returns ``[]`` when embeddings are disabled or the repository has no vector
+        search, so callers fall back to BM25 (``search_combined`` / search_notes).
+        """
+        if not text or not text.strip() or limit <= 0:
+            return []
+        if not (config.embedding_enabled and hasattr(self.repository, "vector_search")):
+            return []
+        results: List[Tuple[Note, float]] = []
+        for note_id, distance in self.repository.vector_search(text, limit):
+            note = self.repository.get(note_id)
+            if note is None:
+                continue
+            similarity = self._semantic_similarity(float(distance))
+            if similarity >= threshold:
+                results.append((note, similarity))
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:limit]
+
     def _similarity_context(
         self, note: Note
     ) -> Tuple[Set[str], Set[str], Set[str]]:
