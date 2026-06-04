@@ -18,6 +18,17 @@ if _REPO_ENV_PATH.exists():
     load_dotenv(_REPO_ENV_PATH, override=False)
 
 
+# --- Dedup-on-create reranker defaults (code constants, not env-configurable) ---
+# Cross-encoder that confirms BM25 dedup candidates: it reads both notes together
+# and is far more precise than BM25 alone, which over-flags on shared vocabulary
+# (true duplicates scored ~7-9, distinct-but-adjacent notes <~1 in testing). The
+# 80 MB ms-marco model is lite-tier-friendly. Empty string disables the confirm.
+DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+# Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
+# if the model changes.
+DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+
+
 class ZettelkastenConfig(BaseModel):
     """Configuration for the Zettelkasten server."""
 
@@ -127,6 +138,11 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
+    # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
+    # active when embeddings are enabled; empty string disables the rerank confirm
+    # (dedup falls back to the BM25 prefilter alone).
+    dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
+    dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""

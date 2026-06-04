@@ -59,6 +59,8 @@ class TestMcpServer:
 
         # Create a server instance AFTER setting up the mocks
         self.server = ZettelkastenMcpServer()
+        # Default to BM25-only dedup; the rerank tests opt in with a fake reranker.
+        self.server._reranker = None
 
     def teardown_method(self):
         """Clean up after each test."""
@@ -185,6 +187,74 @@ class TestMcpServer:
         assert "new123" in result
         self.mock_search_service.search_combined.assert_not_called()
         self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_note_rerank_drops_bm25_false_positive(self):
+        """A strong BM25 match the reranker scores below threshold does NOT block."""
+        adjacent = SimpleNamespace(
+            id="adj1",
+            title="A topically adjacent note",
+            content="Shares vocabulary but makes a different claim.",
+            tags=[],
+            note_type=NoteType.PERMANENT,
+        )
+        match = SimpleNamespace(
+            note=adjacent, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+        # Reranker says "not a duplicate" (below the default threshold of 3.0).
+        self.server._reranker = SimpleNamespace(score=lambda q, docs: [0.5 for _ in docs])
+
+        created = SimpleNamespace(id="new-rr-1")
+        self.mock_zettel_service.create_note.return_value = created
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="A genuinely different idea",
+            content="A distinct claim that merely shares some words.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        assert "successfully" in result
+        assert "new-rr-1" in result
+        self.mock_zettel_service.create_note.assert_called_once()
+
+    def test_create_note_rerank_confirms_true_duplicate(self):
+        """A BM25 match the reranker scores above threshold blocks creation."""
+        existing = SimpleNamespace(
+            id="dup-rr-9",
+            title="The same idea, reworded",
+            content="The identical claim expressed in different words.",
+            tags=[],
+            note_type=NoteType.PERMANENT,
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+        # Reranker confirms the duplicate (above the default threshold of 3.0).
+        self.server._reranker = SimpleNamespace(score=lambda q, docs: [9.0 for _ in docs])
+
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="The same idea",
+            content="The identical claim, in my own words.",
+            note_type="permanent",
+            source="transcript",
+            area_id="area123",
+        )
+
+        assert "Not created" in result
+        assert "dup-rr-9" in result
+        self.mock_zettel_service.create_note.assert_not_called()
 
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""
