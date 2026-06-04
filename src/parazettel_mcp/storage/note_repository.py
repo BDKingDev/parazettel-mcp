@@ -1242,7 +1242,9 @@ class NoteRepository(Repository[Note]):
                 "Embedding %d notes (provider=%s, batch=%d)...",
                 total,
                 provider.model_id,
-                getattr(provider, "_batch_size", 0),
+                # Log the configured batch size (clamped like the providers do)
+                # rather than reaching into a provider-private attribute.
+                max(1, int(getattr(config, "embedding_batch_size", 16))),
             )
             # Chunk the bulk embed so progress is visible during the (slow) embed
             # phase — a single embed_documents call over the whole vault is opaque
