@@ -21,6 +21,7 @@ from parazettel_mcp.models.schema import (
     NoteType,
     Tag,
 )
+from parazettel_mcp.services.reranker import build_reranker
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
 
@@ -106,6 +107,10 @@ class ZettelkastenMcpServer:
         self.backend = self._build_backend()
         self.zettel_service = self.backend.zettel_service
         self.search_service = self.backend.search_service
+        # Optional cross-encoder that confirms dedup-on-create candidates. Built
+        # cheaply here (the model is loaded lazily on first use); None when the
+        # feature is off, in which case dedup uses the BM25 prefilter alone.
+        self._reranker = build_reranker(config)
         # Initialize services
         self.initialize()
         # Register tools
@@ -205,7 +210,56 @@ class ZettelkastenMcpServer:
             candidates.append((result.note, float(score)))
             if len(candidates) >= _DEDUP_MAX_CANDIDATES:
                 break
-        return candidates
+        return self._rerank_confirm(title, content, candidates)
+
+    @staticmethod
+    def _dedup_text(title: str, content: str) -> str:
+        """Combine title + a content lead into the text the reranker compares."""
+        # Slice before strip so a large note body isn't fully stripped just to
+        # take a 600-char lead (mirrors _find_duplicate_candidates' content lead).
+        body = (content or "")[:600].strip()
+        return f"{(title or '').strip()}\n{body}".strip()
+
+    def _rerank_confirm(
+        self, title: str, content: str, candidates: List[Tuple[Note, float]]
+    ) -> List[Tuple[Note, float]]:
+        """Keep only BM25 candidates a cross-encoder confirms as true duplicates.
+
+        BM25 over-flags on shared vocabulary; the reranker reads both notes
+        together and is far more precise, so it drops topically-adjacent-but-
+        distinct false positives. Best-effort: if the reranker is disabled or
+        fails to load/score, the BM25 candidates pass through unchanged — dedup
+        must never crash or block creation on a flaky probe.
+        """
+        if not candidates or self._reranker is None:
+            return candidates
+        query = self._dedup_text(title, content)
+        documents = [
+            self._dedup_text(note.title, note.content) for note, _ in candidates
+        ]
+        try:
+            scores = self._reranker.score(query, documents)
+        except Exception as exc:  # pragma: no cover - advisory only
+            logger.warning("Dedup rerank skipped (reranker failed): %s", exc)
+            return candidates
+        if len(scores) != len(candidates):
+            logger.warning(
+                "Dedup rerank skipped (unexpected score count): expected %d, got %d",
+                len(candidates),
+                len(scores),
+            )
+            return candidates
+        threshold = config.dedup_rerank_min_score
+        confirmed: List[Tuple[Note, float]] = []
+        for (note, bm25), rerank_score in zip(candidates, scores):
+            if not isinstance(rerank_score, (int, float)):
+                # A non-numeric score would crash the threshold compare; stay
+                # best-effort and fall back to the BM25 candidates.
+                logger.warning("Dedup rerank skipped (non-numeric score %r)", rerank_score)
+                return candidates
+            if rerank_score >= threshold:
+                confirmed.append((note, bm25))
+        return confirmed
 
     @staticmethod
     def _format_duplicate_warning(

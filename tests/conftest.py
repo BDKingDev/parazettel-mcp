@@ -12,6 +12,20 @@ from parazettel_mcp.services.zettel_service import ZettelService
 from parazettel_mcp.storage.note_repository import NoteRepository
 
 
+@pytest.fixture(autouse=True)
+def _disable_dedup_reranker():
+    """Keep the dedup cross-encoder off by default so no test downloads a model.
+
+    Reranker-specific tests use their own config instances or inject a fake, so
+    this only guards against an unrelated test accidentally triggering a real
+    model load via the global config singleton.
+    """
+    original = config.dedup_rerank_model
+    config.dedup_rerank_model = ""
+    yield
+    config.dedup_rerank_model = original
+
+
 @pytest.fixture
 def temp_dirs():
     """Create workspace-local directories for notes and graph database."""

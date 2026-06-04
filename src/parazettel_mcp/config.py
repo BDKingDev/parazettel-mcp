@@ -30,6 +30,16 @@ DEFAULT_KUZU_BUFFER_POOL_BYTES = 0
 # holding the Kuzu DB and embedding model forever.
 DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 3600.0
 
+# --- Dedup-on-create reranker defaults (code constants, not env-configurable) ---
+# Cross-encoder that confirms BM25 dedup candidates: it reads both notes together
+# and is far more precise than BM25 alone, which over-flags on shared vocabulary
+# (true duplicates scored ~7-9, distinct-but-adjacent notes <~1 in testing). The
+# 80 MB ms-marco model is lite-tier-friendly. Empty string disables the confirm.
+DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
+# Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
+# if the model changes.
+DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+
 
 class ZettelkastenConfig(BaseModel):
     """Configuration for the Zettelkasten server."""
@@ -160,6 +170,11 @@ class ZettelkastenConfig(BaseModel):
     )
     # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
     kuzu_buffer_pool_bytes: int = Field(default=DEFAULT_KUZU_BUFFER_POOL_BYTES)
+    # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
+    # active when embeddings are enabled; empty string disables the rerank confirm
+    # (dedup falls back to the BM25 prefilter alone).
+    dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
+    dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""
