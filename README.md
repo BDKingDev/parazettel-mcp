@@ -90,6 +90,13 @@ Applies to any note type. Tasks flow through the action lifecycle; knowledge not
 | `part_of` | `has_part` | Task/note belongs to a project or area |
 | `blocks` | `blocked_by` | One task blocks another |
 
+**Membership is bidirectional at the graph layer.** Every routed note carries an explicit `part_of` link to its container (its project when routed through one, otherwise its area) in both markdown and graph. The container's `has_part` counter link comes in two forms:
+
+- **Projects** materialize `has_part` lines in their markdown (bounded membership).
+- **Areas** get a *derived* `has_part` graph edge per direct member, computed at index time from the member's `area_id` frontmatter — never written into the area's markdown. An area can have hundreds of direct members; a 500-line `## Links` section would make the area file, its embedding, and every fetch unusable. Because the edge derives from the member file (the source of truth), rebuilds reproduce it. `pzk_get_linked_notes` on an area shows all members either way.
+
+To upgrade a vault created before this contract, run `python scripts/backfill_counter_links.py` (dry-run; `--apply` to execute with an automatic notes backup).
+
 Parazettel also understands Obsidian-style piped wiki-links such as `[[NOTE_ID|Displayed Title]]`. On ingest, the target note ID is normalized from the link target, so aliases and heading fragments do not break indexing. When a note is rewritten, touched wiki-links are normalized to the target note title when the alias is safe to render. Renaming a note refreshes incoming title aliases (in both `## Links` and prose), and deleting a note scrubs incoming references everywhere — `## Links` entries are removed and inline prose refs are unlinked in place (the alias or title text remains so the sentence stays readable).
 
 **Inline prose links.** A `[[NOTE_ID]]` mention in a note's body (outside `## Links`) is indexed as a derived `inline` graph edge, so traversal, centrality, and similarity see it. Inline edges are never written into `## Links` and cannot be created via `pzk_create_link` — they exist purely as a reflection of the note text.
