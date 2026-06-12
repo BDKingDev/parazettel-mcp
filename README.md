@@ -331,8 +331,16 @@ Rerunning the migration against an existing target updates current notes and lin
 
 ```bash
 uv sync --extra dev
-.venv/bin/python -m pytest tests/
+.venv/bin/python -m pytest tests/ -n 4 --dist loadgroup
 ```
+
+`-n 4 --dist loadgroup` runs the suite in parallel (~2 min vs ~5.5 min serial).
+Tests that perform a real index rebuild are automatically collected into one
+xdist group (see `tests/conftest.py`) so no two rebuilds run concurrently —
+concurrent rebuilds are the suite's known flake source. Each test gets a
+private graph database seeded by file-copying a once-per-session template, so
+isolation is preserved without paying full schema + FTS-index creation per
+test.
 
 See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-tool testing walkthrough using the live MCP server.
 

@@ -1,5 +1,6 @@
 """Common test fixtures for the Zettelkasten MCP server."""
 
+import inspect
 import shutil
 from pathlib import Path
 from uuid import uuid4
@@ -10,6 +11,30 @@ from parazettel_mcp.config import config
 from parazettel_mcp.models import graph_db
 from parazettel_mcp.services.zettel_service import ZettelService
 from parazettel_mcp.storage.note_repository import NoteRepository
+
+# Tests that perform a REAL index rebuild are serialized into one xdist group:
+# each rebuild opens two Kuzu databases (live + fresh temp) plus file-copy
+# backups, and concurrent rebuilds across workers are the suite's known flake
+# source under high parallelism. Run the suite with:
+#
+#     pytest -n 4 --dist loadgroup
+#
+# The marker is applied automatically below — any test whose source mentions
+# a rebuild joins the group, so new rebuild tests don't need a decorator.
+_REBUILD_GROUP = "kuzu_rebuild"
+
+
+def pytest_collection_modifyitems(config, items):  # noqa: ARG001
+    for item in items:
+        func = getattr(item, "function", None)
+        if func is None:
+            continue
+        try:
+            source = inspect.getsource(func)
+        except (OSError, TypeError):
+            source = ""
+        if "rebuild" in source or "rebuild" in item.name:
+            item.add_marker(pytest.mark.xdist_group(_REBUILD_GROUP))
 
 
 @pytest.fixture(autouse=True)
@@ -42,11 +67,56 @@ def temp_dirs():
         shutil.rmtree(test_root, ignore_errors=True)
 
 
+@pytest.fixture(scope="session")
+def graph_db_template():
+    """Build ONE initialized empty graph DB per test session (the 'beforeAll').
+
+    Creating a fresh Kuzu database costs ~0.8s, almost all of it spent building
+    the three full-text indexes — and the suite was paying that per test.
+    Opening a file copy of an already-initialized database costs ~0.1s, so each
+    test gets a private copy of this template instead: identical isolation,
+    ~8x cheaper setup. Under pytest-xdist each worker process builds its own
+    template (session scope is per worker).
+    """
+    template_root = (
+        Path(__file__).resolve().parents[1]
+        / ".tmp"
+        / "test-fixtures"
+        / f"_template-{uuid4().hex}"
+    )
+    template_root.mkdir(parents=True, exist_ok=True)
+    template_path = template_root / "template.kuzu"
+    original_default = graph_db._DEFAULT_BUFFER_POOL_SIZE
+    graph_db._DEFAULT_BUFFER_POOL_SIZE = 128 * 1024 * 1024
+    try:
+        graph_db.init_graph_db(template_path)
+        graph_db.force_close_graph_db(template_path)
+    finally:
+        graph_db._DEFAULT_BUFFER_POOL_SIZE = original_default
+    try:
+        yield template_path
+    finally:
+        shutil.rmtree(template_root, ignore_errors=True)
+
+
 @pytest.fixture
-def test_config(temp_dirs):
-    """Configure with test paths."""
+def test_config(temp_dirs, graph_db_template):
+    """Configure with test paths.
+
+    The test's graph DB starts as a file copy of the session template (schema
+    and FTS indexes already built), so opening it skips the expensive
+    first-time initialization while every test still gets a private database.
+    """
     notes_dir, graph_db_dir = temp_dirs
     graph_db_path = graph_db_dir / "test_graph.kuzu"
+    # Seed the test DB from the template (main file + Kuzu sidecars like .wal).
+    template_name = graph_db_template.name
+    for template_file in graph_db_template.parent.glob(f"{template_name}*"):
+        suffix = template_file.name[len(template_name):]
+        shutil.copy2(
+            template_file,
+            graph_db_path.parent / f"{graph_db_path.name}{suffix}",
+        )
     # Save original config values
     original_notes_dir = config.notes_dir
     original_graph_db_path = config.graph_db_path
