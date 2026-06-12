@@ -135,7 +135,7 @@ All tools are prefixed `pzk_`.
 | Tool | Description |
 | --- | --- |
 | `pzk_briefing` | One-call session orientation: active projects, due tasks, reminders, recent notes |
-| `pzk_ingest_batch` | Create many notes + links + tasks in one call, with `#N` cross-references and per-note dedup |
+| `pzk_ingest_batch` | Create many notes + links + tasks in one call, with `#N` cross-references; likely duplicates are created-and-flagged for review by default (`on_duplicate="skip"` for unattended auto-fold) |
 | `pzk_get_neighborhood` | Hop-grouped map of the linked neighborhood around a note (includes inline refs) |
 | `pzk_find_tensions` | Unlinked same-topic notes framed for a fold / link / contradicts judgment |
 

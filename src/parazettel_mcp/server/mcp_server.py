@@ -2484,14 +2484,25 @@ class ZettelkastenMcpServer:
             default_area_id: Optional[str] = None,
             default_source: str = "chat",
             check_duplicates: bool = True,
+            on_duplicate: str = "flag",
         ) -> str:
             """Create many notes, links, and tasks in ONE call (batch ingestion).
 
             Use this instead of dozens of individual create calls when capturing
-            a transcript, meeting, or document. Notes are created first (each
-            passes the same dedup gate as pzk_create_note — a near-duplicate is
-            skipped and link references to it attach to the EXISTING note), then
+            a transcript, meeting, or document. Notes are created first, then
             tasks, then links. Each item succeeds or fails independently.
+
+            Duplicate handling: every note passes the same dedup probe as
+            pzk_create_note. By default (on_duplicate='flag') a likely duplicate
+            is still CREATED and flagged for your review — the probe compares
+            only a content lead, and a high match means same TOPIC, not
+            necessarily same CLAIM, so the fold decision stays with you (fold
+            with pzk_update_note + pzk_delete_note, or keep and link). With
+            on_duplicate='skip' the item is not created and link references to
+            it attach to the existing note instead (for unattended pipelines
+            where accreting near-duplicates is worse than a rare wrong fold).
+            Because flagging is non-destructive, leave check_duplicates on even
+            for pre-vetted drafts — it is a free safety net.
 
             Reference syntax in links: "#0" refers to the first entry in notes,
             "#1" the second, etc.; "#t0" refers to the first entry in tasks.
@@ -2516,6 +2527,10 @@ class ZettelkastenMcpServer:
                     (default 'chat')
                 check_duplicates: Default dedup behavior for notes (per-item
                     check_duplicates overrides)
+                on_duplicate: 'flag' (default) creates the note anyway and
+                    reports the duplicate candidate for review; 'skip' does not
+                    create it and redirects its "#N" references to the existing
+                    note
             """
             import datetime as _dt
 
@@ -2537,10 +2552,15 @@ class ZettelkastenMcpServer:
                     return f"Error: {exc}"
                 if not (note_items or link_items or task_items):
                     return "Provide at least one of notes, links, or tasks."
+                on_duplicate = str(on_duplicate).strip().lower()
+                if on_duplicate not in {"flag", "skip"}:
+                    return "Invalid on_duplicate: use 'flag' or 'skip'."
 
                 refs: Dict[str, str] = {}
                 lines: List[str] = []
-                created_notes = skipped_notes = created_tasks = created_links = 0
+                review_lines: List[str] = []
+                created_notes = skipped_notes = flagged_notes = 0
+                created_tasks = created_links = 0
                 errors = 0
 
                 for idx, item in enumerate(note_items):
@@ -2573,19 +2593,22 @@ class ZettelkastenMcpServer:
                                 t.strip() for t in tag_list.split(",") if t.strip()
                             ]
                         do_dedup = bool(item.get("check_duplicates", check_duplicates))
-                        if do_dedup:
-                            duplicates = self._find_duplicate_candidates(title, body)
-                            if duplicates:
-                                existing, score = duplicates[0]
-                                refs[ref] = existing.id
-                                skipped_notes += 1
-                                lines.append(
-                                    f"{ref} SKIPPED — near-duplicate of "
-                                    f"'{existing.title}' (ID: {existing.id}, "
-                                    f"score {score:.2f}); links to {ref} attach "
-                                    "to the existing note"
-                                )
-                                continue
+                        duplicates = (
+                            self._find_duplicate_candidates(title, body)
+                            if do_dedup
+                            else []
+                        )
+                        if duplicates and on_duplicate == "skip":
+                            existing, score = duplicates[0]
+                            refs[ref] = existing.id
+                            skipped_notes += 1
+                            lines.append(
+                                f"{ref} SKIPPED — near-duplicate of "
+                                f"'{existing.title}' (ID: {existing.id}, "
+                                f"score {score:.2f}); links to {ref} attach "
+                                "to the existing note"
+                            )
+                            continue
                         note = self.zettel_service.create_note(
                             title=title,
                             content=body,
@@ -2599,7 +2622,27 @@ class ZettelkastenMcpServer:
                         )
                         refs[ref] = note.id
                         created_notes += 1
-                        lines.append(f"{ref} created: {title} (ID: {note.id})")
+                        if duplicates:
+                            # Flag (default): the probe sees only a content
+                            # lead, and a strong match means same TOPIC, not
+                            # necessarily same CLAIM — so create it and hand
+                            # the fold/link decision to the caller.
+                            existing, score = duplicates[0]
+                            flagged_notes += 1
+                            lines.append(
+                                f"{ref} created WITH DUPLICATE FLAG: {title} "
+                                f"(ID: {note.id})"
+                            )
+                            review_lines.append(
+                                f"- {note.id} ('{title}') vs existing "
+                                f"{existing.id} ('{existing.title}'), score "
+                                f"{score:.2f} — open both: same atomic claim "
+                                "-> fold (merge anything new into the existing "
+                                f"note, then pzk_delete_note {note.id}); same "
+                                "topic only -> keep and link them"
+                            )
+                        else:
+                            lines.append(f"{ref} created: {title} (ID: {note.id})")
                     except Exception as exc:
                         errors += 1
                         lines.append(f"{ref} ERROR: {exc}")
@@ -2699,9 +2742,21 @@ class ZettelkastenMcpServer:
                     f"{skipped_notes} skipped as duplicates, {created_tasks} "
                     f"task(s), {created_links} link(s)"
                 )
+                if flagged_notes:
+                    summary += (
+                        f", {flagged_notes} flagged as possible duplicates "
+                        "— REVIEW REQUIRED below"
+                    )
                 if errors:
                     summary += f", {errors} ERROR(s) — review below"
-                return summary + ".\n\n" + "\n".join(lines)
+                out = summary + ".\n\n" + "\n".join(lines)
+                if review_lines:
+                    out += (
+                        "\n\nDuplicate review (judge each — the probe matches "
+                        "topic, only you can confirm the claim):\n"
+                        + "\n".join(review_lines)
+                    )
+                return out
             except Exception as e:
                 return self.format_error_response(e)
 
