@@ -7,9 +7,8 @@ writes now follow:
 * Every project-routed note/task carries ``part_of`` -> project, and the
   project carries a materialized ``has_part`` counter link back.
 * Every directly area-routed note carries ``reference`` AND ``part_of`` ->
-  area. The area-side ``has_part`` counter edge is graph-derived from the
-  member's ``area_id`` (never written into the area's markdown), so it is
-  produced by the final index rebuild rather than by file edits.
+  area, and the area's markdown gains a materialized ``has_part`` counter
+  link per direct member (batched: one file write per area).
 * Optionally (``--semantic-inverses``) every directional semantic link
   (extends/refines/contradicts/questions/supports and their ``_by`` forms)
   gains its inverse on the target note.
@@ -75,15 +74,26 @@ class BackfillPlan:
     actions: List[LinkAction] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
     area_member_counts: Counter = field(default_factory=Counter)
+    # area_id -> member ids needing a materialized has_part line in the area's
+    # markdown. Applied as ONE file write per area (add_link loop + single
+    # update), not one rewrite per member.
+    area_has_part: Dict[str, List[str]] = field(default_factory=dict)
 
     def summary(self) -> str:
         by_reason = Counter(action.reason for action in self.actions)
-        lines = [f"Planned link additions: {len(self.actions)}"]
+        total_has_part = sum(len(v) for v in self.area_has_part.values())
+        lines = [
+            f"Planned link additions: {len(self.actions) + total_has_part}"
+        ]
         for reason, count in by_reason.most_common():
             lines.append(f"  {count:5d}  {reason}")
+        if total_has_part:
+            lines.append(
+                f"  {total_has_part:5d}  area membership (has_part, "
+                f"batched into {len(self.area_has_part)} area file write(s))"
+            )
         if self.area_member_counts:
-            lines.append("Direct members per area (derived has_part edges "
-                         "created by the final rebuild):")
+            lines.append("Direct members per area:")
             for area, count in self.area_member_counts.most_common():
                 lines.append(f"  {count:5d}  {area}")
         if self.skipped:
@@ -168,6 +178,8 @@ def plan_backfill(service, semantic_inverses: bool = False) -> BackfillPlan:
                             reason="area membership (part_of)",
                         )
                     )
+                if not has_link(area, note.id, LinkType.HAS_PART):
+                    plan.area_has_part.setdefault(area.id, []).append(note.id)
 
         if semantic_inverses:
             for link in note.links:
@@ -230,6 +242,29 @@ def apply_plan(service, plan: BackfillPlan) -> Dict[str, int]:
             )
         if i % 100 == 0 or i == total:
             logger.info("  applied %d/%d link additions", i, total)
+
+    # Materialized area has_part counter links, batched: add every missing
+    # member link to the area note in memory, then write the file ONCE — the
+    # biggest area has hundreds of members, and per-link create_link would
+    # rewrite (and re-embed) its file once per member.
+    for area_id, member_ids in plan.area_has_part.items():
+        try:
+            with service._write_locked():
+                area = service.repository.get(area_id)
+                if area is None:
+                    raise ValueError(f"area {area_id} disappeared")
+                for member_id in member_ids:
+                    area.add_link(member_id, LinkType.HAS_PART)
+                service.repository.update(area)
+            results["applied"] += len(member_ids)
+            logger.info(
+                "  materialized %d has_part link(s) on area %s",
+                len(member_ids),
+                area.title,
+            )
+        except Exception as exc:
+            results["failed"] += len(member_ids)
+            logger.error("Failed has_part batch for area %s: %s", area_id, exc)
     return dict(results)
 
 
@@ -258,8 +293,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--skip-rebuild",
         action="store_true",
-        help="Skip the final index rebuild (derived area has_part edges will "
-        "then only appear after the next rebuild)",
+        help="Skip the final index rebuild (a final rebuild reconciles the "
+        "graph with every edited file in one pass)",
     )
     args = parser.parse_args(argv)
 
@@ -304,7 +339,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if not args.skip_rebuild:
             logger.info(
-                "Rebuilding index (derives area has_part membership edges)..."
+                "Rebuilding index (reconciles graph with all edited files)..."
             )
             service.rebuild_index()
             logger.info("Rebuild complete.")

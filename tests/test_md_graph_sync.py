@@ -421,7 +421,7 @@ def test_subproject_wires_parent_and_area_both_layers(para):
 
 
 # ---------------------------------------------------------------------------
-# 2b. Direct area membership is bidirectional (part_of + derived has_part)
+# 2b. Direct area membership is bidirectional (part_of + materialized has_part)
 # ---------------------------------------------------------------------------
 
 
@@ -439,36 +439,38 @@ def test_area_direct_note_is_bidirectional_member(zettel_service):
         "part_of",
         "reference",
     }
-    # Area side: the has_part counter edge exists in the GRAPH...
+    # Area side: the has_part counter link is materialized in the area's
+    # markdown — reading the area file shows its members — and the edge exists.
+    assert f"has_part [[{note.id}" in links_section(zettel_service, area.id)
     assert edge_types(zettel_service, area.id, note.id) == {"has_part"}
-    # ...but is derived, never materialized into the area's markdown (an area
-    # can have hundreds of members; its file must stay readable).
-    assert note.id not in md_text(zettel_service, area.id)
     # Both-ways traversal works.
     assert note.id in {
         n.id for n in zettel_service.get_linked_notes(area.id, "outgoing")
     }
 
 
-def test_derived_membership_edge_removed_when_note_joins_project(para):
+def test_area_has_part_removed_when_note_joins_project(para):
     service, area, project = para
     note = service.create_note(
         title="Promoted Member", content="m", area_id=area.id
     )
     assert edge_types(service, area.id, note.id) == {"has_part"}
+    assert f"has_part [[{note.id}" in links_section(service, area.id)
 
     service.update_note(note.id, project_id=project.id)
 
-    # The project is the container now: area's derived has_part is gone,
-    # the project's materialized has_part exists, part_of points at project.
+    # The project is the container now: the area's has_part moves to the
+    # project in BOTH layers, part_of points at the project.
     assert edge_types(service, area.id, note.id) == set()
+    assert f"has_part [[{note.id}" not in links_section(service, area.id)
     assert edge_types(service, project.id, note.id) == {"has_part"}
+    assert f"has_part [[{note.id}" in links_section(service, project.id)
     section = links_section(service, note.id)
     assert f"part_of [[{project.id}" in section
     assert f"part_of [[{area.id}" not in section
 
 
-def test_derived_membership_edges_survive_rebuild_and_area_update(zettel_service):
+def test_area_membership_survives_rebuild_and_area_update(zettel_service):
     area = zettel_service.create_area_note(title="Stable Area", content="a")
     notes = [
         zettel_service.create_note(
@@ -477,30 +479,28 @@ def test_derived_membership_edges_survive_rebuild_and_area_update(zettel_service
         for i in range(3)
     ]
 
-    # A rebuild trusts files only — derived edges must be reproduced from the
-    # members' area_id frontmatter.
+    # Membership lines live in the area's file, so a rebuild (which trusts
+    # files only) reproduces every has_part edge.
     zettel_service.rebuild_index()
     for note in notes:
         assert edge_types(zettel_service, area.id, note.id) == {"has_part"}
 
-    # Updating the area (which clears + recreates its outgoing edges) must
-    # re-derive member edges, and still not write them into the area's file.
+    # Updating the area body must not disturb the membership lines.
     zettel_service.update_note(area.id, content="Updated area body.")
     for note in notes:
         assert edge_types(zettel_service, area.id, note.id) == {"has_part"}
-        assert note.id not in md_text(zettel_service, area.id)
+        assert f"has_part [[{note.id}" in links_section(zettel_service, area.id)
 
 
 def test_area_member_counts_via_graph(para):
-    """Areas keep materialized has_part for projects AND derived has_part for
-    direct members — both visible to graph traversal."""
+    """Areas materialize has_part for projects AND direct members — all
+    visible in the area's file and to graph traversal."""
     service, area, project = para
     direct = service.create_note(title="Direct", content="d", area_id=area.id)
     outgoing = {n.id for n in service.get_linked_notes(area.id, "outgoing")}
     assert {project.id, direct.id} <= outgoing
-    # Project has_part is materialized in the area's file; member is not.
     assert f"has_part [[{project.id}" in links_section(service, area.id)
-    assert direct.id not in md_text(service, area.id)
+    assert f"has_part [[{direct.id}" in links_section(service, area.id)
 
 
 # ---------------------------------------------------------------------------

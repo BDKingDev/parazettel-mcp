@@ -379,14 +379,14 @@ class ZettelkastenMcpServer:
             )
             return msg
         try:
-            results = self.search_service.search_combined(text=identifier)[:3]
+            results = list(self.search_service.search_combined(text=identifier))[:3]
+            if results:
+                msg += "\nClosest matches:\n" + "\n".join(
+                    f"- {r.note.title} (ID: {r.note.id})" for r in results
+                )
+                msg += "\nIf one of these is the intended note, retry with its ID."
         except Exception:  # pragma: no cover - suggestions are best-effort
-            results = []
-        if results:
-            msg += "\nClosest matches:\n" + "\n".join(
-                f"- {r.note.title} (ID: {r.note.id})" for r in results
-            )
-            msg += "\nIf one of these is the intended note, retry with its ID."
+            pass
         return msg
 
     @staticmethod
@@ -497,19 +497,22 @@ class ZettelkastenMcpServer:
         """
         try:
             similar = self.zettel_service.find_similar_notes(str(note_id), 0.35)
+            similar = [(n, s) for n, s in similar if n.id != note_id][:3]
+            if not similar:
+                return ""
+            lines = [
+                "",
+                "Suggested links (semantic neighbors — link with "
+                "pzk_create_link if related; moderate scores are link "
+                "candidates, not duplicates):",
+            ]
+            for note, score in similar:
+                lines.append(
+                    f"- {note.title} (ID: {note.id}, similarity {score:.2f})"
+                )
+            return "\n".join(lines)
         except Exception:  # pragma: no cover - advisory only
             return ""
-        similar = [(n, s) for n, s in similar if n.id != note_id][:3]
-        if not similar:
-            return ""
-        lines = [
-            "",
-            "Suggested links (semantic neighbors — link with pzk_create_link "
-            "if related; moderate scores are link candidates, not duplicates):",
-        ]
-        for note, score in similar:
-            lines.append(f"- {note.title} (ID: {note.id}, similarity {score:.2f})")
-        return "\n".join(lines)
 
     @staticmethod
     def _normalize_identifier_list(identifiers: List[str]) -> List[str]:

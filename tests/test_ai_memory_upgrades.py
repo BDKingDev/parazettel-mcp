@@ -224,6 +224,29 @@ def test_origin_and_last_verified_roundtrip(zettel_service):
 
 
 # ---------------------------------------------------------------------------
+# Embedding text hygiene
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_text_strips_links_section(zettel_service):
+    """The rendered ## Links section must not pollute a note's semantic vector
+    — a container note (area/hub) would otherwise embed as a soup of member
+    titles instead of its own meaning."""
+    area = zettel_service.create_area_note(title="Embed Area", content="About X.")
+    member = zettel_service.create_note(
+        title="A Very Distinctive Member Title", content="m", area_id=area.id
+    )
+    area_note = zettel_service.get_note(area.id)
+    # The file content contains the membership line...
+    assert f"has_part [[{member.id}" in area_note.content
+    # ...but the embedded text does not.
+    embed_text = zettel_service.repository._embedding_text(area_note)
+    assert "About X." in embed_text
+    assert member.id not in embed_text
+    assert "Distinctive Member Title" not in embed_text
+
+
+# ---------------------------------------------------------------------------
 # Retrieval signals
 # ---------------------------------------------------------------------------
 

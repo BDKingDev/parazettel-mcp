@@ -76,9 +76,11 @@ def legacy_vault(zettel_service):
     _strip_links_lines(zettel_service, tgt.id, "part_of")
     _strip_links_lines(zettel_service, proj_note.id, "part_of")
     _strip_links_lines(zettel_service, project.id, "has_part")
+    _strip_links_lines(zettel_service, area.id, "has_part")
     zettel_service.rebuild_index()
 
     assert edge_types(zettel_service, member.id, area.id) == {"reference"}
+    assert edge_types(zettel_service, area.id, member.id) == set()
     assert edge_types(zettel_service, proj_note.id, project.id) == set()
     return zettel_service, area, project, member, proj_note, src, tgt
 
@@ -95,10 +97,13 @@ def test_plan_finds_all_missing_counter_links(legacy_vault):
     assert (member.id, area.id, "reference") not in planned
     # Project membership is restored bidirectionally.
     assert (proj_note.id, project.id, "part_of") in planned
+    # Area-side has_part counter links are planned (batched per area).
+    assert set(plan.area_has_part.get(area.id, [])) >= {member.id, src.id, tgt.id}
     # No semantic inverses unless requested.
     assert not any(a.link_type == "extended_by" for a in plan.actions)
     # The dry-run summary reports area membership scale.
     assert "Legacy Area" in plan.summary()
+    assert "has_part" in plan.summary()
 
 
 def test_plan_with_semantic_inverses(legacy_vault):
@@ -114,7 +119,7 @@ def test_apply_plan_restores_contract_both_layers(legacy_vault):
 
     results = backfill.apply_plan(service, plan)
     assert results.get("failed", 0) == 0
-    service.rebuild_index()  # derives the area has_part membership edges
+    service.rebuild_index()  # reconcile graph with every edited file
 
     # Member side: part_of + reference in file and graph.
     member_md = (service.repository.notes_dir / f"{member.id}.md").read_text(
@@ -122,12 +127,12 @@ def test_apply_plan_restores_contract_both_layers(legacy_vault):
     )
     assert f"part_of [[{area.id}" in member_md
     assert edge_types(service, member.id, area.id) == {"reference", "part_of"}
-    # Area side: derived has_part edge, nothing materialized in the area file.
+    # Area side: has_part materialized in the area's file AND in the graph.
     assert edge_types(service, area.id, member.id) == {"has_part"}
     area_md = (service.repository.notes_dir / f"{area.id}.md").read_text(
         encoding="utf-8"
     )
-    assert member.id not in area_md
+    assert f"has_part [[{member.id}" in area_md
     # Project membership restored bidirectionally in file and graph.
     assert edge_types(service, proj_note.id, project.id) == {"part_of"}
     assert edge_types(service, project.id, proj_note.id) == {"has_part"}
@@ -137,7 +142,9 @@ def test_apply_plan_restores_contract_both_layers(legacy_vault):
     assert f"has_part [[{proj_note.id}" in project_md
 
     # Idempotent: a second plan finds nothing left to do.
-    assert backfill.plan_backfill(service).actions == []
+    second = backfill.plan_backfill(service)
+    assert second.actions == []
+    assert second.area_has_part == {}
 
 
 def test_backup_copies_notes_dir(legacy_vault, tmp_path):

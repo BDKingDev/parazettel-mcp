@@ -155,11 +155,11 @@ class ZettelService:
     ) -> Note:
         """Synchronize PART_OF/HAS_PART links with the note's current parent routing.
 
-        Project parents get a materialized HAS_PART counter link in their
-        markdown (bounded membership). Area parents do NOT — an area can have
-        hundreds of direct members, so its has_part counter edge is derived at
-        index time from the member's area_id instead of being written into the
-        area's ## Links (see NoteRepository._sync_derived_area_membership).
+        The counter HAS_PART link is materialized in the parent's markdown for
+        BOTH project and area parents, so reading the container's file shows
+        every member. (Large areas get long ## Links sections by design — the
+        owner prefers file-visible membership; embeddings strip the links
+        section so the list never pollutes the area's semantic vector.)
         """
         note = self.repository.get(note_id)
         if not note:
@@ -174,15 +174,8 @@ class ZettelService:
                 self.repository.update(previous_parent)
 
         if parent_id and previous_parent_id != parent_id:
-            parent = self.repository.get(parent_id)
-            materialize_counter = not (
-                parent is not None and parent.note_type == NoteType.AREA
-            )
             note, _ = self._create_link_locked(
-                note.id,
-                parent_id,
-                LinkType.PART_OF,
-                bidirectional=materialize_counter,
+                note.id, parent_id, LinkType.PART_OF, bidirectional=True
             )
         return note
 
@@ -301,17 +294,19 @@ class ZettelService:
                 note.area_id = note.id
             else:
                 # The note's container gets a part_of link: the project when
-                # routed through one, otherwise the area itself — so direct
-                # area membership is part_of/has_part bidirectional like
-                # project membership (the area-side has_part edge is derived
-                # at index time from the member's area_id, never materialized
-                # into the area's markdown).
+                # routed through one, otherwise the area itself — and the
+                # container's markdown gains the has_part counter link, so
+                # direct area membership is bidirectional in both layers like
+                # project membership.
                 note = self._seed_routing_links(
                     note, parent_id=project_id or resolved_area_id
                 )
 
             note = self.repository.create(note)
-            self._ensure_parent_has_part_link(project_id, note.id)
+            self._ensure_parent_has_part_link(
+                project_id or (resolved_area_id if note_type != NoteType.AREA else None),
+                note.id,
+            )
         return note
 
     def get_note(self, note_id: str) -> Optional[Note]:

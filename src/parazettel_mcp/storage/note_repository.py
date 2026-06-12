@@ -117,15 +117,6 @@ _NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
 # Hidden in Obsidian preview; lets link created_at survive rebuilds.
 _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 
-# Marker description on derived area->member has_part edges. Direct area
-# membership is bidirectional in the GRAPH (member part_of area, area has_part
-# member), but an area can have hundreds of direct members, so the area-side
-# counter edge is derived at index time from the member's area_id frontmatter
-# instead of being materialized into the area's ## Links. Derived edges are
-# recognized (and excluded from markdown serialization) by this description.
-_AREA_MEMBERSHIP_DESC = "derived: area membership"
-
-
 def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
     key = (path_str, mtime_ns)
     with _NOTE_CACHE_LOCK:
@@ -748,10 +739,6 @@ class NoteRepository(Repository[Note]):
                         conn,
                         clear_existing=False,
                     )
-                # Derived area->member has_part counter edges (graph-only;
-                # derived from member area_id frontmatter, see
-                # _sync_derived_area_membership).
-                self._derive_all_area_memberships(conn)
                 # Restore retrieval signals before any vector index is built.
                 # MATCH drops signals for notes that no longer exist on disk.
                 if retrieval_signals:
@@ -911,117 +898,6 @@ class NoteRepository(Repository[Note]):
                 },
             )
 
-    def _sync_derived_area_membership(
-        self, note: Note, conn: kuzu.Connection
-    ) -> None:
-        """Maintain the derived area->member ``has_part`` counter edge.
-
-        Direct area membership is bidirectional: the member carries an explicit
-        ``part_of`` link in its markdown, and the area gets a ``has_part`` edge
-        in the graph — derived here from the member's ``area_id`` frontmatter
-        rather than materialized into the area's ## Links (areas can have
-        hundreds of direct members; a 500-line links section would make the
-        area file and its embedding unusable). Because the edge derives from
-        the member file (the source of truth), rebuilds reproduce it.
-
-        Projects are excluded: an area's ``has_part`` to its projects is
-        already materialized in the area's markdown (bounded membership), and a
-        project-routed note's container is the project, not the area.
-        """
-        if note.note_type == NoteType.AREA:
-            # Re-indexing an area cleared its outgoing edges (including derived
-            # member edges); re-derive them for all current direct members.
-            member_ids = _result_first_column(
-                conn.execute(
-                    "MATCH (m:Note) "
-                    "WHERE m.area_id = $id AND m.id <> $id "
-                    "AND m.project_id IS NULL "
-                    "AND m.note_type <> 'project' AND m.note_type <> 'area' "
-                    "RETURN m.id",
-                    {"id": note.id},
-                )
-            )
-            self._create_derived_membership_edges(
-                conn, [(note.id, member_id) for member_id in member_ids]
-            )
-            return
-        if note.note_type == NoteType.PROJECT:
-            return
-        # Member note: drop its stale derived edge (if any) and re-derive for
-        # the current routing. Only derived edges are touched — a has_part an
-        # area carries in its own markdown is left alone.
-        conn.execute(
-            "MATCH (s:Note)-[r:LINKS_TO {link_type: 'has_part'}]->"
-            "(n:Note {id: $id}) "
-            "WHERE s.note_type = 'area' AND r.description = $marker "
-            "WITH r DELETE r",
-            {"id": note.id, "marker": _AREA_MEMBERSHIP_DESC},
-        )
-        if note.area_id and not note.project_id and note.area_id != note.id:
-            area_exists = _result_first_column(
-                conn.execute(
-                    "MATCH (a:Note {id: $area_id}) "
-                    "WHERE a.note_type = 'area' RETURN a.id",
-                    {"area_id": note.area_id},
-                )
-            )
-            if area_exists:
-                self._create_derived_membership_edges(
-                    conn, [(note.area_id, note.id)]
-                )
-
-    @staticmethod
-    def _create_derived_membership_edges(
-        conn: kuzu.Connection, pairs: List[Tuple[str, str]]
-    ) -> None:
-        """Batch-create derived area->member has_part edges for (area, member) pairs."""
-        if not pairs:
-            return
-        now = datetime.datetime.now()
-        conn.execute(
-            """
-            UNWIND $rows AS row
-            MATCH (a:Note {id: row.area_id}), (m:Note {id: row.member_id})
-            CREATE (a)-[:LINKS_TO {
-                link_type: row.link_type,
-                description: row.description,
-                created_at: row.created_at
-            }]->(m)
-            """,
-            {
-                "rows": [
-                    {
-                        "area_id": area_id,
-                        "member_id": member_id,
-                        "link_type": LinkType.HAS_PART.value,
-                        "description": _AREA_MEMBERSHIP_DESC,
-                        "created_at": now,
-                    }
-                    for area_id, member_id in pairs
-                ]
-            },
-        )
-
-    def _derive_all_area_memberships(self, conn: kuzu.Connection) -> None:
-        """Create every derived area->member has_part edge in one pass.
-
-        Used by the fresh rebuild, where the database starts empty and every
-        edge is created exactly once (see _sync_derived_area_membership for the
-        membership rules).
-        """
-        pair_result = conn.execute(
-            "MATCH (a:Note), (m:Note) "
-            "WHERE a.note_type = 'area' AND m.area_id = a.id AND m.id <> a.id "
-            "AND m.project_id IS NULL "
-            "AND m.note_type <> 'project' AND m.note_type <> 'area' "
-            "RETURN a.id AS area_id, m.id AS member_id"
-        )
-        pairs: List[Tuple[str, str]] = []
-        while pair_result.has_next():
-            row = pair_result.get_next()
-            pairs.append((row[0], row[1]))
-        self._create_derived_membership_edges(conn, pairs)
-
     @staticmethod
     def _link_rows_for_note(note: Note) -> List[Dict[str, Any]]:
         """Build LINKS_TO edge rows: explicit ## Links plus derived inline refs.
@@ -1041,10 +917,6 @@ class NoteRepository(Repository[Note]):
             }
             for link in note.links
             if link.link_type != LinkType.INLINE
-            and not (
-                link.link_type == LinkType.HAS_PART
-                and link.description == _AREA_MEMBERSHIP_DESC
-            )
         ]
         explicit_targets = {row["target_id"] for row in rows}
         for target_id in note.inline_refs:
@@ -1403,18 +1275,10 @@ class NoteRepository(Repository[Note]):
         content = "\n".join(content_parts).rstrip()
         content = self._ensure_title_heading(content, note.title)
 
-        # Derived links must never be rendered into ## Links: INLINE links
-        # already live in the prose body, and derived area-membership has_part
-        # edges exist only in the graph (an area's markdown would otherwise
-        # gain one line per member note).
+        # INLINE links are derived from the prose body (they already live in
+        # the content) and must never be rendered into ## Links.
         serializable_links = [
-            link
-            for link in note.links
-            if link.link_type != LinkType.INLINE
-            and not (
-                link.link_type == LinkType.HAS_PART
-                and link.description == _AREA_MEMBERSHIP_DESC
-            )
+            link for link in note.links if link.link_type != LinkType.INLINE
         ]
         if serializable_links:
             unique_links: Dict[str, Link] = {}
@@ -1523,8 +1387,16 @@ class NoteRepository(Repository[Note]):
     # --- Semantic embeddings (only active when a provider is configured) ------
 
     def _embedding_text(self, note: Note) -> str:
-        """Return the text embedded for a note: its title plus body."""
-        return f"{note.title or ''}\n\n{note.content or ''}".strip()
+        """Return the text embedded for a note: its title plus prose body.
+
+        The rendered ``## Links`` section is stripped before embedding: link
+        lines are IDs and titles of OTHER notes, so they dilute the vector —
+        and a container note (an area lists every direct member as a has_part
+        line) would otherwise embed as a soup of member titles instead of its
+        own meaning.
+        """
+        body = (note.content or "").split("## Links", 1)[0]
+        return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod
     def _title_text(note: Note) -> str:
@@ -1947,7 +1819,6 @@ class NoteRepository(Repository[Note]):
 
             self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
             self._index_note_relations(note, conn, clear_existing=node_exists)
-            self._sync_derived_area_membership(note, conn)
             if self._embedding_provider is not None:
                 self._set_note_embedding(conn, note)
 
