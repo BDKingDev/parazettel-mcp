@@ -29,6 +29,13 @@ The result is one unified vault where knowledge notes and action items share the
 - Today view and reminder surfacing
 - Recurring tasks that auto-spawn the next instance on completion
 - Obsidian-style wiki-link aliases like `[[id|Title]]` are normalized on read and rebuild
+- Inline `[[id]]` wiki-links in prose are first-class: indexed as graph edges, scrubbed on delete, alias-refreshed on rename
+- Hand-edits to a note's `## Links` section are reconciled into the graph on update (not silently discarded)
+- Link creation times persist in markdown (HTML comment) and survive index rebuilds
+- Tags normalized on write (lowercase-hyphenated, `@` GTD prefix preserved) to prevent vocabulary sprawl
+- Note provenance (`origin`) and verification (`last_verified`) fields
+- Retrieval signals (hit count, last retrieved) tracked graph-side and carried across rebuilds
+- AI-caller ergonomics: server-level usage instructions, one-call session briefing, batch ingestion, neighborhood maps, tension surfacing, calibrated result verdicts
 
 ---
 
@@ -83,7 +90,13 @@ Applies to any note type. Tasks flow through the action lifecycle; knowledge not
 | `part_of` | `has_part` | Task/note belongs to a project or area |
 | `blocks` | `blocked_by` | One task blocks another |
 
-Parazettel also understands Obsidian-style piped wiki-links such as `[[NOTE_ID|Displayed Title]]`. On ingest, the target note ID is normalized from the link target, so aliases and heading fragments do not break indexing. When a note is rewritten, touched wiki-links are normalized to the target note title when the alias is safe to render. Renaming a note refreshes incoming title aliases, and deleting a note removes incoming markdown references.
+Parazettel also understands Obsidian-style piped wiki-links such as `[[NOTE_ID|Displayed Title]]`. On ingest, the target note ID is normalized from the link target, so aliases and heading fragments do not break indexing. When a note is rewritten, touched wiki-links are normalized to the target note title when the alias is safe to render. Renaming a note refreshes incoming title aliases (in both `## Links` and prose), and deleting a note scrubs incoming references everywhere — `## Links` entries are removed and inline prose refs are unlinked in place (the alias or title text remains so the sentence stays readable).
+
+**Inline prose links.** A `[[NOTE_ID]]` mention in a note's body (outside `## Links`) is indexed as a derived `inline` graph edge, so traversal, centrality, and similarity see it. Inline edges are never written into `## Links` and cannot be created via `pzk_create_link` — they exist purely as a reflection of the note text.
+
+**Editing `## Links` by hand.** When `pzk_update_note` receives content containing a `## Links` heading, its entries are reconciled into the link graph: removed lines unlink, added lines link, surviving links keep their original creation time. Content *without* a `## Links` heading leaves the note's links untouched, so passing just a new body never wipes the graph.
+
+**Link provenance.** Each `## Links` line carries an invisible `<!-- created: ... -->` comment, so "when did I connect these ideas" survives a full index rebuild.
 
 ---
 
@@ -111,7 +124,16 @@ All tools are prefixed `pzk_`.
 | `pzk_find_orphaned_notes` | Find notes with no connections |
 | `pzk_list_notes_by_date` | List notes by creation or update date |
 | `pzk_rebuild_index` | Rebuild the Kuzu graph index from Markdown files |
-| `pzk_check_consistency` | Read-only audit of file-vs-index drift (run before deciding to rebuild) |
+| `pzk_check_consistency` | Read-only audit of file-vs-index drift + dangling wiki references |
+
+### AI-memory ergonomics
+
+| Tool | Description |
+| --- | --- |
+| `pzk_briefing` | One-call session orientation: active projects, due tasks, reminders, recent notes |
+| `pzk_ingest_batch` | Create many notes + links + tasks in one call, with `#N` cross-references and per-note dedup |
+| `pzk_get_neighborhood` | Hop-grouped map of the linked neighborhood around a note (includes inline refs) |
+| `pzk_find_tensions` | Unlinked same-topic notes framed for a fold / link / contradicts judgment |
 
 ### Task management
 
