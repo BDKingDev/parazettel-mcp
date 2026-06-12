@@ -268,6 +268,18 @@ def _create_schema(conn: kuzu.Connection) -> None:
         )
         """
     )
+    # Memory-system columns added after the original schema shipped. ALTER ...
+    # ADD IF NOT EXISTS is a no-op when present, so existing databases pick
+    # these up on open without a migration.
+    # origin / last_verified: durable note attributes, round-tripped through
+    # markdown frontmatter (the source of truth).
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS origin STRING")
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS last_verified STRING")
+    # Retrieval signals: graph-only operational data (NOT in markdown — bumping
+    # a hit counter must never rewrite a note file). They survive a rebuild via
+    # an explicit carry-over in rebuild_index, not via the files.
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS last_retrieved_at TIMESTAMP")
+    conn.execute("ALTER TABLE Note ADD IF NOT EXISTS hit_count INT64")
     _ensure_fts_indexes(conn)
 
 

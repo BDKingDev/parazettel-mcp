@@ -2,6 +2,7 @@
 
 import datetime
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +17,7 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
     Tag,
+    normalize_tag,
 )
 from parazettel_mcp.storage.note_repository import NoteRepository
 
@@ -74,6 +76,24 @@ class ZettelService:
         # Nothing to do here for synchronous implementation
         # The repository is initialized in its constructor
         pass
+
+    @staticmethod
+    def _normalize_tags(tags: Optional[List[str]]) -> List[Tag]:
+        """Normalize and de-duplicate a raw tag list into Tag objects.
+
+        All tag writes funnel through here so the vault converges on one
+        canonical spelling per tag (see :func:`normalize_tag`) instead of
+        accumulating case/separator variants.
+        """
+        normalized: List[Tag] = []
+        seen: Set[str] = set()
+        for raw in tags or []:
+            name = normalize_tag(raw)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            normalized.append(Tag(name=name))
+        return normalized
 
     def close(self) -> None:
         """Release resources held by the service."""
@@ -217,6 +237,7 @@ class ZettelService:
         status: Optional[NoteStatus] = None,
         project_id: Optional[str] = None,
         area_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> Note:
         """Create a new note."""
         if not title:
@@ -253,12 +274,13 @@ class ZettelService:
                 title=title,
                 content=content,
                 note_type=note_type,
-                tags=[Tag(name=tag) for tag in (tags or [])],
+                tags=self._normalize_tags(tags),
                 metadata=metadata or {},
                 source=source,
                 status=status,
                 project_id=project_id,
                 area_id=resolved_area_id,
+                origin=origin,
             )
 
             if note_type == NoteType.AREA:
@@ -278,6 +300,37 @@ class ZettelService:
         """Retrieve a note by title."""
         return self.repository.get_by_title(title)
 
+    def record_retrieval(self, note_ids: List[str]) -> None:
+        """Record that *note_ids* were explicitly retrieved (recency/frequency).
+
+        Best-effort and never raises: retrieval tracking is an enhancement to
+        the read path and must not be able to break a read. Serialized by the
+        write lock because it mutates the graph (Kuzu is single-writer).
+        """
+        ids = [str(nid) for nid in note_ids if nid]
+        if not ids:
+            return
+        recorder = getattr(self.repository, "record_retrieval", None)
+        if not callable(recorder):
+            return
+        try:
+            with self._write_locked():
+                recorder(ids)
+        except Exception as exc:  # pragma: no cover - advisory only
+            logger.debug("Could not record retrieval for %s: %s", ids, exc)
+
+    def get_retrieval_signals(
+        self, note_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return retrieval signals (last_retrieved_at, hit_count) per note id."""
+        getter = getattr(self.repository, "get_retrieval_signals", None)
+        if not callable(getter):
+            return {}
+        try:
+            return getter([str(nid) for nid in note_ids if nid])
+        except Exception:  # pragma: no cover - advisory only
+            return {}
+
     def update_note(
         self,
         note_id: str,
@@ -289,6 +342,8 @@ class ZettelService:
         metadata: Optional[Dict[str, Any]] = None,
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
+        origin: Any = _UNSET,
+        last_verified: Any = _UNSET,
     ) -> Note:
         """Update an existing note.
 
@@ -308,7 +363,32 @@ class ZettelService:
                 metadata=metadata,
                 project_id=project_id,
                 area_id=area_id,
+                origin=origin,
+                last_verified=last_verified,
             )
+
+    def _reconcile_links_from_content(self, note: Note, content: str) -> None:
+        """Honor a ``## Links`` section hand-edited into updated *content*.
+
+        Historically the ``## Links`` section was a one-way render of
+        ``note.links`` — body edits to it were silently discarded on the next
+        write. Instead, when the new content carries a ``## Links`` heading, its
+        entries are parsed and become the note's links: lines removed are
+        unlinked, lines added are linked. Links that survive keep their original
+        ``created_at``/description. When the new content has NO ``## Links``
+        heading the existing links are kept unchanged (so passing just a new
+        body never wipes the link graph).
+        """
+        if "## Links" not in content:
+            return
+        parsed = self.repository.parse_links_in_content(note.id, content)
+        existing_by_key = {
+            (link.target_id, link.link_type): link for link in note.links
+        }
+        note.links = [
+            existing_by_key.get((link.target_id, link.link_type), link)
+            for link in parsed
+        ]
 
     def _update_note_locked(
         self,
@@ -321,6 +401,8 @@ class ZettelService:
         metadata: Optional[Dict[str, Any]] = None,
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
+        origin: Any = _UNSET,
+        last_verified: Any = _UNSET,
     ) -> Note:
         """Update implementation; caller holds the write lock."""
         note = self.repository.get(note_id)
@@ -334,11 +416,12 @@ class ZettelService:
         if title is not None:
             note.title = title
         if content is not None:
+            self._reconcile_links_from_content(note, content)
             note.content = content
         if note_type is not None:
             note.note_type = note_type
         if tags is not None:
-            note.tags = [Tag(name=tag) for tag in tags]
+            note.tags = self._normalize_tags(tags)
         if status is not _UNSET:
             note.status = status
         if metadata is not None:
@@ -347,6 +430,10 @@ class ZettelService:
             note.project_id = project_id
         if area_id is not _UNSET:
             note.area_id = area_id
+        if origin is not _UNSET:
+            note.origin = origin
+        if last_verified is not _UNSET:
+            note.last_verified = last_verified
 
         if note.note_type == NoteType.AREA:
             if note.project_id:
@@ -419,13 +506,28 @@ class ZettelService:
         return note
 
     def _refresh_incoming_link_aliases(self, note_id: str) -> None:
-        """Rewrite incoming source notes so aliases follow the target title."""
+        """Rewrite incoming source notes so aliases follow the target title.
+
+        Covers both representations: the regenerated ``## Links`` section (whose
+        aliases are re-resolved from the graph on rewrite) and aliased inline
+        ``[[id|old title]]`` wiki-links in prose, which are rewritten in place to
+        the new title. Bare inline ``[[id]]`` refs need no refresh.
+        """
+        target = self.repository.get(note_id)
+        new_title = target.title if target else None
+        inline_alias_pattern = re.compile(
+            r"\[\[\s*" + re.escape(note_id) + r"\s*\|[^\]]*\]\]"
+        )
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
         for incoming_note in incoming_notes:
             source_note = self.repository.get(incoming_note.id)
             if not source_note:
                 continue
             existing_source = source_note.model_copy(deep=True)
+            if new_title and "|" not in new_title and "]]" not in new_title:
+                source_note.content = inline_alias_pattern.sub(
+                    f"[[{note_id}|{new_title}]]", source_note.content
+                )
             self.repository.update_preserving_updated_at(
                 source_note,
                 existing_note=existing_source,
@@ -455,7 +557,9 @@ class ZettelService:
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
-            note.add_tag(tag)
+            normalized = normalize_tag(tag)
+            if normalized:
+                note.add_tag(normalized)
             return self.repository.update(note)
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
@@ -464,7 +568,12 @@ class ZettelService:
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
+            # Remove both the raw and the normalized spelling so legacy
+            # (pre-normalization) tags on old notes can still be removed.
             note.remove_tag(tag)
+            normalized = normalize_tag(tag)
+            if normalized and normalized != tag:
+                note.remove_tag(normalized)
             return self.repository.update(note)
 
     def get_all_tags(self) -> List[Tag]:
@@ -519,6 +628,12 @@ class ZettelService:
         Returns:
             Tuple of (source_note, target_note or None)
         """
+        if link_type == LinkType.INLINE or bidirectional_type == LinkType.INLINE:
+            raise ValueError(
+                "'inline' links are derived from [[wiki-links]] in note prose "
+                "and cannot be created directly. Edit the note content, or use "
+                "an explicit link type (reference, extends, supports, ...)."
+            )
         source_note = self.repository.get(source_id)
         if not source_note:
             raise ValueError(f"Source note with ID {source_id} not found")
@@ -995,7 +1110,7 @@ class ZettelService:
                 title=title,
                 content=content,
                 note_type=NoteType.TASK,
-                tags=[Tag(name=t) for t in (tags or [])],
+                tags=self._normalize_tags(tags),
                 status=status,
                 source=source,
                 due_date=due_date,
@@ -1099,7 +1214,7 @@ class ZettelService:
         if recurrence_rule is not _UNSET:
             task.recurrence_rule = recurrence_rule
         if tags is not _UNSET:
-            task.tags = [Tag(name=tag) for tag in tags]
+            task.tags = self._normalize_tags(tags)
 
         if any(value is not _UNSET for value in pending_updates.values()):
             task.updated_at = datetime.datetime.now()
