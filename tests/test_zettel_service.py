@@ -471,14 +471,16 @@ def test_search_notes(zettel_service):
     assert len(python_notes) == 2
     assert {n.id for n in python_notes} == {note1.id, note2.id}
 
-    # Test adding and removing tags
+    # Test adding and removing tags. Tags are normalized on write (lowercase,
+    # hyphenated) so case variants converge instead of fragmenting the vocab.
     first_note = python_notes[0]
     zettel_service.add_tag_to_note(first_note.id, "newTag")
     updated_note = zettel_service.get_note(first_note.id)
-    assert "newTag" in {tag.name for tag in updated_note.tags}
+    assert "newtag" in {tag.name for tag in updated_note.tags}
+    # Removal accepts the un-normalized spelling too.
     zettel_service.remove_tag_from_note(first_note.id, "newTag")
     updated_note = zettel_service.get_note(first_note.id)
-    assert "newTag" not in {tag.name for tag in updated_note.tags}
+    assert "newtag" not in {tag.name for tag in updated_note.tags}
 
 
 def test_find_similar_notes(zettel_service):

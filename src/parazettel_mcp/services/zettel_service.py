@@ -548,8 +548,19 @@ class ZettelService:
         return self.repository.search(**kwargs)
 
     def get_notes_by_tag(self, tag: str) -> List[Note]:
-        """Get notes by tag."""
-        return self.repository.find_by_tag(tag)
+        """Get notes by tag.
+
+        Exact match first (so legacy, pre-normalization tags stay reachable);
+        on a miss, retries with the normalized spelling so a caller asking for
+        'AI' still finds notes tagged 'ai'.
+        """
+        notes = self.repository.find_by_tag(tag)
+        if notes:
+            return notes
+        normalized = normalize_tag(tag)
+        if normalized and normalized != tag:
+            return self.repository.find_by_tag(normalized)
+        return notes
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
         """Add a tag to a note (serialized against all writers by the global write lock)."""

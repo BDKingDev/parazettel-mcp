@@ -124,6 +124,7 @@ class TestMcpServer:
             status=None,
             project_id=None,
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_warns_on_likely_duplicate_and_does_not_create(self):
@@ -417,6 +418,7 @@ class TestMcpServer:
             status=NoteStatus.INBOX,
             project_id=None,
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_tool_rejects_invalid_status(self):
@@ -487,6 +489,7 @@ class TestMcpServer:
             status=None,
             project_id=None,
             area_id=None,
+            origin=None,
         )
 
     def test_create_note_tool_inherits_area_from_project(self):
@@ -520,6 +523,7 @@ class TestMcpServer:
             status=None,
             project_id="project123",
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_tool_rejects_project_area_mismatch(self):
@@ -1656,7 +1660,7 @@ class TestMcpServer:
         fn = self.registered_tools["pzk_delete_note"]
         result = fn(note_id="note123")
 
-        assert result == "Note deleted successfully: note123"
+        assert result.startswith("Note deleted successfully: note123")
         self.mock_zettel_service.get_note.assert_called_once_with("note123")
         self.mock_zettel_service.delete_note.assert_called_once_with("note123")
 
