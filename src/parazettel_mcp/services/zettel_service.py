@@ -153,7 +153,14 @@ class ZettelService:
     def _sync_part_of_link(
         self, note_id: str, previous_parent_id: Optional[str], parent_id: Optional[str]
     ) -> Note:
-        """Synchronize PART_OF/HAS_PART links with the note's current parent routing."""
+        """Synchronize PART_OF/HAS_PART links with the note's current parent routing.
+
+        Project parents get a materialized HAS_PART counter link in their
+        markdown (bounded membership). Area parents do NOT — an area can have
+        hundreds of direct members, so its has_part counter edge is derived at
+        index time from the member's area_id instead of being written into the
+        area's ## Links (see NoteRepository._sync_derived_area_membership).
+        """
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -167,8 +174,15 @@ class ZettelService:
                 self.repository.update(previous_parent)
 
         if parent_id and previous_parent_id != parent_id:
+            parent = self.repository.get(parent_id)
+            materialize_counter = not (
+                parent is not None and parent.note_type == NoteType.AREA
+            )
             note, _ = self._create_link_locked(
-                note.id, parent_id, LinkType.PART_OF, bidirectional=True
+                note.id,
+                parent_id,
+                LinkType.PART_OF,
+                bidirectional=materialize_counter,
             )
         return note
 
@@ -286,7 +300,15 @@ class ZettelService:
             if note_type == NoteType.AREA:
                 note.area_id = note.id
             else:
-                note = self._seed_routing_links(note, parent_id=project_id)
+                # The note's container gets a part_of link: the project when
+                # routed through one, otherwise the area itself — so direct
+                # area membership is part_of/has_part bidirectional like
+                # project membership (the area-side has_part edge is derived
+                # at index time from the member's area_id, never materialized
+                # into the area's markdown).
+                note = self._seed_routing_links(
+                    note, parent_id=project_id or resolved_area_id
+                )
 
             note = self.repository.create(note)
             self._ensure_parent_has_part_link(project_id, note.id)
@@ -491,16 +513,23 @@ class ZettelService:
             note = self._sync_project_area_links(
                 note.id, previous_area_id, note.area_id
             )
-        elif (
-            note.note_type != NoteType.AREA
-            and previous_area_id != note.area_id
-        ):
-            note = self._sync_area_reference_link(
-                note.id, previous_area_id, note.area_id
+            note = self._sync_part_of_link(
+                note.id, previous_project_id, note.project_id
             )
-        note = self._sync_part_of_link(
-            note.id, previous_project_id, note.project_id
-        )
+        elif note.note_type != NoteType.AREA:
+            if previous_area_id != note.area_id:
+                note = self._sync_area_reference_link(
+                    note.id, previous_area_id, note.area_id
+                )
+            # The PART_OF link follows the note's container: its project when
+            # routed through one, otherwise the area itself. This keeps direct
+            # area membership bidirectional (part_of + derived has_part) and
+            # moves the link when routing changes in either dimension.
+            previous_container = previous_project_id or previous_area_id
+            new_container = note.project_id or note.area_id
+            note = self._sync_part_of_link(
+                note.id, previous_container, new_container
+            )
         if title_changed:
             self._refresh_incoming_link_aliases(note.id)
         return note
