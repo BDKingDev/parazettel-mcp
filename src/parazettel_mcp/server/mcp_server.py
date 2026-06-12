@@ -1,8 +1,10 @@
 """MCP server implementation for the Zettelkasten."""
 
+import json
 import logging
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -46,6 +48,44 @@ _DEDUP_NOTE_TYPES = frozenset(
 # every loosely-related note; callers can always bypass with check_duplicates.
 _DEDUP_MIN_SCORE = 1.5
 _DEDUP_MAX_CANDIDATES = 5
+
+# Cosine-similarity bands for the verdict line appended to semantic results.
+# Empirically calibrated on this vault: a high score means same TOPIC (not
+# necessarily same claim), and a low top score is a reliable novelty signal.
+_SIM_STRONG = 0.80
+_SIM_MODERATE = 0.60
+
+# Note IDs are timestamp-shaped; used to give targeted guidance when a lookup
+# by a fabricated/typo'd ID fails.
+_NOTE_ID_SHAPE_RE = re.compile(r"^\d{8}T\d+$")
+
+# Operating manual injected into every MCP client session. This is the one
+# piece of documentation the calling model is guaranteed to see, so the
+# empirically-derived usage rules live here rather than only in the README.
+_SERVER_INSTRUCTIONS = """\
+Parazettel is a Zettelkasten + PARA/GTD vault used as persistent AI memory.
+
+Operating rules (empirically calibrated on this vault):
+- Phrase semantic queries as a complete claim or sentence, NOT keywords — a
+  full-claim query can outrank a terse one by two orders of magnitude of rank.
+  Use pzk_find_similar_to_text for meaning-based recall and pre-create dedup;
+  use pzk_search_notes for lexical/filtered search.
+- Score calibration: a low top similarity (< ~0.6) reliably means the idea is
+  NOVEL to the vault. A high similarity means same TOPIC — open the note and
+  confirm it is the same atomic claim before treating it as a duplicate.
+- Never fabricate note IDs. Copy them exactly from tool output, or pass the
+  note title instead — most lookup tools accept either.
+- Reuse existing tags (pzk_get_all_tags) before minting new ones. Tags are
+  normalized to lowercase-hyphenated form on write.
+- Start a work session with pzk_briefing (active projects, due tasks,
+  reminders, recent notes) so the vault is consulted before new work begins.
+- For multi-note captures (ingesting a transcript or document), use
+  pzk_ingest_batch — notes, links, and tasks in one call — instead of many
+  individual create calls.
+- Editing the "## Links" section inside note content via pzk_update_note IS
+  honored (entries are reconciled into the link graph). Inline [[id]] refs in
+  prose are indexed automatically and cleaned up on delete/rename.
+"""
 
 
 class BackendBundle(Protocol):
@@ -100,6 +140,7 @@ class ZettelkastenMcpServer:
         """Initialize the MCP server."""
         self.mcp = FastMCP(
             config.server_name,
+            instructions=_SERVER_INSTRUCTIONS,
             version=config.server_version,
             host=config.server_host,
             port=config.server_port,
@@ -319,6 +360,157 @@ class ZettelkastenMcpServer:
             return note
         return self.zettel_service.get_note_by_title(normalized)
 
+    def _not_found_message(self, identifier: str) -> str:
+        """Build a prescriptive not-found error with recovery guidance.
+
+        Fabricated/typo'd IDs are a known failure mode for LLM callers, so the
+        error teaches the fix instead of just reporting the miss: id-shaped
+        identifiers get the never-guess-IDs rule; title-like identifiers get
+        the closest fuzzy matches so the retry can succeed in one shot.
+        """
+        identifier = str(identifier).strip()
+        msg = f"Note not found: {identifier}"
+        if _NOTE_ID_SHAPE_RE.match(identifier):
+            msg += (
+                "\nThis looks like a note ID that does not exist. IDs must be "
+                "copied exactly from prior tool output — never constructed or "
+                "guessed from timestamps. If you know the title, pass it "
+                "instead, or locate the note with pzk_search_notes."
+            )
+            return msg
+        try:
+            results = self.search_service.search_combined(text=identifier)[:3]
+        except Exception:  # pragma: no cover - suggestions are best-effort
+            results = []
+        if results:
+            msg += "\nClosest matches:\n" + "\n".join(
+                f"- {r.note.title} (ID: {r.note.id})" for r in results
+            )
+            msg += "\nIf one of these is the intended note, retry with its ID."
+        return msg
+
+    @staticmethod
+    def _semantic_verdict(top_similarity: float) -> str:
+        """One-line interpretation of a semantic-similarity result set.
+
+        Bakes the vault's score calibration into the tool output so every
+        caller (including weaker models) gets the interpretation for free
+        instead of re-deriving what the raw numbers mean.
+        """
+        if top_similarity >= _SIM_STRONG:
+            return (
+                "Verdict: strong match — same topic is certain, but open the "
+                "top note and confirm it is the same atomic CLAIM before "
+                "folding/deduping; dense clusters score high on distinct atoms."
+            )
+        if top_similarity >= _SIM_MODERATE:
+            return (
+                "Verdict: moderate matches — treat these as link candidates, "
+                "not duplicates."
+            )
+        return (
+            "Verdict: weak matches only — this content is likely novel to the "
+            "vault (a calibrated-low top score is a reliable novelty signal). "
+            "Safe to create as a new note."
+        )
+
+    @staticmethod
+    def _lexical_verdict(results: List[Any]) -> str:
+        """One-line interpretation of a BM25/hybrid text-search result set."""
+        top = 0.0
+        for result in results:
+            if isinstance(result.score, (int, float)):
+                top = max(top, float(result.score))
+        if top >= _DEDUP_MIN_SCORE:
+            return (
+                "Verdict: strong lexical match present (top BM25 "
+                f"{top:.2f}) — review the top results before creating "
+                "overlapping content."
+            )
+        if top > 0.0:
+            return (
+                f"Verdict: moderate lexical matches (top BM25 {top:.2f}). For "
+                "meaning-based recall, also try pzk_find_similar_to_text with "
+                "a full-claim query."
+            )
+        return (
+            "Verdict: no lexical match — any results above are semantic-only "
+            "hits. Confirm novelty with pzk_find_similar_to_text before "
+            "concluding the vault has nothing on this."
+        )
+
+    @staticmethod
+    def _format_note_summary(note: Note) -> str:
+        """Compact one-result rendering used by detail='summary' outputs."""
+        line = f"- {note.title} (ID: {note.id}, type: {note.note_type.value}"
+        if note.status:
+            line += f", status: {note.status.value}"
+        line += ")"
+        if note.tags:
+            line += f"\n  Tags: {', '.join(tag.name for tag in note.tags)}"
+        preview = note.content[:200].replace("\n", " ").strip()
+        if len(preview) > 150:
+            preview = preview[:150] + "..."
+        if preview:
+            line += f"\n  Preview: {preview}"
+        return line
+
+    def _render_notes_with_detail(self, notes: List[Note], detail: str) -> str:
+        """Render a note list at the requested detail level (ids/summary/full)."""
+        if detail == "ids":
+            return "\n".join(f"- {note.title} (ID: {note.id})" for note in notes)
+        if detail == "summary":
+            return "\n".join(self._format_note_summary(note) for note in notes)
+        return "\n---\n\n".join(self._format_note_result(note) for note in notes)
+
+    @staticmethod
+    def _truncation_notice(shown: int, total: int, hint: str = "") -> str:
+        """Explicit more-results line so truncation is never silent."""
+        if total <= shown:
+            return ""
+        notice = f"\n({total - shown} more result(s) not shown"
+        if hint:
+            notice += f" — {hint}"
+        return notice + ")\n"
+
+    @staticmethod
+    def _describe_relation(node: Note, neighbor: Note) -> str:
+        """Short label for how *neighbor* connects to *node* (direction + type)."""
+        for link in node.links:
+            if link.target_id == neighbor.id:
+                return f"-> {link.link_type.value}"
+        for link in neighbor.links:
+            if link.target_id == node.id:
+                return f"<- {link.link_type.value}"
+        if neighbor.id in getattr(node, "inline_refs", []):
+            return "-> inline"
+        if node.id in getattr(neighbor, "inline_refs", []):
+            return "<- inline"
+        return "linked"
+
+    def _suggested_links_message(self, note_id: str) -> str:
+        """Propose link candidates for a freshly created note (best-effort).
+
+        Runs the same hybrid similarity the skills use manually, so every
+        create — from any client — gets connection candidates without an extra
+        round-trip. Failures are swallowed; suggestions must never break create.
+        """
+        try:
+            similar = self.zettel_service.find_similar_notes(str(note_id), 0.35)
+        except Exception:  # pragma: no cover - advisory only
+            return ""
+        similar = [(n, s) for n, s in similar if n.id != note_id][:3]
+        if not similar:
+            return ""
+        lines = [
+            "",
+            "Suggested links (semantic neighbors — link with pzk_create_link "
+            "if related; moderate scores are link candidates, not duplicates):",
+        ]
+        for note, score in similar:
+            lines.append(f"- {note.title} (ID: {note.id}, similarity {score:.2f})")
+        return "\n".join(lines)
+
     @staticmethod
     def _normalize_identifier_list(identifiers: List[str]) -> List[str]:
         """Strip empty values and de-duplicate while preserving order."""
@@ -378,9 +570,16 @@ class ZettelkastenMcpServer:
             status: Optional[str] = None,
             project_id: Optional[str] = None,
             area_id: Optional[str] = None,
+            origin: Optional[str] = None,
             check_duplicates: bool = True,
         ) -> str:
             """Create a new Zettelkasten note.
+
+            Creating many notes at once (e.g. ingesting a transcript)? Use
+            pzk_ingest_batch instead — notes, links, and tasks in one call.
+            Reuse existing tags (see pzk_get_all_tags) before minting new ones;
+            tags are normalized to lowercase-hyphenated form.
+
             Args:
                 title: The title of the note
                 content: The main content of the note
@@ -392,6 +591,8 @@ class ZettelkastenMcpServer:
                 status: Optional workflow status such as inbox, evergreen, or archived.
                 project_id: Optional project to route the note under; inherits the project's area.
                 area_id: ID of the area this note belongs to when project_id is not provided.
+                origin: Fine-grained provenance — the URL, chat/session id, file path,
+                    or meeting the note came from (optional but valuable for trust).
                 check_duplicates: When True (default), search for existing notes that look
                     like near-duplicates of this title/content BEFORE creating. If strong
                     matches are found, the note is NOT created and the matches are returned
@@ -502,8 +703,12 @@ class ZettelkastenMcpServer:
                     status=note_status,
                     project_id=project_id,
                     area_id=resolved_area_id,
+                    origin=origin,
                 )
-                return f"Note created successfully with ID: {note.id}"
+                out = f"Note created successfully with ID: {note.id}"
+                if note_type_enum in _DEDUP_NOTE_TYPES:
+                    out += self._suggested_links_message(note.id)
+                return out
             except Exception as e:
                 return self.format_error_response(e)
 
@@ -512,24 +717,34 @@ class ZettelkastenMcpServer:
         def pzk_get_note(identifier: str) -> str:
             """Retrieve a note by ID or title.
             Args:
-                identifier: The ID or title of the note
+                identifier: The ID or title of the note (IDs must be copied
+                    from prior tool output, never guessed)
             """
             try:
                 identifier = str(identifier)
                 note = self._resolve_note_identifier(identifier)
                 if not note:
-                    return f"Note not found: {identifier}"
+                    return self._not_found_message(identifier)
+                # Track explicit retrieval (recency/frequency signals for
+                # future recall ranking). Best-effort; never blocks the read.
+                self.zettel_service.record_retrieval([note.id])
                 return self._format_note_result(note)
             except Exception as e:
                 return self.format_error_response(e)
 
         @self.mcp.tool(name="pzk_get_notes")
-        def pzk_get_notes(identifiers: List[str]) -> str:
+        def pzk_get_notes(identifiers: List[str], detail: str = "full") -> str:
             """Retrieve multiple notes by ID or title in one call.
             Args:
                 identifiers: Note IDs or titles to retrieve
+                detail: Output detail — 'full' (default, complete content),
+                    'summary' (title/tags/preview), or 'ids' (titles + IDs only).
+                    Prefer 'summary' when skimming many notes to save context.
             """
             try:
+                detail = str(detail).strip().lower()
+                if detail not in {"full", "summary", "ids"}:
+                    return "Invalid detail: use 'full', 'summary', or 'ids'."
                 normalized = self._normalize_identifier_list(identifiers)
                 if not normalized:
                     return "Provide at least one note identifier."
@@ -550,42 +765,56 @@ class ZettelkastenMcpServer:
                     out = "No notes found for the provided identifiers."
                     if missing:
                         out += "\n\nMissing identifiers:\n"
-                        out += "\n".join(f"- {identifier}" for identifier in missing)
+                        out += "\n".join(
+                            f"- {self._not_found_message(identifier)}"
+                            for identifier in missing
+                        )
                     return out
 
+                self.zettel_service.record_retrieval([n.id for n in notes])
                 out = f"Notes retrieved ({len(notes)}/{len(normalized)}):\n\n"
-                out += "\n---\n\n".join(
-                    self._format_note_result(note) for note in notes
-                )
+                out += self._render_notes_with_detail(notes, detail)
                 if missing:
                     out += "\n\nMissing identifiers:\n"
                     out += "\n".join(f"- {identifier}" for identifier in missing)
+                    out += (
+                        "\n(IDs must be copied from prior tool output; titles "
+                        "also work.)"
+                    )
                 return out
             except Exception as e:
                 return self.format_error_response(e)
 
         @self.mcp.tool(name="pzk_get_notes_by_tag")
-        def pzk_get_notes_by_tag(tag: str, limit: int = 50) -> str:
+        def pzk_get_notes_by_tag(
+            tag: str, limit: int = 50, detail: str = "full"
+        ) -> str:
             """Retrieve notes with an exact tag match.
             Args:
                 tag: Tag name to retrieve
                 limit: Maximum results
+                detail: Output detail — 'full' (default), 'summary', or 'ids'.
+                    Prefer 'summary' when skimming a large tag to save context.
             """
             try:
+                detail = str(detail).strip().lower()
+                if detail not in {"full", "summary", "ids"}:
+                    return "Invalid detail: use 'full', 'summary', or 'ids'."
                 normalized_tag = str(tag).strip()
                 if not normalized_tag:
                     return "Provide a tag name."
                 if limit <= 0:
                     return "Limit must be greater than 0."
 
-                notes = self.zettel_service.get_notes_by_tag(normalized_tag)
-                notes = notes[:limit]
+                all_notes = self.zettel_service.get_notes_by_tag(normalized_tag)
+                notes = all_notes[:limit]
                 if not notes:
                     return f"No notes found with tag '{normalized_tag}'."
 
                 out = f"Notes tagged '{normalized_tag}' ({len(notes)}):\n\n"
-                out += "\n---\n\n".join(
-                    self._format_note_result(note) for note in notes
+                out += self._render_notes_with_detail(notes, detail)
+                out += self._truncation_notice(
+                    len(notes), len(all_notes), "raise limit to see the rest"
                 )
                 return out
             except Exception as e:
@@ -603,8 +832,16 @@ class ZettelkastenMcpServer:
             project_id: Optional[str] = None,
             parent_project_id: Optional[str] = None,
             area_id: Optional[str] = None,
+            origin: Optional[str] = None,
+            mark_verified: Optional[bool] = None,
         ) -> str:
             """Update an existing note.
+
+            Link editing via content IS honored: if the new content includes a
+            "## Links" section, its entries are reconciled into the link graph
+            (removed lines unlink, added lines link). Content WITHOUT a
+            "## Links" heading leaves the note's links untouched.
+
             Args:
                 note_id: The ID of the note to update
                 title: New title (optional)
@@ -615,12 +852,15 @@ class ZettelkastenMcpServer:
                 project_id: New project routing (optional). Pass empty string to clear it.
                 parent_project_id: New parent project / project routing (optional). Pass empty string to clear it.
                 area_id: New area routing (optional). Pass empty string to clear it.
+                origin: New provenance string (URL, chat id, file). Pass empty string to clear it.
+                mark_verified: True records today as the date this note's claim
+                    was last confirmed still true (last_verified); False clears it.
             """
             try:
                 # Get the note
                 note = self.zettel_service.get_note(str(note_id))
                 if not note:
-                    return f"Note not found: {note_id}"
+                    return self._not_found_message(note_id)
 
                 # Convert note_type string to enum if provided
                 note_type_enum = None
@@ -674,6 +914,14 @@ class ZettelkastenMcpServer:
                 if area_id is not None:
                     normalized_area_id = area_id.strip()
                     update_kwargs["area_id"] = normalized_area_id or None
+                if origin is not None:
+                    update_kwargs["origin"] = origin.strip() or None
+                if mark_verified is not None:
+                    import datetime as _dt
+
+                    update_kwargs["last_verified"] = (
+                        _dt.date.today() if mark_verified else None
+                    )
 
                 # Update the note
                 updated_note = self.zettel_service.update_note(**update_kwargs)
@@ -692,11 +940,15 @@ class ZettelkastenMcpServer:
                 # Check if note exists
                 note = self.zettel_service.get_note(note_id)
                 if not note:
-                    return f"Note not found: {note_id}"
+                    return self._not_found_message(note_id)
 
                 # Delete the note
                 self.zettel_service.delete_note(str(note_id))
-                return f"Note deleted successfully: {note_id}"
+                return (
+                    f"Note deleted successfully: {note_id}\n"
+                    "Incoming references were scrubbed: ## Links entries "
+                    "removed and inline [[wiki-links]] in prose unlinked."
+                )
             except Exception as e:
                 return self.format_error_response(e)
 
@@ -710,6 +962,10 @@ class ZettelkastenMcpServer:
             bidirectional: bool = False,
         ) -> str:
             """Create a link between two notes.
+
+            For many links at once (e.g. wiring up a fresh ingestion), use
+            pzk_ingest_batch with a links list instead of repeated calls.
+
             Args:
                 source_id: ID of the source note
                 target_id: ID of the target note
@@ -724,7 +980,23 @@ class ZettelkastenMcpServer:
                     target_id_str = str(target_id)
                     link_type_enum = LinkType(link_type.lower())
                 except ValueError:
-                    return f"Invalid link type: {link_type}. Valid types are: {', '.join(t.value for t in LinkType)}"
+                    valid = ", ".join(
+                        t.value for t in LinkType if t != LinkType.INLINE
+                    )
+                    return f"Invalid link type: {link_type}. Valid types are: {valid}"
+                if link_type_enum == LinkType.INLINE:
+                    return (
+                        "'inline' links are derived from [[wiki-links]] in note "
+                        "prose and cannot be created directly. Use an explicit "
+                        "type (reference, extends, supports, ...) or edit the "
+                        "note content."
+                    )
+                # Validate both endpoints up front so a bad ID gets recovery
+                # guidance instead of a bare not-found error.
+                if not self.zettel_service.get_note(source_id_str):
+                    return self._not_found_message(source_id_str)
+                if not self.zettel_service.get_note(target_id_str):
+                    return self._not_found_message(target_id_str)
 
                 # Create the link
                 source_note, target_note = self.zettel_service.create_link(
@@ -782,6 +1054,11 @@ class ZettelkastenMcpServer:
             limit: int = 10,
         ) -> str:
             """Search for notes by text, tags, type, status, or PARA routing fields.
+
+            Lexical-first (BM25 + semantic blend). For pure meaning-based recall
+            or pre-create dedup, prefer pzk_find_similar_to_text and phrase the
+            query as a complete claim, not keywords.
+
             Args:
                 query: Text to search for in titles and content
                 tags: Comma-separated list of tags to filter by
@@ -823,9 +1100,17 @@ class ZettelkastenMcpServer:
                 )
 
                 # Limit results
+                total_results = len(results)
                 results = results[:limit]
                 if not results:
-                    return "No matching notes found."
+                    out = "No matching notes found."
+                    if query:
+                        out += (
+                            "\nBefore concluding the vault has nothing on this: "
+                            "try pzk_find_similar_to_text with the full claim "
+                            "(semantic recall catches what keywords miss)."
+                        )
+                    return out
 
                 # Format results
                 output = f"Found {len(results)} matching notes:\n\n"
@@ -856,6 +1141,11 @@ class ZettelkastenMcpServer:
                             content_preview += "..."
                         output += f"   Preview: {content_preview}\n"
                     output += "\n"
+                output += self._truncation_notice(
+                    len(results), total_results, "refine the query or raise limit"
+                )
+                if query:
+                    output += self._lexical_verdict(results) + "\n"
                 return output
             except Exception as e:
                 return self.format_error_response(e)
@@ -902,6 +1192,14 @@ class ZettelkastenMcpServer:
                                             f"   Description: {link.description}\n"
                                         )
                                     break
+                            else:
+                                if note.id in getattr(
+                                    source_note, "inline_refs", []
+                                ):
+                                    output += (
+                                        "   Link type: inline (from a "
+                                        "[[wiki-link]] in prose)\n"
+                                    )
                     if direction in ["incoming", "both"]:
                         # Check target note's outgoing links
                         for link in note.links:
@@ -924,7 +1222,13 @@ class ZettelkastenMcpServer:
         # Get all tags
         @self.mcp.tool(name="pzk_get_all_tags")
         def pzk_get_all_tags() -> str:
-            """Get all tags in the Zettelkasten."""
+            """Get all tags in the Zettelkasten.
+
+            Call this BEFORE tagging new notes and reuse the closest existing
+            tag; only mint a new tag when the concept is genuinely absent.
+            New tags are normalized to lowercase-hyphenated form on write
+            (a leading @ for GTD contexts is preserved).
+            """
             try:
                 tags = self.zettel_service.get_all_tags()
                 if not tags:
@@ -975,6 +1279,7 @@ class ZettelkastenMcpServer:
                     if len(note.content) > 100:
                         content_preview += "..."
                     output += f"   Preview: {content_preview}\n\n"
+                output += self._semantic_verdict(similar_notes[0][1]) + "\n"
                 return output
             except Exception as e:
                 return self.format_error_response(e)
@@ -1010,6 +1315,9 @@ class ZettelkastenMcpServer:
                 if not similar:
                     return (
                         f"No semantically similar notes found (threshold {threshold}). "
+                        "This content is likely novel to the vault — but recall is "
+                        "imperfect, so an empty result does not PROVE novelty; "
+                        "if a related note comes to mind, link it by hand. "
                         "If embeddings are disabled, use pzk_search_notes instead."
                     )
                 output = f"Found {len(similar)} semantically similar notes:\n\n"
@@ -1024,6 +1332,7 @@ class ZettelkastenMcpServer:
                     if len(note.content) > 100:
                         content_preview += "..."
                     output += f"   Preview: {content_preview}\n\n"
+                output += self._semantic_verdict(similar[0][1]) + "\n"
                 return output
             except Exception as e:
                 return self.format_error_response(e)
@@ -1237,13 +1546,7 @@ class ZettelkastenMcpServer:
                 missing_from_files = report.get("missing_from_files", []) or []
                 content_drift = report.get("content_drift", []) or []
                 unreadable = report.get("unreadable_files", []) or []
-
-                if report.get("consistent"):
-                    return (
-                        "Files and index are consistent.\n"
-                        f"Files: {total_files}, Indexed: {total_indexed}, "
-                        f"In sync: {in_sync}"
-                    )
+                dangling_refs = report.get("dangling_refs", []) or []
 
                 def _section(label: str, ids: List[str]) -> str:
                     if not ids:
@@ -1252,6 +1555,23 @@ class ZettelkastenMcpServer:
                     if len(ids) > 20:
                         preview += f", … (+{len(ids) - 20} more)"
                     return f"{label} ({len(ids)}): {preview}\n"
+
+                dangling_section = ""
+                if dangling_refs:
+                    dangling_section = "\n" + _section(
+                        "Dangling wiki references (target note no longer "
+                        "exists; fix by editing the source note)",
+                        dangling_refs,
+                    )
+
+                if report.get("consistent"):
+                    return (
+                        "Files and index are consistent.\n"
+                        f"Files: {total_files}, Indexed: {total_indexed}, "
+                        f"In sync: {in_sync}" + (
+                            "\n" + dangling_section if dangling_section else ""
+                        )
+                    )
 
                 out = "Drift detected between files and index.\n"
                 out += (
@@ -1262,6 +1582,7 @@ class ZettelkastenMcpServer:
                 out += _section("Indexed notes with no file", missing_from_files)
                 out += _section("Content drift (file != index)", content_drift)
                 out += _section("Unreadable files", unreadable)
+                out += dangling_section
                 out += "\nRun pzk_rebuild_index to reconcile."
                 return out
             except Exception as e:
@@ -1773,21 +2094,30 @@ class ZettelkastenMcpServer:
                 return self.format_error_response(e)
 
         @self.mcp.tool(name="pzk_get_project_notes")
-        def pzk_get_project_notes(project_id: str, limit: int = 50) -> str:
+        def pzk_get_project_notes(
+            project_id: str, limit: int = 50, detail: str = "full"
+        ) -> str:
             """Get all non-task notes routed to a project.
             Args:
                 project_id: ID of the project note
                 limit: Maximum results
+                detail: Output detail — 'full' (default), 'summary', or 'ids'.
+                    Prefer 'summary' when surveying a large project to save context.
             """
             try:
-                notes = self.zettel_service.get_project_notes(project_id)
-                notes = notes[:limit]
+                detail = str(detail).strip().lower()
+                if detail not in {"full", "summary", "ids"}:
+                    return "Invalid detail: use 'full', 'summary', or 'ids'."
+                all_notes = self.zettel_service.get_project_notes(project_id)
+                notes = all_notes[:limit]
                 if not notes:
                     return f"No project notes found for project {project_id}."
 
                 out = f"Project notes for {project_id} ({len(notes)}):\n\n"
-                rendered_notes = [self._format_note_result(note) for note in notes]
-                out += "\n---\n\n".join(rendered_notes)
+                out += self._render_notes_with_detail(notes, detail)
+                out += self._truncation_notice(
+                    len(notes), len(all_notes), "raise limit to see the rest"
+                )
                 return out
             except Exception as e:
                 return self.format_error_response(e)
@@ -1951,6 +2281,490 @@ class ZettelkastenMcpServer:
                 for i, n in enumerate(notes, 1):
                     out += f"{i}. {n.title} (ID: {n.id})\n"
                     out += f"   Type: {n.note_type.value}  Remind: {n.remind_at}\n\n"
+                return out
+            except Exception as e:
+                return self.format_error_response(e)
+
+        # ----------------------------------------------------------------
+        # AI-memory ergonomics tools
+        # ----------------------------------------------------------------
+
+        @self.mcp.tool(name="pzk_briefing")
+        def pzk_briefing() -> str:
+            """One-call session orientation: active projects, today's + overdue
+            tasks, due reminders, and recently touched notes.
+
+            Call this at the start of a work session (instead of separate
+            pzk_list_projects / pzk_get_todays_tasks / pzk_get_reminders /
+            pzk_list_notes_by_date calls) so the vault is consulted before new
+            work begins.
+            """
+            import datetime as _dt
+
+            today = _dt.date.today()
+            sections: List[str] = [f"Vault briefing — {today.isoformat()}"]
+
+            try:
+                projects = self.zettel_service.search_notes(
+                    note_type=NoteType.PROJECT
+                )
+                projects = [
+                    p
+                    for p in projects
+                    if p.status not in (NoteStatus.DONE, NoteStatus.CANCELLED)
+                ]
+                projects.sort(key=lambda p: (p.due_date or _dt.date.max))
+                lines = [f"Active projects ({len(projects)}):"]
+                for p in projects[:10]:
+                    line = f"- {p.title} (ID: {p.id})"
+                    if p.due_date:
+                        line += f" — deadline {p.due_date}"
+                    lines.append(line)
+                if len(projects) > 10:
+                    lines.append(f"  (+{len(projects) - 10} more)")
+                sections.append("\n".join(lines))
+            except Exception as e:
+                sections.append(f"Active projects: unavailable ({e})")
+
+            try:
+                tasks = self.zettel_service.get_todays_tasks(True)
+                lines = [f"Tasks due today / overdue ({len(tasks)}):"]
+                for t in tasks[:15]:
+                    priority_str = f" [P{t.priority}]" if t.priority else ""
+                    due_str = f" — due {t.due_date}" if t.due_date else ""
+                    status_str = t.status.value if t.status else "none"
+                    lines.append(
+                        f"-{priority_str} {t.title}{due_str} "
+                        f"({status_str}, ID: {t.id})"
+                    )
+                if len(tasks) > 15:
+                    lines.append(f"  (+{len(tasks) - 15} more)")
+                if len(tasks) == 0:
+                    lines = ["Tasks due today / overdue: none"]
+                sections.append("\n".join(lines))
+            except Exception as e:
+                sections.append(f"Tasks: unavailable ({e})")
+
+            try:
+                reminders = self.zettel_service.get_reminders(10)
+                if reminders:
+                    lines = [f"Reminders due ({len(reminders)}):"]
+                    for n in reminders:
+                        lines.append(
+                            f"- {n.title} (remind {n.remind_at}, ID: {n.id})"
+                        )
+                    sections.append("\n".join(lines))
+                else:
+                    sections.append("Reminders due: none")
+            except Exception as e:
+                sections.append(f"Reminders: unavailable ({e})")
+
+            try:
+                start = datetime.now() - timedelta(days=7)
+                recent = self.search_service.find_notes_by_date_range(
+                    start_date=start, use_updated=True
+                )[:10]
+                if recent:
+                    lines = ["Recently touched notes (last 7 days):"]
+                    for n in recent:
+                        lines.append(
+                            f"- {n.title} ({n.note_type.value}, "
+                            f"updated {n.updated_at.strftime('%Y-%m-%d')}, "
+                            f"ID: {n.id})"
+                        )
+                    sections.append("\n".join(lines))
+                else:
+                    sections.append("Recently touched notes: none in 7 days")
+            except Exception as e:
+                sections.append(f"Recent notes: unavailable ({e})")
+
+            sections.append(
+                "Before starting new work, check the vault for relevant prior "
+                "knowledge: pzk_find_similar_to_text with the task described "
+                "as a full sentence."
+            )
+            return "\n\n".join(sections)
+
+        @self.mcp.tool(name="pzk_get_neighborhood")
+        def pzk_get_neighborhood(
+            note_id: str, depth: int = 2, max_nodes: int = 25
+        ) -> str:
+            """Map the linked neighborhood around a note, grouped by hop distance.
+
+            Use for synthesis ('what do I know around X?') instead of chaining
+            pzk_get_linked_notes calls. Includes inline prose references.
+
+            Args:
+                note_id: ID or title of the center note
+                depth: How many hops to traverse (1-3)
+                max_nodes: Cap on total notes returned (default 25)
+            """
+            try:
+                if not 1 <= depth <= 3:
+                    return "depth must be between 1 and 3."
+                if max_nodes <= 0:
+                    return "max_nodes must be greater than 0."
+                center = self._resolve_note_identifier(note_id)
+                if not center:
+                    return self._not_found_message(note_id)
+
+                visited: Dict[str, Note] = {center.id: center}
+                hop_of: Dict[str, int] = {center.id: 0}
+                relation: Dict[str, str] = {}
+                frontier: List[Note] = [center]
+                for hop in range(1, depth + 1):
+                    next_frontier: List[Note] = []
+                    for node in frontier:
+                        if len(visited) >= max_nodes:
+                            break
+                        try:
+                            neighbors = self.zettel_service.get_linked_notes(
+                                node.id, "both"
+                            )
+                        except Exception:
+                            continue
+                        for neighbor in neighbors:
+                            if neighbor.id in visited:
+                                continue
+                            if len(visited) >= max_nodes:
+                                break
+                            visited[neighbor.id] = neighbor
+                            hop_of[neighbor.id] = hop
+                            relation[neighbor.id] = self._describe_relation(
+                                node, neighbor
+                            )
+                            next_frontier.append(neighbor)
+                    frontier = next_frontier
+                    if not frontier:
+                        break
+
+                out = (
+                    f"Neighborhood of '{center.title}' (ID: {center.id}) — "
+                    f"{len(visited) - 1} connected note(s) within {depth} hop(s):\n"
+                )
+                for hop in range(1, depth + 1):
+                    at_hop = [
+                        note
+                        for nid, note in visited.items()
+                        if hop_of[nid] == hop
+                    ]
+                    if not at_hop:
+                        continue
+                    out += f"\nHop {hop}:\n"
+                    for note in at_hop:
+                        preview = note.content[:120].replace("\n", " ").strip()
+                        if len(preview) > 100:
+                            preview = preview[:100] + "..."
+                        out += (
+                            f"- {note.title} (ID: {note.id}, "
+                            f"{note.note_type.value}) [{relation.get(note.id, 'linked')}]\n"
+                        )
+                        if preview:
+                            out += f"  {preview}\n"
+                if len(visited) - 1 == 0:
+                    out += "\n(No links yet — consider pzk_find_similar_notes to find candidates.)"
+                elif len(visited) >= max_nodes:
+                    out += (
+                        f"\n(Capped at {max_nodes} notes; raise max_nodes for "
+                        "a wider map.)"
+                    )
+                return out
+            except Exception as e:
+                return self.format_error_response(e)
+
+        @self.mcp.tool(name="pzk_ingest_batch")
+        def pzk_ingest_batch(
+            notes: Optional[List[Dict[str, Any]]] = None,
+            links: Optional[List[Dict[str, Any]]] = None,
+            tasks: Optional[List[Dict[str, Any]]] = None,
+            default_project_id: Optional[str] = None,
+            default_area_id: Optional[str] = None,
+            default_source: str = "chat",
+            check_duplicates: bool = True,
+        ) -> str:
+            """Create many notes, links, and tasks in ONE call (batch ingestion).
+
+            Use this instead of dozens of individual create calls when capturing
+            a transcript, meeting, or document. Notes are created first (each
+            passes the same dedup gate as pzk_create_note — a near-duplicate is
+            skipped and link references to it attach to the EXISTING note), then
+            tasks, then links. Each item succeeds or fails independently.
+
+            Reference syntax in links: "#0" refers to the first entry in notes,
+            "#1" the second, etc.; "#t0" refers to the first entry in tasks.
+            Real note IDs are also accepted.
+
+            Args:
+                notes: List of note objects: {title, content, note_type?
+                    (fleeting/literature/permanent/structure/hub, default
+                    permanent), tags? (list or comma-string), source?, status?,
+                    project_id?, area_id?, origin?, check_duplicates?}
+                links: List of link objects: {source, target, type? (default
+                    reference), description?, bidirectional?} — source/target
+                    take real IDs or "#N"/"#tN" references
+                tasks: List of task objects: {title, content, project_id?,
+                    status?, due_date? (YYYY-MM-DD), priority? (1-4), tags?,
+                    remind_at?}
+                default_project_id: Project routing applied to items that don't
+                    specify their own
+                default_area_id: Area routing applied to notes that don't
+                    specify their own
+                default_source: Source for items that don't specify one
+                    (default 'chat')
+                check_duplicates: Default dedup behavior for notes (per-item
+                    check_duplicates overrides)
+            """
+            import datetime as _dt
+
+            def _coerce_items(value: Any, label: str) -> List[Dict[str, Any]]:
+                if value is None:
+                    return []
+                if isinstance(value, str):
+                    value = json.loads(value)
+                if not isinstance(value, list):
+                    raise ValueError(f"{label} must be a JSON array of objects")
+                return value
+
+            try:
+                try:
+                    note_items = _coerce_items(notes, "notes")
+                    link_items = _coerce_items(links, "links")
+                    task_items = _coerce_items(tasks, "tasks")
+                except (ValueError, json.JSONDecodeError) as exc:
+                    return f"Error: {exc}"
+                if not (note_items or link_items or task_items):
+                    return "Provide at least one of notes, links, or tasks."
+
+                refs: Dict[str, str] = {}
+                lines: List[str] = []
+                created_notes = skipped_notes = created_tasks = created_links = 0
+                errors = 0
+
+                for idx, item in enumerate(note_items):
+                    ref = f"#{idx}"
+                    try:
+                        if not isinstance(item, dict):
+                            raise ValueError("each notes entry must be an object")
+                        title = str(item.get("title") or "").strip()
+                        body = str(item.get("content") or "")
+                        if not title or not body:
+                            raise ValueError("title and content are required")
+                        nt = NoteType(
+                            str(item.get("note_type", "permanent")).lower()
+                        )
+                        if nt not in _DEDUP_NOTE_TYPES:
+                            raise ValueError(
+                                "note_type must be a knowledge type (fleeting, "
+                                "literature, permanent, structure, hub); use "
+                                "the tasks list for action items"
+                            )
+                        src = NoteSource(
+                            str(item.get("source") or default_source).lower()
+                        )
+                        st = None
+                        if item.get("status"):
+                            st = NoteStatus(str(item["status"]).lower())
+                        tag_list = item.get("tags")
+                        if isinstance(tag_list, str):
+                            tag_list = [
+                                t.strip() for t in tag_list.split(",") if t.strip()
+                            ]
+                        do_dedup = bool(item.get("check_duplicates", check_duplicates))
+                        if do_dedup:
+                            duplicates = self._find_duplicate_candidates(title, body)
+                            if duplicates:
+                                existing, score = duplicates[0]
+                                refs[ref] = existing.id
+                                skipped_notes += 1
+                                lines.append(
+                                    f"{ref} SKIPPED — near-duplicate of "
+                                    f"'{existing.title}' (ID: {existing.id}, "
+                                    f"score {score:.2f}); links to {ref} attach "
+                                    "to the existing note"
+                                )
+                                continue
+                        note = self.zettel_service.create_note(
+                            title=title,
+                            content=body,
+                            note_type=nt,
+                            tags=tag_list,
+                            source=src,
+                            status=st,
+                            project_id=item.get("project_id") or default_project_id,
+                            area_id=item.get("area_id") or default_area_id,
+                            origin=item.get("origin"),
+                        )
+                        refs[ref] = note.id
+                        created_notes += 1
+                        lines.append(f"{ref} created: {title} (ID: {note.id})")
+                    except Exception as exc:
+                        errors += 1
+                        lines.append(f"{ref} ERROR: {exc}")
+
+                for idx, item in enumerate(task_items):
+                    ref = f"#t{idx}"
+                    try:
+                        if not isinstance(item, dict):
+                            raise ValueError("each tasks entry must be an object")
+                        title = str(item.get("title") or "").strip()
+                        body = str(item.get("content") or "")
+                        if not title or not body:
+                            raise ValueError("title and content are required")
+                        project = item.get("project_id") or default_project_id
+                        if not project:
+                            raise ValueError(
+                                "project_id (or default_project_id) is required "
+                                "for tasks"
+                            )
+                        st = NoteStatus(str(item.get("status", "inbox")).lower())
+                        src = NoteSource(
+                            str(item.get("source") or default_source).lower()
+                        )
+                        due = None
+                        if item.get("due_date"):
+                            due = _dt.date.fromisoformat(str(item["due_date"]))
+                        remind = None
+                        if item.get("remind_at"):
+                            remind = _dt.date.fromisoformat(str(item["remind_at"]))
+                        priority = item.get("priority")
+                        if priority is not None and priority not in {1, 2, 3, 4}:
+                            raise ValueError("priority must be 1-4")
+                        tag_list = item.get("tags")
+                        if isinstance(tag_list, str):
+                            tag_list = [
+                                t.strip() for t in tag_list.split(",") if t.strip()
+                            ]
+                        task = self.zettel_service.create_task(
+                            title=title,
+                            content=body,
+                            status=st,
+                            tags=tag_list,
+                            project_id=project,
+                            due_date=due,
+                            remind_at=remind,
+                            priority=priority,
+                            source=src,
+                        )
+                        refs[ref] = task.id
+                        created_tasks += 1
+                        lines.append(f"{ref} task created: {title} (ID: {task.id})")
+                    except Exception as exc:
+                        errors += 1
+                        lines.append(f"{ref} ERROR: {exc}")
+
+                def _resolve_ref(value: Any) -> str:
+                    text = str(value).strip()
+                    if text.startswith("#"):
+                        resolved = refs.get(text)
+                        if not resolved:
+                            raise ValueError(
+                                f"reference {text} does not resolve (its item "
+                                "errored or does not exist)"
+                            )
+                        return resolved
+                    return text
+
+                for idx, item in enumerate(link_items):
+                    try:
+                        if not isinstance(item, dict):
+                            raise ValueError("each links entry must be an object")
+                        source_id = _resolve_ref(item.get("source"))
+                        target_id = _resolve_ref(item.get("target"))
+                        lt = LinkType(str(item.get("type", "reference")).lower())
+                        if lt == LinkType.INLINE:
+                            raise ValueError(
+                                "'inline' links are derived from prose and "
+                                "cannot be created directly"
+                            )
+                        self.zettel_service.create_link(
+                            source_id=source_id,
+                            target_id=target_id,
+                            link_type=lt,
+                            description=item.get("description"),
+                            bidirectional=bool(item.get("bidirectional", False)),
+                        )
+                        created_links += 1
+                        lines.append(
+                            f"link {idx}: {source_id} -{lt.value}-> {target_id}"
+                        )
+                    except Exception as exc:
+                        errors += 1
+                        lines.append(f"link {idx} ERROR: {exc}")
+
+                summary = (
+                    f"Batch ingest complete: {created_notes} note(s) created, "
+                    f"{skipped_notes} skipped as duplicates, {created_tasks} "
+                    f"task(s), {created_links} link(s)"
+                )
+                if errors:
+                    summary += f", {errors} ERROR(s) — review below"
+                return summary + ".\n\n" + "\n".join(lines)
+            except Exception as e:
+                return self.format_error_response(e)
+
+        @self.mcp.tool(name="pzk_find_tensions")
+        def pzk_find_tensions(note_id: str, limit: int = 8) -> str:
+            """Surface same-topic notes NOT yet linked to a note, framed for a
+            tension/agreement judgment.
+
+            Similarity finds same-TOPIC, not same-stance: a duplicate and a
+            counter-claim look identical to embeddings. This tool retrieves the
+            unlinked semantic neighbors; YOU then judge each one and act:
+            - same atomic claim  -> fold (update the existing note, delete the dup)
+            - compatible/adds to -> link (related / supports / extends)
+            - tension/conflict   -> link contradicts or refines, and consider
+              reconciling the two notes' text
+            Run after creating or substantially updating a note.
+
+            Args:
+                note_id: ID or title of the note to check
+                limit: Maximum candidates to return (default 8)
+            """
+            try:
+                if limit <= 0:
+                    return "Limit must be greater than 0."
+                note = self._resolve_note_identifier(note_id)
+                if not note:
+                    return self._not_found_message(note_id)
+
+                similar = self.zettel_service.find_similar_notes(note.id, 0.3)
+                linked_ids = {link.target_id for link in note.links}
+                linked_ids.update(getattr(note, "inline_refs", []))
+                try:
+                    for neighbor in self.zettel_service.get_linked_notes(
+                        note.id, "incoming"
+                    ):
+                        linked_ids.add(neighbor.id)
+                except Exception:
+                    pass
+                candidates = [
+                    (other, score)
+                    for other, score in similar
+                    if other.id != note.id and other.id not in linked_ids
+                ][:limit]
+                if not candidates:
+                    return (
+                        f"No unlinked same-topic notes found for '{note.title}'. "
+                        "Its semantic neighborhood is either empty or already "
+                        "linked."
+                    )
+
+                out = (
+                    f"Unlinked same-topic notes for '{note.title}' "
+                    f"(ID: {note.id}) — judge each: same claim (fold), "
+                    "compatible (link related/supports/extends), or tension "
+                    "(link contradicts/refines):\n\n"
+                )
+                for i, (other, score) in enumerate(candidates, 1):
+                    preview = other.content[:200].replace("\n", " ").strip()
+                    if len(preview) > 180:
+                        preview = preview[:180] + "..."
+                    out += f"{i}. {other.title} (ID: {other.id}, similarity {score:.2f})\n"
+                    out += f"   {preview}\n\n"
+                out += (
+                    "Act with pzk_create_link (judged relation), pzk_update_note "
+                    "(fold/reconcile), or no action if genuinely unrelated."
+                )
                 return out
             except Exception as e:
                 return self.format_error_response(e)

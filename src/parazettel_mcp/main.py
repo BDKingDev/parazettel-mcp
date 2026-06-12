@@ -7,7 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
 from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
@@ -350,6 +352,69 @@ def _wait_for_daemon_ready(client: DaemonRpcClient, timeout_seconds: float) -> N
         raise last_error
 
 
+_DAEMON_START_LOCK_TIMEOUT_SECONDS = 30.0
+_DAEMON_START_LOCK_POLL_SECONDS = 0.2
+
+
+@contextmanager
+def _daemon_start_lock() -> Iterator[None]:
+    """Hold an OS-level file lock across the daemon health-check-then-spawn.
+
+    Without it, two MCP clients starting simultaneously can both see an
+    unhealthy daemon and both spawn one; the loser of the port race dies to
+    DEVNULL and the second client may fall back to read-only mode. Best-effort:
+    if the lock cannot be acquired within the timeout (or the platform refuses
+    file locking), the start proceeds unlocked rather than deadlocking.
+    """
+    lock_path = config.get_daemon_runtime_dir() / "daemon-start.lock"
+    try:
+        handle = open(lock_path, "a+b")
+    except OSError:
+        yield
+        return
+
+    locked = False
+    deadline = time.time() + _DAEMON_START_LOCK_TIMEOUT_SECONDS
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            while time.time() < deadline:
+                try:
+                    # Non-blocking probe; retry until the holder releases it.
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(_DAEMON_START_LOCK_POLL_SECONDS)
+        else:
+            import fcntl
+
+            while time.time() < deadline:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(_DAEMON_START_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
 def ensure_daemon_running(args: argparse.Namespace) -> None:
     """Ensure the configured daemon is available, auto-starting it if needed."""
     client = DaemonRpcClient(config.get_daemon_base_url())
@@ -357,16 +422,25 @@ def ensure_daemon_running(args: argparse.Namespace) -> None:
         client.health()
         return
     except DaemonUnavailableError:
-        _remove_daemon_pid_file()
+        pass
 
-    _spawn_daemon_process(args)
-    try:
-        _wait_for_daemon_ready(client, _DAEMON_START_TIMEOUT_SECONDS)
-    except DaemonUnavailableError as exc:
-        raise DaemonUnavailableError(
-            "Failed to auto-start the Parazettel daemon. Start it manually "
-            f"with: {config.format_daemon_start_command()}"
-        ) from exc
+    # Serialize the spawn across processes: whoever wins the lock starts the
+    # daemon; everyone who waited re-checks health and finds it already up.
+    with _daemon_start_lock():
+        try:
+            client.health()
+            return
+        except DaemonUnavailableError:
+            _remove_daemon_pid_file()
+
+        _spawn_daemon_process(args)
+        try:
+            _wait_for_daemon_ready(client, _DAEMON_START_TIMEOUT_SECONDS)
+        except DaemonUnavailableError as exc:
+            raise DaemonUnavailableError(
+                "Failed to auto-start the Parazettel daemon. Start it manually "
+                f"with: {config.format_daemon_start_command()}"
+            ) from exc
 
 
 def main():
