@@ -19,7 +19,7 @@ import os
 
 import pytest
 
-from parazettel_mcp.models.schema import LinkType
+from parazettel_mcp.models.schema import LinkType, NoteType
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def test_hand_added_links_line_becomes_edge_after_rebuild(zettel_service):
     assert edge_types(zettel_service, a.id, b.id) == {"extends"}
     # And the parsed note agrees with the graph.
     parsed = zettel_service.get_note(a.id)
-    assert {(l.target_id, l.link_type) for l in parsed.links} == {
+    assert {(link.target_id, link.link_type) for link in parsed.links} == {
         (b.id, LinkType.EXTENDS)
     }
 
@@ -201,7 +201,9 @@ def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
         + f"\n## Links\n- refines [[{b.id}]] <!-- created: {stamp} -->\n",
     )
     zettel_service.rebuild_index()
-    link = next(l for l in zettel_service.get_note(a.id).links if l.target_id == b.id)
+    link = next(
+        lk for lk in zettel_service.get_note(a.id).links if lk.target_id == b.id
+    )
     assert link.created_at == datetime.datetime.fromisoformat(stamp)
     with zettel_service.repository._connection() as conn:
         result = conn.execute(
@@ -423,6 +425,55 @@ def test_subproject_wires_parent_and_area_both_layers(para):
 # ---------------------------------------------------------------------------
 # 2b. Direct area membership is bidirectional (part_of + materialized has_part)
 # ---------------------------------------------------------------------------
+
+
+def test_create_note_project_under_parent_wires_area_membership(para):
+    """A project created via create_note (note_type=project) under a parent
+    project must be a full member of its inherited area — part_of + has_part on
+    both the parent project and the area — not just reference the area."""
+    service, area, parent = para
+    sub = service.create_note(
+        title="Sub via create_note",
+        content="s",
+        note_type=NoteType.PROJECT,
+        project_id=parent.id,
+    )
+    assert sub.area_id == area.id
+    section = links_section(service, sub.id)
+    assert f"part_of [[{parent.id}" in section
+    assert f"part_of [[{area.id}" in section
+    assert edge_types(service, sub.id, parent.id) == {"part_of"}
+    assert "part_of" in edge_types(service, sub.id, area.id)
+    # has_part counter link on both containers, both layers.
+    assert edge_types(service, parent.id, sub.id) == {"has_part"}
+    assert edge_types(service, area.id, sub.id) == {"has_part"}
+
+
+def test_links_section_edit_cannot_deroute_note(zettel_service):
+    """A hand-edited ## Links that omits routing links must not de-route the
+    note: area reference + part_of are regenerated from frontmatter."""
+    area = zettel_service.create_area_note(title="Routing Area", content="a")
+    note = zettel_service.create_note(
+        title="Routed", content="n", area_id=area.id
+    )
+    other = zettel_service.create_note(
+        title="Other Note", content="o", area_id=area.id
+    )
+
+    # Hand-edit content with a ## Links section that drops BOTH area links and
+    # keeps only an unrelated reference.
+    new_content = f"# Routed\n\nBody.\n\n## Links\n- reference [[{other.id}]]\n"
+    zettel_service.update_note(note.id, content=new_content)
+
+    parsed = zettel_service.get_note(note.id)
+    targets = {(link.target_id, link.link_type) for link in parsed.links}
+    # Routing links survived the omission...
+    assert (area.id, LinkType.REFERENCE) in targets
+    assert (area.id, LinkType.PART_OF) in targets
+    # ...and the hand-added link is present too.
+    assert (other.id, LinkType.REFERENCE) in targets
+    # Graph agrees with the file.
+    assert {"reference", "part_of"} <= edge_types(zettel_service, note.id, area.id)
 
 
 def test_area_direct_note_is_bidirectional_member(zettel_service):

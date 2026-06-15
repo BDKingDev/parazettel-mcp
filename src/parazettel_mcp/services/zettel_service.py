@@ -132,6 +132,33 @@ class ZettelService:
             note.add_link(parent_id, LinkType.PART_OF)
         return note
 
+    def _routing_link_keys(self, note: Note) -> List[Tuple[str, LinkType]]:
+        """The (target_id, link_type) routing links a note must carry given its
+        current frontmatter routing.
+
+        These are generated from ``area_id``/``project_id`` — not free-form — so
+        they are the canonical set to seed at create and to preserve across a
+        ``## Links`` reconciliation. A non-area note references its area and is
+        ``part_of`` its container (its project, else the area); a project routed
+        under a parent project is additionally ``part_of`` its inherited area.
+        """
+        if note.note_type == NoteType.AREA:
+            return []
+        keys: List[Tuple[str, LinkType]] = []
+        if note.area_id and note.area_id != note.id:
+            keys.append((note.area_id, LinkType.REFERENCE))
+        container = note.project_id or note.area_id
+        if container and container != note.id:
+            keys.append((container, LinkType.PART_OF))
+        if (
+            note.note_type == NoteType.PROJECT
+            and note.project_id
+            and note.area_id
+            and note.area_id != note.id
+        ):
+            keys.append((note.area_id, LinkType.PART_OF))
+        return keys
+
     def _ensure_parent_has_part_link(self, parent_id: Optional[str], child_id: str) -> None:
         """Update the parent note once so it reflects the child relationship.
 
@@ -296,20 +323,27 @@ class ZettelService:
             if note_type == NoteType.AREA:
                 note.area_id = note.id
             else:
-                # The note's container gets a part_of link: the project when
-                # routed through one, otherwise the area itself — and the
-                # container's markdown gains the has_part counter link, so
-                # direct area membership is bidirectional in both layers like
-                # project membership.
+                # Seed the canonical routing links (area reference + part_of to
+                # the container, plus area part_of for a project under a parent
+                # project) so membership is bidirectional in both layers — the
+                # same set create_project_note produces.
                 note = self._seed_routing_links(
                     note, parent_id=project_id or resolved_area_id
                 )
+                if note_type == NoteType.PROJECT and project_id and resolved_area_id:
+                    note.add_link(resolved_area_id, LinkType.PART_OF)
 
             note = self.repository.create(note)
-            self._ensure_parent_has_part_link(
-                project_id or (resolved_area_id if note_type != NoteType.AREA else None),
-                note.id,
-            )
+            # Materialize the has_part counter link on every container the note
+            # is a member of. A project routed under a parent project belongs to
+            # both that parent project and its inherited area.
+            if note_type == NoteType.PROJECT and project_id and resolved_area_id:
+                self._ensure_parent_has_part_link(project_id, note.id)
+                self._ensure_parent_has_part_link(resolved_area_id, note.id)
+            elif note_type != NoteType.AREA:
+                self._ensure_parent_has_part_link(
+                    project_id or resolved_area_id, note.id
+                )
         return note
 
     def get_note(self, note_id: str) -> Optional[Note]:
@@ -398,6 +432,13 @@ class ZettelService:
         ``created_at``/description. When the new content has NO ``## Links``
         heading the existing links are kept unchanged (so passing just a new
         body never wipes the link graph).
+
+        Routing-derived links (area ``reference``/``part_of``) are NOT free-form
+        — they are generated from the note's frontmatter routing — so they are
+        re-added after parsing even when the hand-edited section omits them.
+        Otherwise a ## Links edit could silently de-route the note from its
+        area/project (the later routing sync only repairs links when
+        ``area_id``/``project_id`` themselves change).
         """
         if "## Links" not in content:
             return
@@ -409,6 +450,17 @@ class ZettelService:
             existing_by_key.get((link.target_id, link.link_type), link)
             for link in parsed
         ]
+        present = {(link.target_id, link.link_type) for link in note.links}
+        for key in self._routing_link_keys(note):
+            if key in present:
+                continue
+            target_id, link_type = key
+            note.links.append(
+                existing_by_key.get(key)
+                or Link(
+                    source_id=note.id, target_id=target_id, link_type=link_type
+                )
+            )
 
     def _update_note_locked(
         self,
@@ -585,16 +637,19 @@ class ZettelService:
     def get_notes_by_tag(self, tag: str) -> List[Note]:
         """Get notes by tag.
 
-        Exact match first (so legacy, pre-normalization tags stay reachable);
-        on a miss, retries with the normalized spelling so a caller asking for
-        'AI' still finds notes tagged 'ai'.
+        Returns the de-duplicated union of the raw-tag and normalized-tag
+        matches, so a mixed vault (some notes under a legacy raw spelling, some
+        under the canonical normalized one) surfaces both for a query like 'AI'
+        — not just whichever set happens to match first.
         """
-        notes = self.repository.find_by_tag(tag)
-        if notes:
-            return notes
+        notes = list(self.repository.find_by_tag(tag))
         normalized = normalize_tag(tag)
         if normalized and normalized != tag:
-            return self.repository.find_by_tag(normalized)
+            seen = {note.id for note in notes}
+            for note in self.repository.find_by_tag(normalized):
+                if note.id not in seen:
+                    seen.add(note.id)
+                    notes.append(note)
         return notes
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
@@ -1098,7 +1153,8 @@ class ZettelService:
         title = note.title or ""
         body = note.content or ""
         # Drop the generated ## Links section so link IDs don't dominate overlap.
-        body = body.split("## Links", 1)[0]
+        # Match only an actual heading line, never the literal text in prose.
+        body = re.split(r"(?m)^\s*##\s+Links\s*$", body, maxsplit=1)[0]
         text = f"{title} {body}".lower()
         tokens = re.findall(r"[a-z0-9]+", text)
         return {

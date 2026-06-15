@@ -385,8 +385,12 @@ class ZettelkastenMcpServer:
                     f"- {r.note.title} (ID: {r.note.id})" for r in results
                 )
                 msg += "\nIf one of these is the intended note, retry with its ID."
-        except Exception:  # pragma: no cover - suggestions are best-effort
-            pass
+        except Exception as exc:  # pragma: no cover - suggestions are best-effort
+            logger.debug(
+                "Could not compute not-found suggestions for %r: %s",
+                identifier,
+                exc,
+            )
         return msg
 
     @staticmethod
@@ -814,6 +818,10 @@ class ZettelkastenMcpServer:
                 if not notes:
                     return f"No notes found with tag '{normalized_tag}'."
 
+                # Record retrieval only when full content is actually returned;
+                # an ids/summary browse isn't a deliberate read.
+                if detail == "full":
+                    self.zettel_service.record_retrieval([n.id for n in notes])
                 out = f"Notes tagged '{normalized_tag}' ({len(notes)}):\n\n"
                 out += self._render_notes_with_detail(notes, detail)
                 out += self._truncation_notice(
@@ -2116,6 +2124,8 @@ class ZettelkastenMcpServer:
                 if not notes:
                     return f"No project notes found for project {project_id}."
 
+                if detail == "full":
+                    self.zettel_service.record_retrieval([n.id for n in notes])
                 out = f"Project notes for {project_id} ({len(notes)}):\n\n"
                 out += self._render_notes_with_detail(notes, detail)
                 out += self._truncation_notice(
@@ -2424,7 +2434,10 @@ class ZettelkastenMcpServer:
                             neighbors = self.zettel_service.get_linked_notes(
                                 node.id, "both"
                             )
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug(
+                                "Could not read neighbors for %s: %s", node.id, exc
+                            )
                             continue
                         for neighbor in neighbors:
                             if neighbor.id in visited:
@@ -2793,8 +2806,12 @@ class ZettelkastenMcpServer:
                         note.id, "incoming"
                     ):
                         linked_ids.add(neighbor.id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug(
+                        "Could not read incoming links for tensions on %s: %s",
+                        note.id,
+                        exc,
+                    )
                 candidates = [
                     (other, score)
                     for other, score in similar

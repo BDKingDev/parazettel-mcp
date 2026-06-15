@@ -249,6 +249,11 @@ def apply_plan(service, plan: BackfillPlan) -> Dict[str, int]:
     # rewrite (and re-embed) its file once per member.
     for area_id, member_ids in plan.area_has_part.items():
         try:
+            # Deliberately reach into the service's private write lock: this
+            # one-time migration batches all of an area's has_part links into a
+            # single file write (the largest area has ~600 members; per-link
+            # create_link would rewrite and re-embed the area file once per
+            # member). Acceptable coupling for a script; not a public API.
             with service._write_locked():
                 area = service.repository.get(area_id)
                 if area is None:

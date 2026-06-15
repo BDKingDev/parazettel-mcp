@@ -117,6 +117,10 @@ _NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
 # Hidden in Obsidian preview; lets link created_at survive rebuilds.
 _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 
+# Matches an actual "## Links" heading line (not the literal text in prose), so
+# splitting a note body on it can't be tripped by an in-prose mention.
+_LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
+
 def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
     key = (path_str, mtime_ns)
     with _NOTE_CACHE_LOCK:
@@ -1204,7 +1208,13 @@ class NoteRepository(Repository[Note]):
         are skipped so the graph doesn't grow a duplicate edge. Fenced code
         blocks are ignored.
         """
-        explicit_targets = {link.target_id for link in links}
+        # Exclude INLINE links: a graph-sourced Note carries its inline edges in
+        # ``links`` too, and treating those as "explicit" would suppress
+        # re-deriving the very inline refs they represent (dropping the edge on
+        # the next reindex). Only true ## Links entries should pre-empt a ref.
+        explicit_targets = {
+            link.target_id for link in links if link.link_type != LinkType.INLINE
+        }
         refs: List[str] = []
         seen: Set[str] = set()
         links_section = False
@@ -1403,9 +1413,10 @@ class NoteRepository(Repository[Note]):
         lines are IDs and titles of OTHER notes, so they dilute the vector —
         and a container note (an area lists every direct member as a has_part
         line) would otherwise embed as a soup of member titles instead of its
-        own meaning.
+        own meaning. Only an actual ``## Links`` heading line is matched, so the
+        literal text appearing in prose never truncates the body.
         """
-        body = (note.content or "").split("## Links", 1)[0]
+        body = _LINKS_HEADING_RE.split(note.content or "", maxsplit=1)[0]
         return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod

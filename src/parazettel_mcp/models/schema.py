@@ -335,13 +335,18 @@ class Note(BaseModel):
 
         # Format tags
         tags_str = ", ".join([tag.name for tag in self.tags])
-        # Format links
+        # Format links. INLINE links are derived from prose [[wiki-links]] and
+        # must never be rendered into the ## Links section (the new contract);
+        # a graph-sourced Note can carry them in self.links, so filter them out.
+        serializable_links = [
+            link for link in self.links if link.link_type != LinkType.INLINE
+        ]
         links_str = ""
-        if self.links:
+        if serializable_links:
             links_str = "\n".join(
                 [
                     f"- [{link.link_type.value}] [[{link.target_id}]] {link.description or ''}"
-                    for link in self.links
+                    for link in serializable_links
                 ]
             )
         # Apply template

@@ -42,6 +42,26 @@ def test_tags_normalized_on_create_and_update(zettel_service):
     assert [tag.name for tag in updated.tags] == ["new-tag"]
 
 
+def test_get_notes_by_tag_unions_raw_and_normalized(zettel_service):
+    """A mixed vault — a legacy note under a raw 'AI' tag plus a current note
+    under the normalized 'ai' — must surface BOTH when queried by the raw
+    spelling, not just whichever set matches first."""
+    from parazettel_mcp.models.schema import Note, NoteType, Tag
+
+    # Current note: normalized to 'ai' on write.
+    norm = zettel_service.create_note(title="Norm", content="n", tags=["AI"])
+    assert "ai" in {t.name for t in zettel_service.get_note(norm.id).tags}
+    # Legacy note seeded directly with the raw 'AI' tag (pre-normalization).
+    legacy = Note(
+        title="Legacy", content="l", note_type=NoteType.FLEETING,
+        tags=[Tag(name="AI")],
+    )
+    zettel_service.repository.create(legacy)
+
+    ids = {n.id for n in zettel_service.get_notes_by_tag("AI")}
+    assert {norm.id, legacy.id} <= ids
+
+
 # ---------------------------------------------------------------------------
 # Inline prose wiki-links
 # ---------------------------------------------------------------------------
@@ -283,6 +303,37 @@ def test_embedding_text_strips_links_section(zettel_service):
     assert "About X." in embed_text
     assert member.id not in embed_text
     assert "Distinctive Member Title" not in embed_text
+
+
+def test_embedding_text_keeps_prose_mention_of_links_heading(zettel_service):
+    """Only an actual ## Links heading line is stripped — the literal text in
+    prose must not truncate the embedded body."""
+    note = zettel_service.create_note(
+        title="Meta Note",
+        content=(
+            "The phrase ## Links in running prose is not a heading and the "
+            "important keyword zebracorn must survive embedding."
+        ),
+    )
+    embed_text = zettel_service.repository._embedding_text(
+        zettel_service.get_note(note.id)
+    )
+    assert "zebracorn" in embed_text
+
+
+def test_to_markdown_excludes_inline_links(zettel_service):
+    """Note.to_markdown (used by export) must not render derived INLINE links
+    into the ## Links section."""
+    from parazettel_mcp.models.schema import LinkType as _LT
+    from parazettel_mcp.models.schema import Note, Tag
+
+    note = Note(title="Exportable", content="# Exportable\n\nBody.")
+    note.add_link("20260101T000000000000009", _LT.INLINE)
+    note.add_link("20260101T000000000000010", _LT.REFERENCE)
+    md = note.to_markdown()
+    assert "20260101T000000000000010" in md  # reference rendered
+    assert "20260101T000000000000009" not in md  # inline NOT rendered
+    assert "inline" not in md
 
 
 # ---------------------------------------------------------------------------
