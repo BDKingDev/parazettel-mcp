@@ -215,6 +215,7 @@ class TestMcpServer:
         assert link_kwargs["source_id"] == "dup123"
 
     def test_ingest_batch_rejects_invalid_on_duplicate(self):
+        """pzk_ingest_batch rejects an on_duplicate value other than flag/skip."""
         ingest_func = self.registered_tools["pzk_ingest_batch"]
         result = ingest_func(
             notes=[{"title": "T", "content": "c"}], on_duplicate="banana"

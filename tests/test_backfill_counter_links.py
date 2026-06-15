@@ -10,6 +10,7 @@ from parazettel_mcp.models.schema import LinkType
 
 
 def _load_backfill_module():
+    """Import the standalone backfill script as a module for testing."""
     script = (
         Path(__file__).resolve().parents[1] / "scripts" / "backfill_counter_links.py"
     )
@@ -38,6 +39,7 @@ def _strip_links_lines(service, note_id: str, *link_types: str) -> None:
 
 
 def edge_types(service, source_id: str, target_id: str) -> set:
+    """Return the LINKS_TO edge types from source to target, read straight from Kuzu."""
     with service.repository._connection() as conn:
         result = conn.execute(
             "MATCH (s:Note {id: $s})-[r:LINKS_TO]->(t:Note {id: $t}) "
@@ -86,6 +88,7 @@ def legacy_vault(zettel_service):
 
 
 def test_plan_finds_all_missing_counter_links(legacy_vault):
+    """plan_backfill finds every missing project/area counter link in a legacy vault."""
     service, area, project, member, proj_note, src, tgt = legacy_vault
     plan = backfill.plan_backfill(service)
 
@@ -107,6 +110,7 @@ def test_plan_finds_all_missing_counter_links(legacy_vault):
 
 
 def test_plan_with_semantic_inverses(legacy_vault):
+    """plan_backfill with semantic_inverses plans the inverse of a directional link."""
     service, area, project, member, proj_note, src, tgt = legacy_vault
     plan = backfill.plan_backfill(service, semantic_inverses=True)
     planned = {(a.source_id, a.target_id, a.link_type) for a in plan.actions}
@@ -114,6 +118,7 @@ def test_plan_with_semantic_inverses(legacy_vault):
 
 
 def test_apply_plan_restores_contract_both_layers(legacy_vault):
+    """apply_plan restores the membership contract in both layers and is idempotent."""
     service, area, project, member, proj_note, src, tgt = legacy_vault
     plan = backfill.plan_backfill(service)
 
@@ -148,6 +153,7 @@ def test_apply_plan_restores_contract_both_layers(legacy_vault):
 
 
 def test_backup_copies_notes_dir(legacy_vault, tmp_path):
+    """backup_notes_dir copies every note file into the timestamped sibling backup."""
     service = legacy_vault[0]
     backup = backfill.backup_notes_dir(service.repository.notes_dir)
     try:

@@ -2548,6 +2548,7 @@ class ZettelkastenMcpServer:
             import datetime as _dt
 
             def _coerce_items(value: Any, label: str) -> List[Dict[str, Any]]:
+                """Coerce a notes/links/tasks arg into a list of dicts (parsing JSON strings)."""
                 if value is None:
                     return []
                 if isinstance(value, str):
@@ -2712,6 +2713,7 @@ class ZettelkastenMcpServer:
                         lines.append(f"{ref} ERROR: {exc}")
 
                 def _resolve_ref(value: Any) -> str:
+                    """Resolve a link endpoint: a "#N"/"#tN" batch ref to its created id, else the id verbatim."""
                     text = str(value).strip()
                     if text.startswith("#"):
                         resolved = refs.get(text)

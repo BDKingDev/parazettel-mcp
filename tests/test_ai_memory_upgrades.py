@@ -17,6 +17,7 @@ from parazettel_mcp.services.zettel_service import ZettelService
 
 
 def test_normalize_tag_collapses_common_variants():
+    """normalize_tag collapses case/separator variants and preserves the @ GTD prefix."""
     assert normalize_tag("ADD-ADHD") == "add-adhd"
     assert normalize_tag("emotional regulation") == "emotional-regulation"
     assert normalize_tag("structure_note") == "structure-note"
@@ -29,6 +30,7 @@ def test_normalize_tag_collapses_common_variants():
 
 
 def test_tags_normalized_on_create_and_update(zettel_service):
+    """Tags are normalized and de-duplicated on note create and update."""
     note = zettel_service.create_note(
         title="Tag normalization probe",
         content="Body.",
@@ -68,6 +70,7 @@ def test_get_notes_by_tag_unions_raw_and_normalized(zettel_service):
 
 
 def test_inline_ref_is_indexed_as_graph_edge(zettel_service):
+    """An inline [[id]] prose ref is indexed as a graph edge in both directions."""
     target = zettel_service.create_note(title="Inline Target", content="T.")
     source = zettel_service.create_note(
         title="Inline Source",
@@ -90,6 +93,7 @@ def test_inline_ref_is_indexed_as_graph_edge(zettel_service):
 
 
 def test_inline_ref_scrubbed_on_delete(zettel_service):
+    """Inline prose refs to a deleted note are scrubbed, leaving readable alias/title text."""
     target = zettel_service.create_note(title="Doomed Note", content="T.")
     source = zettel_service.create_note(
         title="Referencing Note",
@@ -112,6 +116,7 @@ def test_inline_ref_scrubbed_on_delete(zettel_service):
 
 
 def test_inline_alias_refreshed_on_rename(zettel_service):
+    """An aliased inline ref is rewritten to the target's new title on rename."""
     target = zettel_service.create_note(title="Old Title", content="T.")
     source = zettel_service.create_note(
         title="Aliased Referencer",
@@ -150,6 +155,7 @@ def test_inline_ref_with_fragment_or_md_suffix_scrubbed_on_delete(zettel_service
 
 
 def test_inline_alias_with_fragment_refreshed_on_rename(zettel_service):
+    """An aliased inline ref with a #fragment is refreshed on rename, preserving the fragment."""
     target = zettel_service.create_note(title="Old Title", content="T.")
     source = zettel_service.create_note(
         title="Fragment Referencer",
@@ -165,6 +171,7 @@ def test_inline_alias_with_fragment_refreshed_on_rename(zettel_service):
 
 
 def test_create_link_rejects_inline_type(zettel_service):
+    """create_link rejects the derived INLINE link type."""
     a = zettel_service.create_note(title="A", content="a")
     b = zettel_service.create_note(title="B", content="b")
     with pytest.raises(ValueError, match="inline"):
@@ -172,6 +179,7 @@ def test_create_link_rejects_inline_type(zettel_service):
 
 
 def test_consistency_reports_dangling_refs(zettel_service):
+    """check_consistency reports wiki refs whose target no longer exists."""
     ghost_id = "20990101T000000000000000"
     note = zettel_service.create_note(
         title="Dangler", content=f"Mentions [[{ghost_id}]] which never existed."
@@ -188,6 +196,7 @@ def test_consistency_reports_dangling_refs(zettel_service):
 
 
 def test_link_created_at_survives_file_roundtrip_and_rebuild(zettel_service):
+    """A link's created_at persists in markdown and survives a full rebuild."""
     a = zettel_service.create_note(title="Link Source", content="a")
     b = zettel_service.create_note(title="Link Target", content="b")
     linked, _ = zettel_service.create_link(a.id, b.id, LinkType.EXTENDS)
@@ -210,6 +219,7 @@ def test_link_created_at_survives_file_roundtrip_and_rebuild(zettel_service):
 
 
 def test_links_section_edit_is_reconciled_on_update(zettel_service):
+    """A hand-edited ## Links section in updated content is reconciled into the graph."""
     a = zettel_service.create_note(title="Reconcile Me", content="a")
     b = zettel_service.create_note(title="Keep Link", content="b")
     c = zettel_service.create_note(title="Drop Link", content="c")
@@ -247,6 +257,7 @@ def test_links_section_edit_is_reconciled_on_update(zettel_service):
 
 
 def test_content_without_links_section_keeps_links(zettel_service):
+    """Updating content with no ## Links heading leaves the note's links untouched."""
     a = zettel_service.create_note(title="Body Edit", content="a")
     b = zettel_service.create_note(title="Stable Target", content="b")
     zettel_service.create_link(a.id, b.id, LinkType.REFERENCE)
@@ -263,6 +274,7 @@ def test_content_without_links_section_keeps_links(zettel_service):
 
 
 def test_origin_and_last_verified_roundtrip(zettel_service):
+    """The origin and last_verified fields round-trip through frontmatter and the graph."""
     note = zettel_service.create_note(
         title="Provenance Note",
         content="Body.",
@@ -342,6 +354,7 @@ def test_to_markdown_excludes_inline_links(zettel_service):
 
 
 def test_retrieval_signals_recorded_and_survive_rebuild(zettel_service):
+    """Retrieval signals are recorded, survive a rebuild, and never rewrite the note file."""
     note = zettel_service.create_note(title="Hot Note", content="Body.")
 
     zettel_service.record_retrieval([note.id])

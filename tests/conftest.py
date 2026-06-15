@@ -25,6 +25,8 @@ _REBUILD_GROUP = "kuzu_rebuild"
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: ARG001
+    """Auto-assign rebuild-touching tests to one xdist group so no two real
+    Kuzu rebuilds run concurrently (the suite's known parallel-flake source)."""
     for item in items:
         func = getattr(item, "function", None)
         if func is None:

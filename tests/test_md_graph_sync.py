@@ -69,6 +69,7 @@ def links_section(service, note_id: str) -> str:
 
 
 def test_hand_added_links_line_becomes_edge_after_rebuild(zettel_service):
+    """A hand-added ## Links line becomes a graph edge after a rebuild."""
     a = zettel_service.create_note(title="Hand Edit A", content="a")
     b = zettel_service.create_note(title="Hand Edit B", content="b")
     assert edge_types(zettel_service, a.id, b.id) == set()
@@ -95,6 +96,7 @@ def test_hand_added_links_line_becomes_edge_after_rebuild(zettel_service):
 
 
 def test_hand_removed_links_line_drops_edge_after_rebuild(zettel_service):
+    """Removing a ## Links line by hand drops its graph edge after a rebuild."""
     a = zettel_service.create_note(title="Remover A", content="a")
     b = zettel_service.create_note(title="Remover B", content="b")
     zettel_service.create_link(a.id, b.id, LinkType.SUPPORTS)
@@ -114,6 +116,7 @@ def test_hand_removed_links_line_drops_edge_after_rebuild(zettel_service):
 
 
 def test_hand_changed_link_type_updates_edge_after_rebuild(zettel_service):
+    """Editing a link's type in the file updates the edge type after a rebuild."""
     a = zettel_service.create_note(title="Retyper A", content="a")
     b = zettel_service.create_note(title="Retyper B", content="b")
     zettel_service.create_link(a.id, b.id, LinkType.REFERENCE)
@@ -128,6 +131,7 @@ def test_hand_changed_link_type_updates_edge_after_rebuild(zettel_service):
 
 
 def test_hand_added_inline_prose_ref_becomes_inline_edge(zettel_service):
+    """An inline [[id]] added in prose becomes an inline edge, and is dropped when removed."""
     a = zettel_service.create_note(title="Prose A", content="No refs yet.")
     b = zettel_service.create_note(title="Prose B", content="b")
 
@@ -157,6 +161,7 @@ def test_hand_added_inline_prose_ref_becomes_inline_edge(zettel_service):
 def test_hand_written_link_target_forms_normalize(
     zettel_service, link_line_template, expected_type
 ):
+    """Hand-written target forms (alias, #fragment, .md, unknown type) normalize to the right edge."""
     a = zettel_service.create_note(title="Form A", content="a")
     b = zettel_service.create_note(title="Form B", content="b")
     write_md(
@@ -172,6 +177,7 @@ def test_hand_written_link_target_forms_normalize(
 
 
 def test_hand_written_duplicate_link_lines_dedupe_to_one_edge(zettel_service):
+    """Duplicate ## Links lines for the same target collapse to a single edge."""
     a = zettel_service.create_note(title="Dup A", content="a")
     b = zettel_service.create_note(title="Dup B", content="b")
     write_md(
@@ -191,6 +197,7 @@ def test_hand_written_duplicate_link_lines_dedupe_to_one_edge(zettel_service):
 
 
 def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
+    """A hand-written <!-- created --> comment sets the edge's created_at."""
     a = zettel_service.create_note(title="Stamp A", content="a")
     b = zettel_service.create_note(title="Stamp B", content="b")
     stamp = "2025-01-02T03:04:05"
@@ -215,6 +222,7 @@ def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
 
 
 def test_hand_edited_frontmatter_routing_propagates(zettel_service):
+    """Editing area_id in frontmatter re-routes the note in the graph after a rebuild."""
     area1 = zettel_service.create_area_note(title="Area One", content="a1")
     area2 = zettel_service.create_area_note(title="Area Two", content="a2")
     note = zettel_service.create_note(
@@ -239,6 +247,7 @@ def test_hand_edited_frontmatter_routing_propagates(zettel_service):
 
 
 def test_new_hand_dropped_file_is_indexed_with_its_links(zettel_service):
+    """A note file dropped on disk is indexed with its links by rebuild_index_if_needed."""
     b = zettel_service.create_note(title="Existing Target", content="b")
     new_id = "20260101T000000000000001"
     write_md(
@@ -267,6 +276,7 @@ def test_new_hand_dropped_file_is_indexed_with_its_links(zettel_service):
 
 
 def test_hand_deleted_file_drops_node_and_edges(zettel_service):
+    """Deleting a note file on disk drops its node and edges and surfaces a dangling ref."""
     a = zettel_service.create_note(title="Survivor", content="a")
     doomed = zettel_service.create_note(title="Hand Deleted", content="d")
     zettel_service.create_link(a.id, doomed.id, LinkType.REFERENCE)
@@ -287,6 +297,7 @@ def test_hand_deleted_file_drops_node_and_edges(zettel_service):
 
 
 def test_hand_edited_tags_propagate_to_tag_edges(zettel_service):
+    """Editing tags in frontmatter propagates to HAS_TAG edges after a rebuild."""
     note = zettel_service.create_note(
         title="Tag Edit", content="t", tags=["keep-me", "drop-me"]
     )
@@ -316,6 +327,7 @@ def para(zettel_service):
 
 
 def test_create_project_wires_area_links_both_layers(para):
+    """Creating a project wires its area links and the area's has_part in both layers."""
     service, area, project = para
     # Project file: part_of + reference to its area.
     section = links_section(service, project.id)
@@ -328,6 +340,7 @@ def test_create_project_wires_area_links_both_layers(para):
 
 
 def test_create_note_under_project_wires_routing_both_layers(para):
+    """A note created under a project gets its routing links in markdown and graph."""
     service, area, project = para
     note = service.create_note(
         title="Project Knowledge", content="k", project_id=project.id
@@ -345,6 +358,7 @@ def test_create_note_under_project_wires_routing_both_layers(para):
 
 
 def test_create_task_wires_routing_both_layers(para):
+    """A task created under a project gets its routing links in markdown and graph."""
     service, area, project = para
     task = service.create_task(
         title="Routed Task", content="do it", project_id=project.id
@@ -358,6 +372,7 @@ def test_create_task_wires_routing_both_layers(para):
 
 
 def test_task_project_reassignment_moves_links_both_layers(para):
+    """Reassigning a task's project moves its routing links in both layers."""
     service, area, project1 = para
     project2 = service.create_project_note(
         title="Second Project", content="p2", area_id=area.id
@@ -382,6 +397,7 @@ def test_task_project_reassignment_moves_links_both_layers(para):
 
 
 def test_note_area_reroute_moves_reference_both_layers(zettel_service):
+    """Re-routing a note to a new area moves its reference/part_of links in both layers."""
     area1 = zettel_service.create_area_note(title="From Area", content="a1")
     area2 = zettel_service.create_area_note(title="To Area", content="a2")
     note = zettel_service.create_note(
@@ -405,6 +421,7 @@ def test_note_area_reroute_moves_reference_both_layers(zettel_service):
 
 
 def test_subproject_wires_parent_and_area_both_layers(para):
+    """A subproject is wired to both its parent project and inherited area in both layers."""
     service, area, parent = para
     sub = service.create_project_note(
         title="Subproject", content="s", project_id=parent.id
@@ -477,6 +494,7 @@ def test_links_section_edit_cannot_deroute_note(zettel_service):
 
 
 def test_area_direct_note_is_bidirectional_member(zettel_service):
+    """A note routed directly to an area is a bidirectional member (part_of + materialized has_part)."""
     area = zettel_service.create_area_note(title="Member Area", content="a")
     note = zettel_service.create_note(
         title="Direct Member", content="m", area_id=area.id
@@ -501,6 +519,7 @@ def test_area_direct_note_is_bidirectional_member(zettel_service):
 
 
 def test_area_has_part_removed_when_note_joins_project(para):
+    """An area's has_part moves to the project when a member note joins a project."""
     service, area, project = para
     note = service.create_note(
         title="Promoted Member", content="m", area_id=area.id
@@ -522,6 +541,7 @@ def test_area_has_part_removed_when_note_joins_project(para):
 
 
 def test_area_membership_survives_rebuild_and_area_update(zettel_service):
+    """Area membership links survive a rebuild and an area-body update."""
     area = zettel_service.create_area_note(title="Stable Area", content="a")
     notes = [
         zettel_service.create_note(
@@ -576,6 +596,7 @@ INVERSE_PAIRS = [
 def test_bidirectional_create_writes_counter_link_md_and_edges(
     zettel_service, forward, inverse
 ):
+    """A bidirectional link writes the inverse counter link into the target's markdown and both edges."""
     src = zettel_service.create_note(title=f"Src {forward.value}", content="s")
     tgt = zettel_service.create_note(title=f"Tgt {forward.value}", content="t")
 
@@ -598,6 +619,7 @@ def test_bidirectional_create_writes_counter_link_md_and_edges(
     ],
 )
 def test_bidirectional_remove_cleans_both_layers(zettel_service, forward, inverse):
+    """Bidirectional link removal cleans the markdown and the graph on both notes."""
     src = zettel_service.create_note(title="Unlink Src", content="s")
     tgt = zettel_service.create_note(title="Unlink Tgt", content="t")
     zettel_service.create_link(src.id, tgt.id, forward, bidirectional=True)

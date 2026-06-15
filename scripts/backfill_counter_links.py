@@ -62,6 +62,7 @@ _SEMANTIC_INVERSES = {
 
 @dataclass
 class LinkAction:
+    """A single planned link addition (source, target, type, reason)."""
     source_id: str
     target_id: str
     link_type: str
@@ -71,6 +72,7 @@ class LinkAction:
 
 @dataclass
 class BackfillPlan:
+    """The computed set of link additions, skips, and per-area has_part batches."""
     actions: List[LinkAction] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)
     area_member_counts: Counter = field(default_factory=Counter)
@@ -80,6 +82,7 @@ class BackfillPlan:
     area_has_part: Dict[str, List[str]] = field(default_factory=dict)
 
     def summary(self) -> str:
+        """Render the plan as a human-readable dry-run report."""
         by_reason = Counter(action.reason for action in self.actions)
         total_has_part = sum(len(v) for v in self.area_has_part.values())
         lines = [
@@ -113,6 +116,7 @@ def plan_backfill(service, semantic_inverses: bool = False) -> BackfillPlan:
     note_cache: Dict[str, Optional[object]] = {}
 
     def get_note(note_id: str):
+        """Return a note by id (cached), tolerating parse failures."""
         if note_id not in note_cache:
             try:
                 note_cache[note_id] = repository.get(note_id)
@@ -121,6 +125,7 @@ def plan_backfill(service, semantic_inverses: bool = False) -> BackfillPlan:
         return note_cache[note_id]
 
     def has_link(note, target_id: str, link_type: LinkType) -> bool:
+        """Return True if *note* already has a link of *link_type* to *target_id*."""
         return any(
             link.target_id == target_id and link.link_type == link_type
             for link in note.links
@@ -282,6 +287,7 @@ def backup_notes_dir(notes_dir: Path) -> Path:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point: parse args, plan the backfill, and (with --apply) execute it."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--notes-dir", type=str, default=None)
     parser.add_argument("--graph-db-path", type=str, default=None)

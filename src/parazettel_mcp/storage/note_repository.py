@@ -2211,6 +2211,7 @@ class NoteRepository(Repository[Note]):
         )
 
         def _unlink_ref(match: "re.Match[str]") -> str:
+            """Replace a deleted note's inline ref with its alias text, else the deleted note's title."""
             alias = (match.group(1) or "").strip()
             return alias or deleted_title
 

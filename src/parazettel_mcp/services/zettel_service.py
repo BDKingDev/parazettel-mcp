@@ -603,6 +603,7 @@ class ZettelService:
         )
 
         def _rewrite_alias(match: "re.Match[str]") -> str:
+            """Rewrite an aliased inline ref to the new title, preserving any .md/#fragment suffix."""
             return f"[[{note_id}{match.group('sfx')}|{new_title}]]"
 
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
