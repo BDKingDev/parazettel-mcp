@@ -175,6 +175,14 @@ def _normalize_wiki_target(target: str) -> str:
 
 _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
 
+# Optional suffix an inline wiki-link target may carry after the note id and
+# still normalize back to that id (see _normalize_wiki_target): a ".md" suffix
+# and/or an Obsidian "#heading" fragment. Used to build the delete-scrub and
+# rename-alias-refresh patterns so every form that _parse_inline_refs indexes is
+# also cleaned up. Safe against a longer id with the same prefix: neither branch
+# matches a trailing digit, so the surrounding "|"/"]]"/whitespace anchor fails.
+_WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
+
 
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
     """Accept YAML-parsed datetimes/dates as well as ISO timestamp strings."""
@@ -504,6 +512,7 @@ class NoteRepository(Repository[Note]):
         content_drift: List[str] = []
         unreadable_files: List[str] = []
         dangling_refs: List[str] = []
+        seen_dangling: Set[str] = set()
         for note_id in sorted(common):
             file_path = self.notes_dir / f"{note_id}.md"
             try:
@@ -537,7 +546,8 @@ class NoteRepository(Repository[Note]):
                     and target_id not in file_stems
                 ):
                     entry = f"{note_id} -> {target_id}"
-                    if entry not in dangling_refs:
+                    if entry not in seen_dangling:
+                        seen_dangling.add(entry)
                         dangling_refs.append(entry)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
@@ -2182,8 +2192,11 @@ class NoteRepository(Repository[Note]):
             os.remove(file_path)
         _cache_evict(str(file_path))
 
+        # Match every inline form that normalizes to this id — bare, aliased,
+        # and with a ".md"/"#fragment" suffix — so none dangle after delete.
         inline_ref_pattern = re.compile(
-            r"\[\[\s*" + re.escape(id) + r"(?:\|([^\]]*))?\s*\]\]"
+            r"\[\[\s*" + re.escape(id) + _WIKI_TARGET_SUFFIX
+            + r"(?:\|([^\]]*))?\s*\]\]"
         )
 
         def _unlink_ref(match: "re.Match[str]") -> str:

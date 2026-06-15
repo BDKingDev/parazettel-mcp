@@ -105,6 +105,45 @@ def test_inline_alias_refreshed_on_rename(zettel_service):
     assert "Old Title" not in parsed.content
 
 
+def test_inline_ref_with_fragment_or_md_suffix_scrubbed_on_delete(zettel_service):
+    """An inline ref normalizes to the target id even with a #fragment or .md
+    suffix, so delete must scrub all those forms — not just bare/aliased ones."""
+    target = zettel_service.create_note(title="Suffixed Target", content="T.")
+    source = zettel_service.create_note(
+        title="Suffix Referencer",
+        content=(
+            f"Frag [[{target.id}#a-heading]], md [[{target.id}.md]], and "
+            f"frag-alias [[{target.id}#sec|see here]] all point here."
+        ),
+    )
+    # All three forms were indexed as an inline edge to the target.
+    assert target.id in zettel_service.get_note(source.id).inline_refs
+
+    zettel_service.delete_note(target.id)
+
+    parsed = zettel_service.get_note(source.id)
+    # No form of the reference survives in prose...
+    assert target.id not in parsed.content
+    assert parsed.inline_refs == []
+    # ...and the aliased form leaves its readable alias behind.
+    assert "see here" in parsed.content
+
+
+def test_inline_alias_with_fragment_refreshed_on_rename(zettel_service):
+    target = zettel_service.create_note(title="Old Title", content="T.")
+    source = zettel_service.create_note(
+        title="Fragment Referencer",
+        content=f"See [[{target.id}#intro|Old Title]] for details.",
+    )
+
+    zettel_service.update_note(target.id, title="New Title")
+
+    parsed = zettel_service.get_note(source.id)
+    # The alias is refreshed AND the #fragment is preserved.
+    assert f"[[{target.id}#intro|New Title]]" in parsed.content
+    assert "Old Title" not in parsed.content
+
+
 def test_create_link_rejects_inline_type(zettel_service):
     a = zettel_service.create_note(title="A", content="a")
     b = zettel_service.create_note(title="B", content="b")

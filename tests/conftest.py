@@ -109,14 +109,18 @@ def test_config(temp_dirs, graph_db_template):
     """
     notes_dir, graph_db_dir = temp_dirs
     graph_db_path = graph_db_dir / "test_graph.kuzu"
-    # Seed the test DB from the template (main file + Kuzu sidecars like .wal).
+    # Seed the test DB from the template (main file/dir + Kuzu sidecars like the
+    # .wal). Kuzu may back a DB with either a single file or a directory
+    # depending on version, so copy directories recursively rather than assuming
+    # a file (copy2 would raise IsADirectoryError on a directory-backed DB).
     template_name = graph_db_template.name
     for template_file in graph_db_template.parent.glob(f"{template_name}*"):
         suffix = template_file.name[len(template_name):]
-        shutil.copy2(
-            template_file,
-            graph_db_path.parent / f"{graph_db_path.name}{suffix}",
-        )
+        dest = graph_db_path.parent / f"{graph_db_path.name}{suffix}"
+        if template_file.is_dir():
+            shutil.copytree(template_file, dest)
+        else:
+            shutil.copy2(template_file, dest)
     # Save original config values
     original_notes_dir = config.notes_dir
     original_graph_db_path = config.graph_db_path

@@ -19,7 +19,10 @@ from parazettel_mcp.models.schema import (
     Tag,
     normalize_tag,
 )
-from parazettel_mcp.storage.note_repository import NoteRepository
+from parazettel_mcp.storage.note_repository import (
+    _WIKI_TARGET_SUFFIX,
+    NoteRepository,
+)
 
 logger = logging.getLogger(__name__)
 _UNSET = object()
@@ -535,13 +538,21 @@ class ZettelService:
         Covers both representations: the regenerated ``## Links`` section (whose
         aliases are re-resolved from the graph on rewrite) and aliased inline
         ``[[id|old title]]`` wiki-links in prose, which are rewritten in place to
-        the new title. Bare inline ``[[id]]`` refs need no refresh.
+        the new title. Any ``.md``/``#fragment`` suffix on the target is
+        preserved. Bare inline ``[[id]]`` refs need no refresh.
         """
         target = self.repository.get(note_id)
         new_title = target.title if target else None
+        # Match aliased inline refs in any normalizing form (id, id.md, id#frag,
+        # id.md#frag), capturing the suffix so it survives the rewrite.
         inline_alias_pattern = re.compile(
-            r"\[\[\s*" + re.escape(note_id) + r"\s*\|[^\]]*\]\]"
+            r"\[\[\s*" + re.escape(note_id)
+            + r"(?P<sfx>" + _WIKI_TARGET_SUFFIX + r")\s*\|[^\]]*\]\]"
         )
+
+        def _rewrite_alias(match: "re.Match[str]") -> str:
+            return f"[[{note_id}{match.group('sfx')}|{new_title}]]"
+
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
         for incoming_note in incoming_notes:
             source_note = self.repository.get(incoming_note.id)
@@ -550,7 +561,7 @@ class ZettelService:
             existing_source = source_note.model_copy(deep=True)
             if new_title and "|" not in new_title and "]]" not in new_title:
                 source_note.content = inline_alias_pattern.sub(
-                    f"[[{note_id}|{new_title}]]", source_note.content
+                    _rewrite_alias, source_note.content
                 )
             self.repository.update_preserving_updated_at(
                 source_note,
