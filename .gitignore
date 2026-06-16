@@ -35,15 +35,23 @@ logs/
 
 # uv specific
 .uv/
+.uv-cache/
 
 # Testing
 .coverage
 htmlcov/
 .pytest_cache/
+# Local pytest --basetemp dirs and the conftest fixture root
+.pytest-tmp/
+.tmp/
 
 # Local configuration
 config.local.json
 claude_desktop_config.json
+
+# Local agent & tool state
+.claude/
+.playwright-mcp/
 
 # Temporary files
 *.tmp
@@ -55,11 +63,6 @@ temp/
 repomix-output.txt
 repomix-output.xml
 
-# Data files
-data/db/*.db
-data/db/*.db-wal
-data/db/*.db-shm
-data/db/*.kuzu
-data/db/*.kuzu.wal
-data/db/graph.kuzu*/
-data/notes/*.md
+# Personal vault data — notes, graph DB, embeddings cache, backups.
+# The entire data/ tree is local user content; nothing in it is tracked.
+/data/

@@ -255,6 +255,38 @@ it always-on).
 
 An idle timeout is the safest approximation to “close the daemon once all sessions are gone,” because one chat closing should not kill the daemon while another chat is still using it.
 
+#### Restarting the daemon (after a code change)
+
+The package is installed editable, so a running daemon keeps executing whatever
+code it started with. **To apply code changes, restart the daemon** — its new
+process picks up the latest code, and new graph columns are added idempotently
+on open (no migration). A restart must preserve the embedding environment, or
+the new daemon will come up without semantic search.
+
+One-shot restart scripts handle the stop → detached-start → health-check, with
+the embedding env defaulted (and overridable):
+
+```powershell
+# Windows / PowerShell
+pwsh scripts/restart_daemon.ps1
+```
+
+```bash
+# POSIX / Git Bash
+bash scripts/restart_daemon.sh
+```
+
+Both stop any running daemon, start a fresh detached one, and print its status.
+Edit the embedding defaults near the top of the script if your vault uses a
+different model or device. Equivalent manual steps:
+
+```bash
+python -m parazettel_mcp.main --stop-daemon
+# then trigger a detached auto-start with the embedding env exported:
+python -c "import argparse; from parazettel_mcp import main as m; m.ensure_daemon_running(argparse.Namespace(log_level='INFO'))"
+python -m parazettel_mcp.main --daemon-status
+```
+
 ### Connecting to Claude Code (CLI)
 
 Add the same entry to `~/.claude.json` under `mcpServers`.
