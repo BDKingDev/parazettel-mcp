@@ -16,9 +16,9 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 py="$repo/.venv/Scripts/python.exe"          # Windows venv layout
 [ -x "$py" ] || py="$repo/.venv/bin/python"  # POSIX venv layout
-[ -x "$py" ] || py="$(command -v python || true)"
+[ -x "$py" ] || py="$(command -v python || command -v python3 || true)"
 if [ -z "$py" ]; then
-  echo "Python not found: no interpreter in .venv and none on PATH." >&2
+  echo "Python not found: no interpreter in .venv and no python/python3 on PATH." >&2
   echo "Create the venv (uv venv --python 3.13) or activate one first." >&2
   exit 1
 fi

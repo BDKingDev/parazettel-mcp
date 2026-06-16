@@ -21,9 +21,10 @@ $repo = (Resolve-Path "$PSScriptRoot\..").Path
 $py = Join-Path $repo ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) {
   $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+  if (-not $py) { $py = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
 }
 if (-not $py) {
-  throw "Python not found: no interpreter at .venv\Scripts\python.exe and none on PATH. Create the venv (uv venv --python 3.13) or activate one first."
+  throw "Python not found: no interpreter at .venv\Scripts\python.exe and no python/python3 on PATH. Create the venv (uv venv --python 3.13) or activate one first."
 }
 
 function Set-DefaultEnv([string]$name, [string]$value) {
