@@ -278,14 +278,33 @@ bash scripts/restart_daemon.sh
 
 Both stop any running daemon, start a fresh detached one, and print its status.
 Edit the embedding defaults near the top of the script if your vault uses a
-different model or device. Equivalent manual steps:
+different model or device.
+
+Equivalent manual steps — **export the embedding environment first** (match
+these to your MCP client config; semantic search is disabled if they are
+missing), then stop, detach-start, and check:
 
 ```bash
+# Embedding env (adjust model/dim/device to your vault):
+export PARAZETTEL_NOTES_DIR="$PWD/data/notes"
+export PARAZETTEL_GRAPH_DB_PATH="$PWD/data/db/graph.kuzu"
+export PARAZETTEL_BACKEND_MODE=daemon
+export PARAZETTEL_EMBEDDING_ENABLED=true
+export PARAZETTEL_EMBEDDING_PROVIDER=fastembed
+export PARAZETTEL_EMBEDDING_MODEL="mixedbread-ai/mxbai-embed-large-v1"
+export PARAZETTEL_EMBEDDING_DIM=1024
+export PARAZETTEL_EMBEDDING_METRIC=cosine
+export PARAZETTEL_EMBEDDING_DEVICE=cuda
+export FASTEMBED_CACHE_PATH="$PWD/data/fastembed_cache"
+
 python -m parazettel_mcp.main --stop-daemon
-# then trigger a detached auto-start with the embedding env exported:
+# trigger a detached auto-start that inherits the env exported above:
 python -c "import argparse; from parazettel_mcp import main as m; m.ensure_daemon_running(argparse.Namespace(log_level='INFO'))"
 python -m parazettel_mcp.main --daemon-status
 ```
+
+On Windows PowerShell, set each with `$env:NAME = "value"` instead of `export`
+(or just run `scripts/restart_daemon.ps1`, which sets these for you).
 
 ### Connecting to Claude Code (CLI)
 
