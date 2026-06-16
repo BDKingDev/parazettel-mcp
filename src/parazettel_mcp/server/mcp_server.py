@@ -195,8 +195,8 @@ class ZettelkastenMcpServer:
             logger.error(f"Daemon connectivity error [{error_id}]: {str(error)}")
             return (
                 f"Error: {str(error)}\n"
-                f"Start it for this vault with: "
-                f"{config.format_daemon_start_command()}"
+                f"Restart it for this vault (preserves embeddings) with: "
+                f"{config.format_daemon_restart_command()}"
             )
         elif isinstance(error, GraphDatabaseReadOnlyError):
             # Read-only fallback errors are safe and actionable for users

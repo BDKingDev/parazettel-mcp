@@ -239,6 +239,26 @@ class ZettelkastenConfig(BaseModel):
         ]
         return " ".join(f'"{part}"' if " " in part else part for part in parts)
 
+    def format_daemon_restart_command(self) -> str:
+        """Render the recommended daemon (re)start command for a down daemon.
+
+        Prefers the repo's restart script, which preserves the embedding
+        environment so semantic search comes back up — the raw ``--run-daemon``
+        command does not, and following it would silently start the daemon
+        without embeddings. Falls back to that raw command when the script is
+        absent (e.g. a non-editable install). Absolute path so it is
+        copy-pasteable from any working directory.
+        """
+        repo_root = Path(__file__).resolve().parents[2]
+        script_name = "restart_daemon.ps1" if os.name == "nt" else "restart_daemon.sh"
+        script = repo_root / "scripts" / script_name
+        if script.is_file():
+            runner = "pwsh" if os.name == "nt" else "bash"
+            script_str = str(script)
+            quoted = f'"{script_str}"' if " " in script_str else script_str
+            return f"{runner} {quoted}"
+        return self.format_daemon_start_command()
+
 
 # Create a global config instance
 config = ZettelkastenConfig()

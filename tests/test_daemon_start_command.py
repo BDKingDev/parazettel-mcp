@@ -1,6 +1,7 @@
 """Tests for the absolute daemon-start command surfaced in daemon-down UX."""
 
 import os
+from pathlib import Path
 
 from parazettel_mcp.config import config
 from parazettel_mcp.main import format_daemon_status
@@ -20,6 +21,28 @@ def test_format_daemon_start_command_is_absolute_and_complete():
     # in some other repo's environment is never assumed.
     first_token = cmd.split(" ", 1)[0].strip('"')
     assert os.path.isabs(first_token), first_token
+
+
+def test_format_daemon_restart_command_prefers_embedding_aware_script():
+    """When the repo's restart script is present, the daemon-down hint points
+    to it (it preserves the embedding env), not the raw --run-daemon command."""
+    cmd = config.format_daemon_restart_command()
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script_name = "restart_daemon.ps1" if os.name == "nt" else "restart_daemon.sh"
+    script = repo_root / "scripts" / script_name
+
+    if script.is_file():
+        # Absolute path to the script, run with the platform's interpreter.
+        assert script_name in cmd
+        assert "--run-daemon" not in cmd
+        runner = "pwsh" if os.name == "nt" else "bash"
+        assert cmd.startswith(runner + " ")
+        first_path = cmd.split(" ", 1)[1].strip('"')
+        assert os.path.isabs(first_path), first_path
+    else:
+        # No script (non-editable install) -> falls back to the raw command.
+        assert "--run-daemon" in cmd
 
 
 def test_daemon_status_message_includes_start_command():
