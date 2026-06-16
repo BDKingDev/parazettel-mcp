@@ -1916,7 +1916,16 @@ class NoteRepository(Repository[Note]):
         conjunctive: bool = False,
     ) -> List[Tuple[str, float]]:
         """Return (note_id, BM25 score) pairs from a full-text query, ranked by score."""
-        normalized_query = query.strip()
+        # Kuzu's FTS query parser crashes the whole process (Windows access
+        # violation / heap corruption 0xC0000374) on structural characters in the
+        # query string — markdown '#'/'**', newlines, brackets. A dedup probe
+        # built from raw note content, or a user pasting markdown into search,
+        # readily contains these, and a native crash cannot be caught with
+        # try/except — it takes the daemon down silently, leaving every client
+        # hanging. So reduce the query to plain word tokens before it reaches
+        # Kuzu. The FTS engine tokenizes on word boundaries anyway, so this does
+        # not change recall; \w keeps Unicode letters/digits for non-ASCII terms.
+        normalized_query = " ".join(re.findall(r"\w+", query or ""))
         if not normalized_query:
             return []
 
