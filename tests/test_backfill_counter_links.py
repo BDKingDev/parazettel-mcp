@@ -111,7 +111,7 @@ def test_plan_finds_all_missing_counter_links(legacy_vault):
 
 def test_plan_with_semantic_inverses(legacy_vault):
     """plan_backfill with semantic_inverses plans the inverse of a directional link."""
-    service, area, project, member, proj_note, src, tgt = legacy_vault
+    service, _area, _project, _member, _proj_note, src, tgt = legacy_vault
     plan = backfill.plan_backfill(service, semantic_inverses=True)
     planned = {(a.source_id, a.target_id, a.link_type) for a in plan.actions}
     assert (tgt.id, src.id, "extended_by") in planned
@@ -119,7 +119,7 @@ def test_plan_with_semantic_inverses(legacy_vault):
 
 def test_apply_plan_restores_contract_both_layers(legacy_vault):
     """apply_plan restores the membership contract in both layers and is idempotent."""
-    service, area, project, member, proj_note, src, tgt = legacy_vault
+    service, area, project, member, proj_note, _src, _tgt = legacy_vault
     plan = backfill.plan_backfill(service)
 
     results = backfill.apply_plan(service, plan)
