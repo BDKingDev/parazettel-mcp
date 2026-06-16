@@ -103,9 +103,23 @@ _NOTE_SELECT = (
     "n.priority AS priority, n.recurrence_rule AS recurrence_rule, "
     "n.estimated_minutes AS estimated_minutes, n.remind_at AS remind_at, "
     "n.project_id AS project_id, n.area_id AS area_id, "
+    "n.origin AS origin, n.last_verified AS last_verified, "
     "n.metadata_json AS metadata_json, n.created_at AS created_at, n.updated_at AS updated_at"
 )
 
+# Matches one Obsidian wiki link and captures its target (id, optionally with a
+# |alias or #fragment suffix handled by _normalize_wiki_target).
+_WIKI_LINK_RE = re.compile(r"\[\[([^\]\[]+)\]\]")
+# Note IDs are timestamp-shaped (YYYYMMDDTHHMMSS + microseconds + counter).
+_NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
+# Optional per-link provenance comment appended to a ## Links line, e.g.
+# "- extends [[id|Title]] desc <!-- created: 2026-06-12T10:00:00 -->".
+# Hidden in Obsidian preview; lets link created_at survive rebuilds.
+_LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
+
+# Matches an actual "## Links" heading line (not the literal text in prose), so
+# splitting a note body on it can't be tripped by an in-prose mention.
+_LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
 
 def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
     key = (path_str, mtime_ns)
@@ -164,6 +178,16 @@ def _normalize_wiki_target(target: str) -> str:
 
 
 _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
+
+# Optional suffix an inline wiki-link target may carry after the note id and
+# still normalize back to that id (see _normalize_wiki_target): a ".md" suffix
+# and/or an Obsidian "#heading" fragment. Used to build the delete-scrub and
+# rename-alias-refresh patterns so every form that _parse_inline_refs indexes is
+# also cleaned up. Safe against a longer id with the same prefix: neither branch
+# matches a trailing digit, so the surrounding "|"/"]]"/whitespace anchor fails.
+# Public (no underscore) because the service layer builds the rename pattern
+# from the same fragment — keeping one source of truth for the wiki-link grammar.
+WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
 
 
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
@@ -257,6 +281,12 @@ def _db_dict_to_note(
         ),
         project_id=nd.get("project_id"),
         area_id=nd.get("area_id"),
+        origin=nd.get("origin"),
+        last_verified=(
+            datetime.date.fromisoformat(nd["last_verified"])
+            if nd.get("last_verified")
+            else None
+        ),
     )
 
 
@@ -487,6 +517,8 @@ class NoteRepository(Repository[Note]):
 
         content_drift: List[str] = []
         unreadable_files: List[str] = []
+        dangling_refs: List[str] = []
+        seen_dangling: Set[str] = set()
         for note_id in sorted(common):
             file_path = self.notes_dir / f"{note_id}.md"
             try:
@@ -508,6 +540,21 @@ class NoteRepository(Repository[Note]):
             # links would falsely register as drifted.
             if file_body != stored_content.get(note_id):
                 content_drift.append(note_id)
+            # Wiki references (## Links entries AND inline prose refs) whose
+            # id-shaped target no longer exists on disk. Informational — these
+            # don't affect file/index sync, but each is a broken thread in the
+            # knowledge graph.
+            for match in _WIKI_LINK_RE.finditer(file_body):
+                target_id = _normalize_wiki_target(match.group(1))
+                if (
+                    _NOTE_ID_RE.match(target_id)
+                    and target_id != note_id
+                    and target_id not in file_stems
+                ):
+                    entry = f"{note_id} -> {target_id}"
+                    if entry not in seen_dangling:
+                        seen_dangling.add(entry)
+                        dangling_refs.append(entry)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
         return {
@@ -518,6 +565,9 @@ class NoteRepository(Repository[Note]):
             "missing_from_files": missing_from_files,
             "content_drift": content_drift,
             "unreadable_files": unreadable_files,
+            # Informational: broken wiki references; not counted in `consistent`
+            # because they reflect vault content, not file/index drift.
+            "dangling_refs": dangling_refs,
             "consistent": not (
                 missing_from_index
                 or missing_from_files
@@ -608,6 +658,14 @@ class NoteRepository(Repository[Note]):
         self.last_rebuild_skipped = []
         backup_path = self._create_graph_backup()
 
+        # Snapshot retrieval signals from the live graph: they exist only in the
+        # index (never in markdown), so a fresh build would otherwise wipe them.
+        try:
+            retrieval_signals = self._fetch_retrieval_signals()
+        except Exception as exc:  # best-effort: signals must never block rebuild
+            logger.warning("Could not snapshot retrieval signals: %s", exc)
+            retrieval_signals = []
+
         note_files = list(self.notes_dir.glob("*.md"))
         notes: List[Note] = []
         skipped: List[str] = []
@@ -643,7 +701,9 @@ class NoteRepository(Repository[Note]):
         tmp_db_path = tmp_dir / self.graph_db_path.name
         try:
             tmp_dir.mkdir(parents=True, exist_ok=True)
-            self._build_graph_into(tmp_db_path, notes)
+            self._build_graph_into(
+                tmp_db_path, notes, retrieval_signals=retrieval_signals
+            )
 
             # Close every handle to the live DB so the file can be replaced,
             # then atomically swap the freshly built DB into place and reopen.
@@ -658,12 +718,19 @@ class NoteRepository(Repository[Note]):
 
         return backup_path
 
-    def _build_graph_into(self, db_path: Path, notes: List[Note]) -> None:
+    def _build_graph_into(
+        self,
+        db_path: Path,
+        notes: List[Note],
+        retrieval_signals: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         """Build a complete graph for *notes* in a fresh database at *db_path*.
 
         The database starts empty, so every node is new and no deletes are
         issued. ``init_graph_db`` creates the schema (and FTS indexes), and the
         handle is fully released afterwards so the file can be swapped in.
+        ``retrieval_signals`` (snapshotted from the previous graph) are restored
+        onto the new Note nodes so graph-only operational data survives.
         """
         db = init_graph_db(
             db_path, buffer_pool_size=config.kuzu_buffer_pool_bytes
@@ -687,6 +754,15 @@ class NoteRepository(Repository[Note]):
                         notes[i : i + _GRAPH_BATCH_SIZE],
                         conn,
                         clear_existing=False,
+                    )
+                # Restore retrieval signals before any vector index is built.
+                # MATCH drops signals for notes that no longer exist on disk.
+                if retrieval_signals:
+                    conn.execute(
+                        "UNWIND $rows AS row MATCH (n:Note {id: row.id}) "
+                        "SET n.last_retrieved_at = row.last_retrieved_at, "
+                        "n.hit_count = row.hit_count",
+                        {"rows": retrieval_signals},
                     )
                 # Pass 3: embed all notes and build the HNSW index (no-op when
                 # embeddings are disabled).
@@ -739,6 +815,8 @@ class NoteRepository(Repository[Note]):
                     n.remind_at = $remind_at,
                     n.project_id = $project_id,
                     n.area_id = $area_id,
+                    n.origin = $origin,
+                    n.last_verified = $last_verified,
                     n.metadata_json = $metadata_json,
                     n.updated_at = $updated_at
                 """,
@@ -761,6 +839,8 @@ class NoteRepository(Repository[Note]):
                     remind_at: $remind_at,
                     project_id: $project_id,
                     area_id: $area_id,
+                    origin: $origin,
+                    last_verified: $last_verified,
                     metadata_json: $metadata_json,
                     created_at: $created_at,
                     updated_at: $updated_at
@@ -813,7 +893,8 @@ class NoteRepository(Repository[Note]):
                 },
             )
 
-        if note.links:
+        link_rows = self._link_rows_for_note(note)
+        if link_rows:
             conn.execute(
                 """
                 UNWIND $links AS link
@@ -827,16 +908,48 @@ class NoteRepository(Repository[Note]):
                 {
                     "source_id": note.id,
                     "links": [
-                        {
-                            "target_id": link.target_id,
-                            "link_type": link.link_type.value,
-                            "description": link.description,
-                            "created_at": link.created_at,
-                        }
-                        for link in note.links
+                        {k: v for k, v in row.items() if k != "source_id"}
+                        for row in link_rows
                     ],
                 },
             )
+
+    @staticmethod
+    def _link_rows_for_note(note: Note) -> List[Dict[str, Any]]:
+        """Build LINKS_TO edge rows: explicit ## Links plus derived inline refs.
+
+        Explicit links exclude the INLINE type (a graph-sourced Note can carry
+        reconstructed inline links; re-deriving them from ``inline_refs`` keeps
+        one source of truth). Inline refs to a target the note already links to
+        explicitly are skipped by the parser, so no duplicate edges arise.
+        """
+        rows: List[Dict[str, Any]] = [
+            {
+                "source_id": note.id,
+                "target_id": link.target_id,
+                "link_type": link.link_type.value,
+                "description": link.description,
+                "created_at": link.created_at,
+            }
+            for link in note.links
+            if link.link_type != LinkType.INLINE
+        ]
+        explicit_targets = {row["target_id"] for row in rows}
+        for target_id in note.inline_refs:
+            if target_id in explicit_targets or target_id == note.id:
+                continue
+            rows.append(
+                {
+                    "source_id": note.id,
+                    "target_id": target_id,
+                    "link_type": LinkType.INLINE.value,
+                    "description": None,
+                    # Inline refs carry no stored timestamp; the note's own
+                    # updated_at is the closest durable approximation.
+                    "created_at": note.updated_at,
+                }
+            )
+        return rows
 
     def _index_note_relations_batch(
         self,
@@ -884,15 +997,7 @@ class NoteRepository(Repository[Note]):
             )
 
         link_rows = [
-            {
-                "source_id": note.id,
-                "target_id": link.target_id,
-                "link_type": link.link_type.value,
-                "description": link.description,
-                "created_at": link.created_at,
-            }
-            for note in notes
-            for link in note.links
+            row for note in notes for row in self._link_rows_for_note(note)
         ]
         if link_rows:
             conn.execute(
@@ -942,50 +1047,8 @@ class NoteRepository(Repository[Note]):
         tag_names = _dedupe_preserve_order(tag_names)
         tags = [Tag(name=name) for name in tag_names]
 
-        links: List[Link] = []
-        seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        links_section = False
-        for line in post.content.split("\n"):
-            line = line.strip()
-            if line.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and line.startswith("## "):
-                links_section = False
-                continue
-            if links_section and line.startswith("- "):
-                try:
-                    line_content = line.strip()
-                    if "[[" in line_content and "]]" in line_content:
-                        parts = line_content.split("[[", 1)
-                        link_type_str = parts[0].strip()
-                        if link_type_str.startswith("- "):
-                            link_type_str = link_type_str[2:].strip()
-                        id_and_description = parts[1].split("]]", 1)
-                        raw_target = id_and_description[0].strip()
-                        target_id = _normalize_wiki_target(raw_target)
-                        description = None
-                        if len(id_and_description) > 1:
-                            description = id_and_description[1].strip()
-                        try:
-                            link_type = LinkType(link_type_str)
-                        except ValueError:
-                            link_type = LinkType.REFERENCE
-                        link_key = (target_id, link_type)
-                        if link_key in seen_link_keys:
-                            continue
-                        seen_link_keys.add(link_key)
-                        links.append(
-                            Link(
-                                source_id=note_id,
-                                target_id=target_id,
-                                link_type=link_type,
-                                description=description,
-                                created_at=datetime.datetime.now(),
-                            )
-                        )
-                except Exception as e:
-                    logger.error("Error parsing link: %s - %s", line, e)
+        links = self.parse_links_in_content(note_id, post.content)
+        inline_refs = self._parse_inline_refs(note_id, post.content, links)
 
         created_at = _coerce_datetime(metadata.get("created"), datetime.datetime.now())
         updated_at = _coerce_datetime(metadata.get("updated"), created_at)
@@ -994,6 +1057,7 @@ class NoteRepository(Repository[Note]):
             "id", "title", "type", "tags", "created", "updated",
             "status", "source", "due_date", "priority", "recurrence_rule",
             "estimated_minutes", "remind_at", "project_id", "area_id",
+            "origin", "last_verified",
         }
 
         status_str = metadata.get("status")
@@ -1025,6 +1089,19 @@ class NoteRepository(Repository[Note]):
         estimated_minutes = metadata.get("estimated_minutes")
         project_id = metadata.get("project_id") or None
         area_id = metadata.get("area_id") or None
+        origin = metadata.get("origin") or None
+        last_verified_str = metadata.get("last_verified")
+        last_verified = None
+        if last_verified_str:
+            try:
+                if isinstance(last_verified_str, datetime.date):
+                    last_verified = last_verified_str
+                else:
+                    last_verified = datetime.date.fromisoformat(
+                        str(last_verified_str)
+                    )
+            except ValueError:
+                last_verified = None
 
         return Note(
             id=note_id,
@@ -1045,7 +1122,132 @@ class NoteRepository(Repository[Note]):
             remind_at=remind_at,
             project_id=project_id,
             area_id=area_id,
+            origin=origin,
+            last_verified=last_verified,
+            inline_refs=inline_refs,
         )
+
+    def parse_links_in_content(self, note_id: str, content: str) -> List[Link]:
+        """Parse the ``## Links`` section of *content* into Link objects.
+
+        Public so the service layer can reconcile a hand-edited ``## Links``
+        section on update against the graph-backed links. A per-link
+        ``<!-- created: ISO -->`` comment, written by the serializer, restores
+        the link's original creation time; without one the parse falls back to
+        now() (the historical behaviour).
+        """
+        links: List[Link] = []
+        seen_link_keys: Set[Tuple[str, LinkType]] = set()
+        links_section = False
+        for line in content.split("\n"):
+            line = line.strip()
+            if line.startswith("## Links"):
+                links_section = True
+                continue
+            if links_section and line.startswith("## "):
+                links_section = False
+                continue
+            if links_section and line.startswith("- "):
+                try:
+                    line_content = line.strip()
+                    if "[[" in line_content and "]]" in line_content:
+                        parts = line_content.split("[[", 1)
+                        link_type_str = parts[0].strip()
+                        if link_type_str.startswith("- "):
+                            link_type_str = link_type_str[2:].strip()
+                        id_and_description = parts[1].split("]]", 1)
+                        raw_target = id_and_description[0].strip()
+                        target_id = _normalize_wiki_target(raw_target)
+                        description = None
+                        created_at = None
+                        if len(id_and_description) > 1:
+                            description = id_and_description[1]
+                            created_match = _LINK_CREATED_RE.search(description)
+                            if created_match:
+                                try:
+                                    created_at = datetime.datetime.fromisoformat(
+                                        created_match.group(1)
+                                    )
+                                except ValueError:
+                                    created_at = None
+                                description = _LINK_CREATED_RE.sub(
+                                    " ", description
+                                )
+                            description = description.strip() or None
+                        try:
+                            link_type = LinkType(link_type_str)
+                        except ValueError:
+                            link_type = LinkType.REFERENCE
+                        if link_type == LinkType.INLINE:
+                            # 'inline' is a derived type; a hand-written inline
+                            # line in ## Links reads as a plain reference.
+                            link_type = LinkType.REFERENCE
+                        link_key = (target_id, link_type)
+                        if link_key in seen_link_keys:
+                            continue
+                        seen_link_keys.add(link_key)
+                        links.append(
+                            Link(
+                                source_id=note_id,
+                                target_id=target_id,
+                                link_type=link_type,
+                                description=description,
+                                created_at=created_at or datetime.datetime.now(),
+                            )
+                        )
+                except Exception as e:
+                    logger.error("Error parsing link: %s - %s", line, e)
+        return links
+
+    @staticmethod
+    def _parse_inline_refs(
+        note_id: str, content: str, links: List[Link]
+    ) -> List[str]:
+        """Extract note IDs wiki-linked from prose (outside ``## Links``).
+
+        Only id-shaped targets count — a ``[[Some Title]]`` style link is not a
+        managed reference. Targets already covered by an explicit ## Links entry
+        are skipped so the graph doesn't grow a duplicate edge. Fenced code
+        blocks are ignored.
+        """
+        # Exclude INLINE links: a graph-sourced Note carries its inline edges in
+        # ``links`` too, and treating those as "explicit" would suppress
+        # re-deriving the very inline refs they represent (dropping the edge on
+        # the next reindex). Only true ## Links entries should pre-empt a ref.
+        explicit_targets = {
+            link.target_id for link in links if link.link_type != LinkType.INLINE
+        }
+        refs: List[str] = []
+        seen: Set[str] = set()
+        links_section = False
+        in_code_fence = False
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                continue
+            if in_code_fence:
+                continue
+            if stripped.startswith("## Links"):
+                links_section = True
+                continue
+            if links_section and stripped.startswith("## "):
+                links_section = False
+            if links_section:
+                continue
+            for match in _WIKI_LINK_RE.finditer(line):
+                target_id = _normalize_wiki_target(match.group(1))
+                if not _NOTE_ID_RE.match(target_id):
+                    continue
+                if (
+                    target_id == note_id
+                    or target_id in explicit_targets
+                    or target_id in seen
+                ):
+                    continue
+                seen.add(target_id)
+                refs.append(target_id)
+        return refs
 
     def _note_to_markdown(self, note: Note) -> str:
         """Convert a note to markdown with frontmatter."""
@@ -1075,6 +1277,10 @@ class NoteRepository(Repository[Note]):
             metadata["project_id"] = note.project_id
         if note.area_id is not None:
             metadata["area_id"] = note.area_id
+        if note.origin is not None:
+            metadata["origin"] = note.origin
+        if note.last_verified is not None:
+            metadata["last_verified"] = note.last_verified.isoformat()
         metadata.update(note.metadata)
 
         content_parts = []
@@ -1091,9 +1297,14 @@ class NoteRepository(Repository[Note]):
         content = "\n".join(content_parts).rstrip()
         content = self._ensure_title_heading(content, note.title)
 
-        if note.links:
+        # INLINE links are derived from the prose body (they already live in
+        # the content) and must never be rendered into ## Links.
+        serializable_links = [
+            link for link in note.links if link.link_type != LinkType.INLINE
+        ]
+        if serializable_links:
             unique_links: Dict[str, Link] = {}
-            for link in note.links:
+            for link in serializable_links:
                 key = f"{link.target_id}:{link.link_type.value}"
                 unique_links[key] = link
             title_map = self._get_link_title_map(note, list(unique_links.values()))
@@ -1101,7 +1312,12 @@ class NoteRepository(Repository[Note]):
             for link in unique_links.values():
                 desc = f" {link.description}" if link.description else ""
                 target_ref = self._format_wiki_link_target(link.target_id, title_map)
-                content += f"- {link.link_type.value} [[{target_ref}]]{desc}\n"
+                # Persist creation time as a markdown comment (invisible in
+                # Obsidian preview) so link provenance survives index rebuilds.
+                created = f" <!-- created: {link.created_at.isoformat(timespec='seconds')} -->"
+                content += (
+                    f"- {link.link_type.value} [[{target_ref}]]{desc}{created}\n"
+                )
 
         post = frontmatter.Post(content, **metadata)
         return frontmatter.dumps(post)
@@ -1177,6 +1393,10 @@ class NoteRepository(Repository[Note]):
             "remind_at": note.remind_at.isoformat() if note.remind_at else None,
             "project_id": note.project_id,
             "area_id": note.area_id,
+            "origin": note.origin,
+            "last_verified": (
+                note.last_verified.isoformat() if note.last_verified else None
+            ),
             "metadata_json": (
                 json.dumps(note.metadata, default=_json_default)
                 if note.metadata
@@ -1189,8 +1409,17 @@ class NoteRepository(Repository[Note]):
     # --- Semantic embeddings (only active when a provider is configured) ------
 
     def _embedding_text(self, note: Note) -> str:
-        """Return the text embedded for a note: its title plus body."""
-        return f"{note.title or ''}\n\n{note.content or ''}".strip()
+        """Return the text embedded for a note: its title plus prose body.
+
+        The rendered ``## Links`` section is stripped before embedding: link
+        lines are IDs and titles of OTHER notes, so they dilute the vector —
+        and a container note (an area lists every direct member as a has_part
+        line) would otherwise embed as a soup of member titles instead of its
+        own meaning. Only an actual ``## Links`` heading line is matched, so the
+        literal text appearing in prose never truncates the body.
+        """
+        body = _LINKS_HEADING_RE.split(note.content or "", maxsplit=1)[0]
+        return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod
     def _title_text(note: Note) -> str:
@@ -1569,6 +1798,8 @@ class NoteRepository(Repository[Note]):
                         n.remind_at = $remind_at,
                         n.project_id = $project_id,
                         n.area_id = $area_id,
+                        n.origin = $origin,
+                        n.last_verified = $last_verified,
                         n.metadata_json = $metadata_json,
                         n.updated_at = $updated_at
                     """,
@@ -1599,6 +1830,8 @@ class NoteRepository(Repository[Note]):
                         remind_at: $remind_at,
                         project_id: $project_id,
                         area_id: $area_id,
+                        origin: $origin,
+                        last_verified: $last_verified,
                         metadata_json: $metadata_json,
                         created_at: $created_at,
                         updated_at: $updated_at
@@ -1663,7 +1896,15 @@ class NoteRepository(Repository[Note]):
                 )
                 for row in links_by_note.get(note_id, [])
             ]
-            note_map[note_id] = _db_dict_to_note(nd, tags, links)
+            note = _db_dict_to_note(nd, tags, links)
+            # Mirror inline edges into inline_refs so a graph-sourced note that
+            # gets re-indexed re-derives the same inline rows it carried.
+            note.inline_refs = [
+                link.target_id
+                for link in links
+                if link.link_type == LinkType.INLINE
+            ]
+            note_map[note_id] = note
         return [note_map[note_id] for note_id in ids if note_id in note_map]
 
     def _query_fts_index_scored(
@@ -1808,6 +2049,9 @@ class NoteRepository(Repository[Note]):
         self._write_markdown_atomically(file_path, markdown)
 
         rendered_body = frontmatter.loads(markdown).content
+        # Derive inline prose refs from the rendered body so [[id]] mentions in
+        # freshly created content are indexed immediately, not on the next parse.
+        note.inline_refs = self._parse_inline_refs(note.id, rendered_body, note.links)
         self._index_note(note, rendered_content=rendered_body)
         return note
 
@@ -1923,6 +2167,9 @@ class NoteRepository(Repository[Note]):
         _cache_evict(str(file_path))
 
         rendered_body = frontmatter.loads(markdown).content
+        # Re-derive inline prose refs from the body actually written, so edits
+        # that add/remove [[id]] mentions update the graph on this same write.
+        note.inline_refs = self._parse_inline_refs(note.id, rendered_body, note.links)
         try:
             self._index_note(note, rendered_content=rendered_body)
         except Exception as e:
@@ -1932,24 +2179,72 @@ class NoteRepository(Repository[Note]):
         return note
 
     def delete(self, id: str) -> None:
-        """Delete a note by ID."""
+        """Delete a note by ID.
+
+        Incoming references are scrubbed from every source note: the matching
+        ``## Links`` entries are removed, and inline ``[[id]]`` / ``[[id|alias]]``
+        wiki-links in prose are unlinked in place — replaced by their alias text
+        (or the deleted note's title) so the sentence stays readable but no
+        dangling reference remains.
+        """
         self._assert_writable()
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             raise ValueError(f"Note with ID {id} does not exist")
 
+        # Read the note before removal so inline refs can be replaced with its
+        # title when they carry no alias. A corrupted/unparseable note must
+        # still be deletable, so fall back to its id as the replacement text.
+        try:
+            deleted_note = self.get(id)
+        except Exception:
+            deleted_note = None
+        deleted_title = deleted_note.title if deleted_note else id
+
+        # Incoming sources come from the graph, which includes inline edges, so
+        # prose-only referencers are scrubbed too.
         source_notes = self.find_linked_notes(id, "incoming")
 
         with self.file_lock:
             os.remove(file_path)
         _cache_evict(str(file_path))
 
+        # Match every inline form that normalizes to this id — bare, aliased,
+        # and with a ".md"/"#fragment" suffix — so none dangle after delete.
+        inline_ref_pattern = re.compile(
+            r"\[\[\s*" + re.escape(id) + WIKI_TARGET_SUFFIX
+            + r"(?:\|([^\]]*))?\s*\]\]"
+        )
+
+        def _unlink_ref(match: "re.Match[str]") -> str:
+            """Replace a deleted note's inline ref with its alias text, else the deleted note's title."""
+            alias = (match.group(1) or "").strip()
+            return alias or deleted_title
+
         for source_note in source_notes:
-            file_backed_source = self.get(source_note.id)
+            # Best-effort scrub: an unreadable/unparseable source note must not
+            # abort the delete and leave the vault half-scrubbed.
+            try:
+                file_backed_source = self.get(source_note.id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not scrub references to %s in source %s during "
+                    "delete: %s",
+                    id,
+                    source_note.id,
+                    exc,
+                )
+                continue
             if not file_backed_source:
                 continue
             existing_source = file_backed_source.model_copy(deep=True)
             file_backed_source.remove_link(id)
+            file_backed_source.content = inline_ref_pattern.sub(
+                _unlink_ref, file_backed_source.content
+            )
+            file_backed_source.inline_refs = [
+                ref for ref in file_backed_source.inline_refs if ref != id
+            ]
             self.update_preserving_updated_at(
                 file_backed_source,
                 existing_note=existing_source,
@@ -2153,6 +2448,65 @@ class NoteRepository(Repository[Note]):
             if result.get_num_tuples() == 0:
                 return None
             return {"created_at": result.get_next()[0]}
+
+    def record_retrieval(self, note_ids: List[str]) -> None:
+        """Bump retrieval signals (last_retrieved_at, hit_count) for *note_ids*.
+
+        Graph-only operational data: deliberately NOT written to markdown, so
+        reading a note never rewrites its file. Signals survive rebuilds via the
+        explicit carry-over in :meth:`rebuild_index`. No-op in read-only mode.
+        """
+        if not note_ids or self.read_only:
+            return
+        with self._connection() as conn:
+            conn.execute(
+                "UNWIND $ids AS nid MATCH (n:Note {id: nid}) "
+                "SET n.last_retrieved_at = $now, "
+                "n.hit_count = coalesce(n.hit_count, 0) + 1",
+                {"ids": list(note_ids), "now": datetime.datetime.now()},
+            )
+
+    def get_retrieval_signals(
+        self, note_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return {note_id: {last_retrieved_at, hit_count}} for ids with signals."""
+        if not note_ids:
+            return {}
+        with self._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note) WHERE n.id IN $ids AND n.hit_count IS NOT NULL "
+                "RETURN n.id AS id, n.last_retrieved_at AS last_retrieved_at, "
+                "n.hit_count AS hit_count",
+                {"ids": list(note_ids)},
+            )
+            signals: Dict[str, Dict[str, Any]] = {}
+            while result.has_next():
+                row = result.get_next()
+                signals[row[0]] = {
+                    "last_retrieved_at": row[1],
+                    "hit_count": row[2],
+                }
+            return signals
+
+    def _fetch_retrieval_signals(self) -> List[Dict[str, Any]]:
+        """Snapshot all retrieval signals for carry-over into a rebuilt graph."""
+        with self._connection() as conn:
+            result = conn.execute(
+                "MATCH (n:Note) WHERE n.hit_count IS NOT NULL "
+                "RETURN n.id AS id, n.last_retrieved_at AS last_retrieved_at, "
+                "n.hit_count AS hit_count"
+            )
+            rows: List[Dict[str, Any]] = []
+            while result.has_next():
+                row = result.get_next()
+                rows.append(
+                    {
+                        "id": row[0],
+                        "last_retrieved_at": row[1],
+                        "hit_count": row[2],
+                    }
+                )
+            return rows
 
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""

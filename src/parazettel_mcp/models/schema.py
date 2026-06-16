@@ -1,12 +1,8 @@
 """Data models for the Zettelkasten MCP server."""
 
 import datetime
-import inspect
-import random
-import sys
+import re
 import threading
-import time
-from datetime import datetime as dt
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Union
 
@@ -77,6 +73,33 @@ class LinkType(str, Enum):
     HAS_PART = "has_part"  # This project/area contains a task or note
     BLOCKS = "blocks"  # This task blocks another task
     BLOCKED_BY = "blocked_by"  # This task is blocked by another task
+    # Derived link type: a [[wiki-link]] found in a note's prose body (outside
+    # the ## Links section). Indexed into the graph so traversal/centrality see
+    # it, but never rendered into ## Links and not creatable via create_link —
+    # it exists only as a reflection of the note text.
+    INLINE = "inline"
+
+
+_TAG_SEPARATOR_RE = re.compile(r"[\s_]+")
+_TAG_MULTI_HYPHEN_RE = re.compile(r"-{2,}")
+
+
+def normalize_tag(name: str) -> str:
+    """Normalize a tag to the canonical lowercase-hyphenated form.
+
+    Collapses the most common sources of tag sprawl (case variants, underscores
+    vs hyphens vs spaces, doubled separators) so near-identical tags converge on
+    one spelling instead of fragmenting the tag vocabulary. A leading ``@`` is
+    preserved because GTD context tags (``@home``, ``@computer``) use it as a
+    semantic prefix.
+    """
+    name = str(name).strip()
+    prefix = ""
+    if name.startswith("@"):
+        prefix, name = "@", name[1:]
+    name = _TAG_SEPARATOR_RE.sub("-", name.strip().lower())
+    name = _TAG_MULTI_HYPHEN_RE.sub("-", name).strip("-")
+    return f"{prefix}{name}" if name else ""
 
 
 class Link(BaseModel):
@@ -216,6 +239,25 @@ class Note(BaseModel):
     area_id: Optional[str] = Field(
         default=None, description="ID of the linked area note (PARA routing)"
     )
+    origin: Optional[str] = Field(
+        default=None,
+        description=(
+            "Fine-grained provenance: where this note came from "
+            "(URL, chat/session id, file path, meeting name)"
+        ),
+    )
+    last_verified: Optional[datetime.date] = Field(
+        default=None,
+        description="Date the note's claim was last confirmed as still true",
+    )
+    inline_refs: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Note IDs referenced via [[wiki-links]] in the prose body, outside "
+            "the ## Links section. Derived from content on parse; indexed into "
+            "the graph as 'inline' edges but never serialized to markdown."
+        ),
+    )
 
     model_config = {
         "validate_assignment": True,
@@ -288,13 +330,18 @@ class Note(BaseModel):
 
         # Format tags
         tags_str = ", ".join([tag.name for tag in self.tags])
-        # Format links
+        # Format links. INLINE links are derived from prose [[wiki-links]] and
+        # must never be rendered into the ## Links section (the new contract);
+        # a graph-sourced Note can carry them in self.links, so filter them out.
+        serializable_links = [
+            link for link in self.links if link.link_type != LinkType.INLINE
+        ]
         links_str = ""
-        if self.links:
+        if serializable_links:
             links_str = "\n".join(
                 [
                     f"- [{link.link_type.value}] [[{link.target_id}]] {link.description or ''}"
-                    for link in self.links
+                    for link in serializable_links
                 ]
             )
         # Apply template

@@ -29,6 +29,13 @@ The result is one unified vault where knowledge notes and action items share the
 - Today view and reminder surfacing
 - Recurring tasks that auto-spawn the next instance on completion
 - Obsidian-style wiki-link aliases like `[[id|Title]]` are normalized on read and rebuild
+- Inline `[[id]]` wiki-links in prose are first-class: indexed as graph edges, scrubbed on delete, alias-refreshed on rename
+- Hand-edits to a note's `## Links` section are reconciled into the graph on update (not silently discarded)
+- Link creation times persist in markdown (HTML comment) and survive index rebuilds
+- Tags normalized on write (lowercase-hyphenated, `@` GTD prefix preserved) to prevent vocabulary sprawl
+- Note provenance (`origin`) and verification (`last_verified`) fields
+- Retrieval signals (hit count, last retrieved) tracked graph-side and carried across rebuilds
+- AI-caller ergonomics: server-level usage instructions, one-call session briefing, batch ingestion, neighborhood maps, tension surfacing, calibrated result verdicts
 
 ---
 
@@ -83,7 +90,17 @@ Applies to any note type. Tasks flow through the action lifecycle; knowledge not
 | `part_of` | `has_part` | Task/note belongs to a project or area |
 | `blocks` | `blocked_by` | One task blocks another |
 
-Parazettel also understands Obsidian-style piped wiki-links such as `[[NOTE_ID|Displayed Title]]`. On ingest, the target note ID is normalized from the link target, so aliases and heading fragments do not break indexing. When a note is rewritten, touched wiki-links are normalized to the target note title when the alias is safe to render. Renaming a note refreshes incoming title aliases, and deleting a note removes incoming markdown references.
+**Membership is bidirectional in both layers.** Every routed note carries an explicit `part_of` link to its container (its project when routed through one, otherwise its area), and the container's markdown carries a materialized `has_part` counter link per member — so reading a project's or area's file shows everything routed to it. Large areas get long `## Links` sections by design; to keep that from polluting retrieval, note embeddings strip the rendered `## Links` section, so a container's semantic vector reflects its own description, not a soup of member titles.
+
+To upgrade a vault created before this contract, run `python scripts/backfill_counter_links.py` (dry-run; `--apply` to execute with an automatic notes backup; `--semantic-inverses` additionally backfills inverses for directional semantic links).
+
+Parazettel also understands Obsidian-style piped wiki-links such as `[[NOTE_ID|Displayed Title]]`. On ingest, the target note ID is normalized from the link target, so aliases and heading fragments do not break indexing. When a note is rewritten, touched wiki-links are normalized to the target note title when the alias is safe to render. Renaming a note refreshes incoming title aliases (in both `## Links` and prose), and deleting a note scrubs incoming references everywhere — `## Links` entries are removed and inline prose refs are unlinked in place (the alias or title text remains so the sentence stays readable).
+
+**Inline prose links.** A `[[NOTE_ID]]` mention in a note's body (outside `## Links`) is indexed as a derived `inline` graph edge, so traversal, centrality, and similarity see it. Inline edges are never written into `## Links` and cannot be created via `pzk_create_link` — they exist purely as a reflection of the note text.
+
+**Editing `## Links` by hand.** When `pzk_update_note` receives content containing a `## Links` heading, its entries are reconciled into the link graph: removed lines unlink, added lines link, surviving links keep their original creation time. Content *without* a `## Links` heading leaves the note's links untouched, so passing just a new body never wipes the graph.
+
+**Link provenance.** Each `## Links` line carries an invisible `<!-- created: ... -->` comment, so "when did I connect these ideas" survives a full index rebuild.
 
 ---
 
@@ -111,7 +128,16 @@ All tools are prefixed `pzk_`.
 | `pzk_find_orphaned_notes` | Find notes with no connections |
 | `pzk_list_notes_by_date` | List notes by creation or update date |
 | `pzk_rebuild_index` | Rebuild the Kuzu graph index from Markdown files |
-| `pzk_check_consistency` | Read-only audit of file-vs-index drift (run before deciding to rebuild) |
+| `pzk_check_consistency` | Read-only audit of file-vs-index drift + dangling wiki references |
+
+### AI-memory ergonomics
+
+| Tool | Description |
+| --- | --- |
+| `pzk_briefing` | One-call session orientation: active projects, due tasks, reminders, recent notes |
+| `pzk_ingest_batch` | Create many notes + links + tasks in one call, with `#N` cross-references; likely duplicates are created-and-flagged for review by default (`on_duplicate="skip"` for unattended auto-fold) |
+| `pzk_get_neighborhood` | Hop-grouped map of the linked neighborhood around a note (includes inline refs) |
+| `pzk_find_tensions` | Unlinked same-topic notes framed for a fold / link / contradicts judgment |
 
 ### Task management
 
@@ -302,8 +328,16 @@ Rerunning the migration against an existing target updates current notes and lin
 
 ```bash
 uv sync --extra dev
-.venv/bin/python -m pytest tests/
+.venv/bin/python -m pytest tests/ -n 4 --dist loadgroup
 ```
+
+`-n 4 --dist loadgroup` runs the suite in parallel (~2 min vs ~5.5 min serial).
+Tests that perform a real index rebuild are automatically collected into one
+xdist group (see `tests/conftest.py`) so no two rebuilds run concurrently —
+concurrent rebuilds are the suite's known flake source. Each test gets a
+private graph database seeded by file-copying a once-per-session template, so
+isolation is preserved without paying full schema + FTS-index creation per
+test.
 
 See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-tool testing walkthrough using the live MCP server.
 
@@ -314,7 +348,7 @@ See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-
 | Document | Description |
 | --- | --- |
 | [`docs/para-gtd-guide.md`](docs/para-gtd-guide.md) | PARA/GTD workflow — areas, projects, tasks, today view, reminders |
-| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 31 tools with example calls and expected output |
+| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 36 tools with example calls and expected output |
 | [`docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md`](docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md) | Full link type reference |
 | [`docs/prompts/system/system-prompt.md`](docs/prompts/system/system-prompt.md) | System prompt for Claude |
 | [`docs/prompts/chat/`](docs/prompts/chat/) | Chat prompts for knowledge workflows |

@@ -2,10 +2,11 @@
 
 import datetime
 import logging
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (
@@ -16,8 +17,12 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
     Tag,
+    normalize_tag,
 )
-from parazettel_mcp.storage.note_repository import NoteRepository
+from parazettel_mcp.storage.note_repository import (
+    WIKI_TARGET_SUFFIX,
+    NoteRepository,
+)
 
 logger = logging.getLogger(__name__)
 _UNSET = object()
@@ -75,6 +80,24 @@ class ZettelService:
         # The repository is initialized in its constructor
         pass
 
+    @staticmethod
+    def _normalize_tags(tags: Optional[List[str]]) -> List[Tag]:
+        """Normalize and de-duplicate a raw tag list into Tag objects.
+
+        All tag writes funnel through here so the vault converges on one
+        canonical spelling per tag (see :func:`normalize_tag`) instead of
+        accumulating case/separator variants.
+        """
+        normalized: List[Tag] = []
+        seen: Set[str] = set()
+        for raw in tags or []:
+            name = normalize_tag(raw)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            normalized.append(Tag(name=name))
+        return normalized
+
     def close(self) -> None:
         """Release resources held by the service."""
         self.repository.close()
@@ -109,6 +132,33 @@ class ZettelService:
             note.add_link(parent_id, LinkType.PART_OF)
         return note
 
+    def _routing_link_keys(self, note: Note) -> List[Tuple[str, LinkType]]:
+        """The (target_id, link_type) routing links a note must carry given its
+        current frontmatter routing.
+
+        These are generated from ``area_id``/``project_id`` — not free-form — so
+        they are the canonical set to seed at create and to preserve across a
+        ``## Links`` reconciliation. A non-area note references its area and is
+        ``part_of`` its container (its project, else the area); a project routed
+        under a parent project is additionally ``part_of`` its inherited area.
+        """
+        if note.note_type == NoteType.AREA:
+            return []
+        keys: List[Tuple[str, LinkType]] = []
+        if note.area_id and note.area_id != note.id:
+            keys.append((note.area_id, LinkType.REFERENCE))
+        container = note.project_id or note.area_id
+        if container and container != note.id:
+            keys.append((container, LinkType.PART_OF))
+        if (
+            note.note_type == NoteType.PROJECT
+            and note.project_id
+            and note.area_id
+            and note.area_id != note.id
+        ):
+            keys.append((note.area_id, LinkType.PART_OF))
+        return keys
+
     def _ensure_parent_has_part_link(self, parent_id: Optional[str], child_id: str) -> None:
         """Update the parent note once so it reflects the child relationship.
 
@@ -133,7 +183,14 @@ class ZettelService:
     def _sync_part_of_link(
         self, note_id: str, previous_parent_id: Optional[str], parent_id: Optional[str]
     ) -> Note:
-        """Synchronize PART_OF/HAS_PART links with the note's current parent routing."""
+        """Synchronize PART_OF/HAS_PART links with the note's current parent routing.
+
+        The counter HAS_PART link is materialized in the parent's markdown for
+        BOTH project and area parents, so reading the container's file shows
+        every member. (Large areas get long ## Links sections by design — the
+        owner prefers file-visible membership; embeddings strip the links
+        section so the list never pollutes the area's semantic vector.)
+        """
         note = self.repository.get(note_id)
         if not note:
             raise ValueError(f"Note with ID {note_id} not found")
@@ -217,6 +274,7 @@ class ZettelService:
         status: Optional[NoteStatus] = None,
         project_id: Optional[str] = None,
         area_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> Note:
         """Create a new note."""
         if not title:
@@ -253,21 +311,39 @@ class ZettelService:
                 title=title,
                 content=content,
                 note_type=note_type,
-                tags=[Tag(name=tag) for tag in (tags or [])],
+                tags=self._normalize_tags(tags),
                 metadata=metadata or {},
                 source=source,
                 status=status,
                 project_id=project_id,
                 area_id=resolved_area_id,
+                origin=origin,
             )
 
             if note_type == NoteType.AREA:
                 note.area_id = note.id
             else:
-                note = self._seed_routing_links(note, parent_id=project_id)
+                # Seed the canonical routing links (area reference + part_of to
+                # the container, plus area part_of for a project under a parent
+                # project) so membership is bidirectional in both layers — the
+                # same set create_project_note produces.
+                note = self._seed_routing_links(
+                    note, parent_id=project_id or resolved_area_id
+                )
+                if note_type == NoteType.PROJECT and project_id and resolved_area_id:
+                    note.add_link(resolved_area_id, LinkType.PART_OF)
 
             note = self.repository.create(note)
-            self._ensure_parent_has_part_link(project_id, note.id)
+            # Materialize the has_part counter link on every container the note
+            # is a member of. A project routed under a parent project belongs to
+            # both that parent project and its inherited area.
+            if note_type == NoteType.PROJECT and project_id and resolved_area_id:
+                self._ensure_parent_has_part_link(project_id, note.id)
+                self._ensure_parent_has_part_link(resolved_area_id, note.id)
+            elif note_type != NoteType.AREA:
+                self._ensure_parent_has_part_link(
+                    project_id or resolved_area_id, note.id
+                )
         return note
 
     def get_note(self, note_id: str) -> Optional[Note]:
@@ -277,6 +353,37 @@ class ZettelService:
     def get_note_by_title(self, title: str) -> Optional[Note]:
         """Retrieve a note by title."""
         return self.repository.get_by_title(title)
+
+    def record_retrieval(self, note_ids: List[str]) -> None:
+        """Record that *note_ids* were explicitly retrieved (recency/frequency).
+
+        Best-effort and never raises: retrieval tracking is an enhancement to
+        the read path and must not be able to break a read. Serialized by the
+        write lock because it mutates the graph (Kuzu is single-writer).
+        """
+        ids = [str(nid) for nid in note_ids if nid]
+        if not ids:
+            return
+        recorder = getattr(self.repository, "record_retrieval", None)
+        if not callable(recorder):
+            return
+        try:
+            with self._write_locked():
+                recorder(ids)
+        except Exception as exc:  # pragma: no cover - advisory only
+            logger.debug("Could not record retrieval for %s: %s", ids, exc)
+
+    def get_retrieval_signals(
+        self, note_ids: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return retrieval signals (last_retrieved_at, hit_count) per note id."""
+        getter = getattr(self.repository, "get_retrieval_signals", None)
+        if not callable(getter):
+            return {}
+        try:
+            return getter([str(nid) for nid in note_ids if nid])
+        except Exception:  # pragma: no cover - advisory only
+            return {}
 
     def update_note(
         self,
@@ -289,6 +396,8 @@ class ZettelService:
         metadata: Optional[Dict[str, Any]] = None,
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
+        origin: Any = _UNSET,
+        last_verified: Any = _UNSET,
     ) -> Note:
         """Update an existing note.
 
@@ -308,6 +417,56 @@ class ZettelService:
                 metadata=metadata,
                 project_id=project_id,
                 area_id=area_id,
+                origin=origin,
+                last_verified=last_verified,
+            )
+
+    def _reconcile_links_from_content(self, note: Note, content: str) -> None:
+        """Honor a ``## Links`` section hand-edited into updated *content*.
+
+        Historically the ``## Links`` section was a one-way render of
+        ``note.links`` — body edits to it were silently discarded on the next
+        write. Instead, when the new content carries a ``## Links`` heading, its
+        entries are parsed and become the note's links: lines removed are
+        unlinked, lines added are linked. Links that survive keep their original
+        ``created_at``/description. When the new content has NO ``## Links``
+        heading the existing links are kept unchanged (so passing just a new
+        body never wipes the link graph).
+
+        Routing-derived links (area ``reference``/``part_of``) are NOT free-form
+        — they are generated from the note's frontmatter routing — so they are
+        re-added after parsing even when the hand-edited section omits them.
+        Otherwise a ## Links edit could silently de-route the note from its
+        area/project (the later routing sync only repairs links when
+        ``area_id``/``project_id`` themselves change).
+        """
+        if "## Links" not in content:
+            return
+        parsed = self.repository.parse_links_in_content(note.id, content)
+        existing_by_key = {
+            (link.target_id, link.link_type): link for link in note.links
+        }
+        # Take each surviving link from the parsed (edited) content so a
+        # description edit in the ## Links line is honored, but carry over the
+        # durable ``created_at`` from the stored link (the hand-edit may have
+        # dropped the invisible provenance comment).
+        reconciled: List[Link] = []
+        for link in parsed:
+            existing = existing_by_key.get((link.target_id, link.link_type))
+            if existing is not None:
+                link = link.model_copy(update={"created_at": existing.created_at})
+            reconciled.append(link)
+        note.links = reconciled
+        present = {(link.target_id, link.link_type) for link in note.links}
+        for key in self._routing_link_keys(note):
+            if key in present:
+                continue
+            target_id, link_type = key
+            note.links.append(
+                existing_by_key.get(key)
+                or Link(
+                    source_id=note.id, target_id=target_id, link_type=link_type
+                )
             )
 
     def _update_note_locked(
@@ -321,6 +480,8 @@ class ZettelService:
         metadata: Optional[Dict[str, Any]] = None,
         project_id: Any = _UNSET,
         area_id: Any = _UNSET,
+        origin: Any = _UNSET,
+        last_verified: Any = _UNSET,
     ) -> Note:
         """Update implementation; caller holds the write lock."""
         note = self.repository.get(note_id)
@@ -334,11 +495,12 @@ class ZettelService:
         if title is not None:
             note.title = title
         if content is not None:
+            self._reconcile_links_from_content(note, content)
             note.content = content
         if note_type is not None:
             note.note_type = note_type
         if tags is not None:
-            note.tags = [Tag(name=tag) for tag in tags]
+            note.tags = self._normalize_tags(tags)
         if status is not _UNSET:
             note.status = status
         if metadata is not None:
@@ -347,6 +509,10 @@ class ZettelService:
             note.project_id = project_id
         if area_id is not _UNSET:
             note.area_id = area_id
+        if origin is not _UNSET:
+            note.origin = origin
+        if last_verified is not _UNSET:
+            note.last_verified = last_verified
 
         if note.note_type == NoteType.AREA:
             if note.project_id:
@@ -404,28 +570,59 @@ class ZettelService:
             note = self._sync_project_area_links(
                 note.id, previous_area_id, note.area_id
             )
-        elif (
-            note.note_type != NoteType.AREA
-            and previous_area_id != note.area_id
-        ):
-            note = self._sync_area_reference_link(
-                note.id, previous_area_id, note.area_id
+            note = self._sync_part_of_link(
+                note.id, previous_project_id, note.project_id
             )
-        note = self._sync_part_of_link(
-            note.id, previous_project_id, note.project_id
-        )
+        elif note.note_type != NoteType.AREA:
+            if previous_area_id != note.area_id:
+                note = self._sync_area_reference_link(
+                    note.id, previous_area_id, note.area_id
+                )
+            # The PART_OF link follows the note's container: its project when
+            # routed through one, otherwise the area itself. This keeps direct
+            # area membership bidirectional (part_of + derived has_part) and
+            # moves the link when routing changes in either dimension.
+            previous_container = previous_project_id or previous_area_id
+            new_container = note.project_id or note.area_id
+            note = self._sync_part_of_link(
+                note.id, previous_container, new_container
+            )
         if title_changed:
             self._refresh_incoming_link_aliases(note.id)
         return note
 
     def _refresh_incoming_link_aliases(self, note_id: str) -> None:
-        """Rewrite incoming source notes so aliases follow the target title."""
+        """Rewrite incoming source notes so aliases follow the target title.
+
+        Covers both representations: the regenerated ``## Links`` section (whose
+        aliases are re-resolved from the graph on rewrite) and aliased inline
+        ``[[id|old title]]`` wiki-links in prose, which are rewritten in place to
+        the new title. Any ``.md``/``#fragment`` suffix on the target is
+        preserved. Bare inline ``[[id]]`` refs need no refresh.
+        """
+        target = self.repository.get(note_id)
+        new_title = target.title if target else None
+        # Match aliased inline refs in any normalizing form (id, id.md, id#frag,
+        # id.md#frag), capturing the suffix so it survives the rewrite.
+        inline_alias_pattern = re.compile(
+            r"\[\[\s*" + re.escape(note_id)
+            + r"(?P<sfx>" + WIKI_TARGET_SUFFIX + r")\s*\|[^\]]*\]\]"
+        )
+
+        def _rewrite_alias(match: "re.Match[str]") -> str:
+            """Rewrite an aliased inline ref to the new title, preserving any .md/#fragment suffix."""
+            return f"[[{note_id}{match.group('sfx')}|{new_title}]]"
+
         incoming_notes = self.repository.find_linked_notes(note_id, "incoming")
         for incoming_note in incoming_notes:
             source_note = self.repository.get(incoming_note.id)
             if not source_note:
                 continue
             existing_source = source_note.model_copy(deep=True)
+            if new_title and "|" not in new_title and "]]" not in new_title:
+                source_note.content = inline_alias_pattern.sub(
+                    _rewrite_alias, source_note.content
+                )
             self.repository.update_preserving_updated_at(
                 source_note,
                 existing_note=existing_source,
@@ -446,8 +643,22 @@ class ZettelService:
         return self.repository.search(**kwargs)
 
     def get_notes_by_tag(self, tag: str) -> List[Note]:
-        """Get notes by tag."""
-        return self.repository.find_by_tag(tag)
+        """Get notes by tag.
+
+        Returns the de-duplicated union of the raw-tag and normalized-tag
+        matches, so a mixed vault (some notes under a legacy raw spelling, some
+        under the canonical normalized one) surfaces both for a query like 'AI'
+        — not just whichever set happens to match first.
+        """
+        notes = list(self.repository.find_by_tag(tag))
+        normalized = normalize_tag(tag)
+        if normalized and normalized != tag:
+            seen = {note.id for note in notes}
+            for note in self.repository.find_by_tag(normalized):
+                if note.id not in seen:
+                    seen.add(note.id)
+                    notes.append(note)
+        return notes
 
     def add_tag_to_note(self, note_id: str, tag: str) -> Note:
         """Add a tag to a note (serialized against all writers by the global write lock)."""
@@ -455,7 +666,9 @@ class ZettelService:
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
-            note.add_tag(tag)
+            normalized = normalize_tag(tag)
+            if normalized:
+                note.add_tag(normalized)
             return self.repository.update(note)
 
     def remove_tag_from_note(self, note_id: str, tag: str) -> Note:
@@ -464,7 +677,12 @@ class ZettelService:
             note = self.repository.get(note_id)
             if not note:
                 raise ValueError(f"Note with ID {note_id} not found")
+            # Remove both the raw and the normalized spelling so legacy
+            # (pre-normalization) tags on old notes can still be removed.
             note.remove_tag(tag)
+            normalized = normalize_tag(tag)
+            if normalized and normalized != tag:
+                note.remove_tag(normalized)
             return self.repository.update(note)
 
     def get_all_tags(self) -> List[Tag]:
@@ -519,6 +737,12 @@ class ZettelService:
         Returns:
             Tuple of (source_note, target_note or None)
         """
+        if link_type == LinkType.INLINE or bidirectional_type == LinkType.INLINE:
+            raise ValueError(
+                "'inline' links are derived from [[wiki-links]] in note prose "
+                "and cannot be created directly. Edit the note content, or use "
+                "an explicit link type (reference, extends, supports, ...)."
+            )
         source_note = self.repository.get(source_id)
         if not source_note:
             raise ValueError(f"Source note with ID {source_id} not found")
@@ -937,7 +1161,8 @@ class ZettelService:
         title = note.title or ""
         body = note.content or ""
         # Drop the generated ## Links section so link IDs don't dominate overlap.
-        body = body.split("## Links", 1)[0]
+        # Match only an actual heading line, never the literal text in prose.
+        body = re.split(r"(?m)^\s*##\s+Links\s*$", body, maxsplit=1)[0]
         text = f"{title} {body}".lower()
         tokens = re.findall(r"[a-z0-9]+", text)
         return {
@@ -995,7 +1220,7 @@ class ZettelService:
                 title=title,
                 content=content,
                 note_type=NoteType.TASK,
-                tags=[Tag(name=t) for t in (tags or [])],
+                tags=self._normalize_tags(tags),
                 status=status,
                 source=source,
                 due_date=due_date,
@@ -1099,7 +1324,7 @@ class ZettelService:
         if recurrence_rule is not _UNSET:
             task.recurrence_rule = recurrence_rule
         if tags is not _UNSET:
-            task.tags = [Tag(name=tag) for tag in tags]
+            task.tags = self._normalize_tags(tags)
 
         if any(value is not _UNSET for value in pending_updates.values()):
             task.updated_at = datetime.datetime.now()

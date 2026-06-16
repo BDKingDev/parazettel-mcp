@@ -1,6 +1,6 @@
 # MCP Testing Guide
 
-A complete walkthrough of all 31 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
+A complete walkthrough of all 36 `pzk_` tools in logical execution order. Run sections in sequence — later sections reference IDs created in earlier ones.
 
 Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each creation call.
 
@@ -1120,6 +1120,83 @@ The categories are: **Files missing from index** (a `{id}.md` exists on disk but
 
 ---
 
+## Section 6 — AI-memory ergonomics
+
+These tools make the vault easier to drive as persistent AI memory: one-call orientation, batch ingestion, neighborhood mapping, semantic recall, and tension surfacing.
+
+### `pzk_briefing`
+
+**Call:**
+
+```json
+{}
+```
+
+One call returns active projects, today's + overdue tasks, due reminders, and recently touched notes — the session-start orientation that replaces separate `pzk_list_projects` / `pzk_get_todays_tasks` / `pzk_get_reminders` / `pzk_list_notes_by_date` calls.
+
+### `pzk_find_similar_to_text`
+
+**Call:**
+
+```json
+{
+  "text": "Atomic notes hold exactly one idea so they can be linked precisely.",
+  "threshold": 0.5,
+  "limit": 10
+}
+```
+
+Embeds arbitrary text (no existing note needed) and returns notes by calibrated cosine similarity (0–1), highest first — use it to check a *draft* for near-duplicates before creating. Phrase the query as a full claim, not keywords. Requires embeddings enabled; otherwise fall back to `pzk_search_notes`. The result ends with a calibrated verdict (low top score ≈ novel; high ≈ same topic — confirm same atomic claim before folding).
+
+### `pzk_get_neighborhood`
+
+**Call:**
+
+```json
+{
+  "note_id": "{NOTE_ID}",
+  "depth": 2,
+  "max_nodes": 25
+}
+```
+
+Maps the linked neighborhood around a note, grouped by hop distance (includes inline prose refs). Use for synthesis ("what do I know around X?") instead of chaining `pzk_get_linked_notes` calls.
+
+### `pzk_find_tensions`
+
+**Call:**
+
+```json
+{
+  "note_id": "{NOTE_ID}",
+  "limit": 8
+}
+```
+
+Returns same-topic notes **not yet linked** to the given note, framed for a fold / link / contradict judgment. Run after creating or substantially updating a note: similarity finds same-topic, so a duplicate and a counter-claim look alike — you judge each and act (`pzk_update_note` to fold, `pzk_create_link` with the judged relation, or leave it).
+
+### `pzk_ingest_batch`
+
+**Call:**
+
+```json
+{
+  "notes": [
+    {"title": "Spaced repetition fights forgetting", "content": "...", "area_id": "{AREA_ID}"},
+    {"title": "Active recall beats re-reading", "content": "...", "area_id": "{AREA_ID}"}
+  ],
+  "links": [
+    {"source": "#0", "target": "#1", "type": "related"}
+  ],
+  "tasks": [],
+  "default_source": "chat"
+}
+```
+
+Creates many notes, links, and tasks in one call — links reference notes by position (`#0`, `#1`, …) or real IDs. Each note passes the same dedup probe as `pzk_create_note`; by default (`on_duplicate="flag"`) a likely duplicate is still created and flagged in a "Duplicate review" section for you to fold or link. Pass `on_duplicate="skip"` for unattended pipelines (the duplicate is not created and its references attach to the existing note).
+
+---
+
 ## Quick Reference
 
 | Tool | Required params | Key optional params |
@@ -1153,4 +1230,10 @@ The categories are: **Files missing from index** (a `{id}.md` exists on disk but
 | `pzk_list_notes_by_date` | — | start\_date, end\_date, use\_updated, limit |
 | `pzk_rebuild_index` | — | — |
 | `pzk_check_consistency` | — | — |
-| `pzk_get_notes` | identifiers | — |
+| `pzk_get_notes` | identifiers | detail |
+| `pzk_get_notes_by_tag` | tag | limit, detail |
+| `pzk_briefing` | — | — |
+| `pzk_find_similar_to_text` | text | threshold, limit |
+| `pzk_get_neighborhood` | note\_id | depth, max\_nodes |
+| `pzk_find_tensions` | note\_id | limit |
+| `pzk_ingest_batch` | one of notes/links/tasks | default\_project\_id, default\_area\_id, default\_source, on\_duplicate |

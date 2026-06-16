@@ -14,6 +14,19 @@ Merged to `main` after v0.5.1.1; not yet version-bumped.
 - **Area reference link syncs on re-route** — changing a note's `area_id` (directly or via project) now rewrites its `## Links` area reference to match.
 - **Actionable daemon-down errors** — the daemon-unavailable message now includes an absolute, runnable command to start the daemon.
 
+### AI memory: link integrity, retrieval ergonomics, bidirectional membership
+
+This batch turns the vault from a search index into durable AI memory. Brings the total to **36 MCP tools**.
+
+- **Inline `[[id]]` prose links are first-class** — a wiki-link in a note body (outside `## Links`) is indexed as an `inline` graph edge, scrubbed on delete (leaving readable alias/title text), alias-refreshed on rename, and reported as a dangling ref by `pzk_check_consistency`. Every form is handled (`[[id]]`, `[[id|alias]]`, `[[id#fragment]]`, `[[id.md]]`).
+- **Hand-edited `## Links` is honored** — passing content with a `## Links` section to `pzk_update_note` reconciles its entries into the graph (adds/removes links, honors description edits) instead of silently discarding them; routing-derived links are preserved so an edit can't de-route a note. Content with no `## Links` heading leaves links untouched.
+- **Durable link timestamps** — a link's `created_at` persists in markdown (invisible HTML comment) and survives a full `pzk_rebuild_index`.
+- **Bidirectional PARA membership in both layers** — every routed note carries `part_of` to its container, and the container's markdown carries a materialized `has_part` counter link per member (areas as well as projects). Note embeddings strip the `## Links` section so a large membership list never pollutes a container's semantic vector. `scripts/backfill_counter_links.py` upgrades an existing vault.
+- **New AI-ergonomics tools** — `pzk_briefing` (one-call session orientation), `pzk_ingest_batch` (notes + links + tasks in one call with `#N` cross-refs and a per-note dedup gate that flags rather than auto-folds), `pzk_get_neighborhood` (hop-grouped graph map), `pzk_find_tensions` (unlinked same-topic notes framed for fold/link/contradict).
+- **Calibrated, AI-friendly output** — the MCP server ships an operating-instructions block (full-claim queries, score calibration, never-guess-IDs, tag reuse); search/similarity results carry a calibrated verdict line; heavy readers accept `detail=ids|summary|full`; not-found errors give did-you-mean recovery; results never truncate silently.
+- **Memory primitives** — new `origin` (provenance) and `last_verified` note fields; graph-side retrieval signals (`hit_count`, `last_retrieved_at`) carried across rebuilds; tags normalized on every write (lowercase-hyphenated, `@` GTD prefix preserved).
+- **Reliability** — daemon auto-start serialized with an OS file lock (kills the double-spawn read-only race); `delete()` is resilient to unparseable notes; test suite parallelized (~5.5 min → ~2 min) via a session-scoped template DB and a serialized rebuild group.
+
 ## v0.5.1.1 (Current Release)
 
 **Release Date:** 2026-05-11

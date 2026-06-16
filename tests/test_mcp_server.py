@@ -4,7 +4,6 @@ import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-import pytest
 
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
@@ -124,6 +123,7 @@ class TestMcpServer:
             status=None,
             project_id=None,
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_warns_on_likely_duplicate_and_does_not_create(self):
@@ -156,6 +156,70 @@ class TestMcpServer:
         assert "Atomic notes hold one idea" in result
         assert "Relevance: 2.6" in result
         assert "check_duplicates=false" in result
+        self.mock_zettel_service.create_note.assert_not_called()
+
+    def _ingest_batch_with_duplicate(self, **batch_kwargs):
+        """Run pzk_ingest_batch with one note that trips the dedup probe."""
+        existing = MagicMock()
+        existing.id = "dup123"
+        existing.title = "Atomic notes hold one idea"
+        existing.content = "Each note contains exactly one idea for clarity."
+        existing.tags = []
+        existing.note_type = NoteType.PERMANENT
+        match = SimpleNamespace(
+            note=existing, score=2.6, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+
+        new_note = MagicMock()
+        new_note.id = "new456"
+        self.mock_zettel_service.create_note.return_value = new_note
+
+        ingest_func = self.registered_tools["pzk_ingest_batch"]
+        result = ingest_func(
+            notes=[
+                {
+                    "title": "Atomic notes contain a single idea",
+                    "content": "A note should hold one idea.",
+                }
+            ],
+            links=[{"source": "#0", "target": "tgt999"}],
+            default_area_id="area123",
+            **batch_kwargs,
+        )
+        return result
+
+    def test_ingest_batch_flags_duplicate_by_default(self):
+        """Default on_duplicate='flag': the note is created, refs resolve to
+        the NEW note, and the report demands a fold-or-link review — the probe
+        matches topic, so the claim judgment stays with the caller."""
+        result = self._ingest_batch_with_duplicate()
+
+        self.mock_zettel_service.create_note.assert_called_once()
+        assert "DUPLICATE FLAG" in result
+        assert "REVIEW REQUIRED" in result
+        assert "dup123" in result and "new456" in result
+        # The #0 reference attaches the link to the newly created note.
+        _, link_kwargs = self.mock_zettel_service.create_link.call_args
+        assert link_kwargs["source_id"] == "new456"
+
+    def test_ingest_batch_on_duplicate_skip_redirects_refs(self):
+        """on_duplicate='skip' keeps the old auto-fold for unattended
+        pipelines: nothing created, refs attach to the existing note."""
+        result = self._ingest_batch_with_duplicate(on_duplicate="skip")
+
+        self.mock_zettel_service.create_note.assert_not_called()
+        assert "SKIPPED" in result
+        _, link_kwargs = self.mock_zettel_service.create_link.call_args
+        assert link_kwargs["source_id"] == "dup123"
+
+    def test_ingest_batch_rejects_invalid_on_duplicate(self):
+        """pzk_ingest_batch rejects an on_duplicate value other than flag/skip."""
+        ingest_func = self.registered_tools["pzk_ingest_batch"]
+        result = ingest_func(
+            notes=[{"title": "T", "content": "c"}], on_duplicate="banana"
+        )
+        assert "Invalid on_duplicate" in result
         self.mock_zettel_service.create_note.assert_not_called()
 
     def test_create_note_whitespace_title_returns_validation_error(self):
@@ -417,6 +481,7 @@ class TestMcpServer:
             status=NoteStatus.INBOX,
             project_id=None,
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_tool_rejects_invalid_status(self):
@@ -487,6 +552,7 @@ class TestMcpServer:
             status=None,
             project_id=None,
             area_id=None,
+            origin=None,
         )
 
     def test_create_note_tool_inherits_area_from_project(self):
@@ -520,6 +586,7 @@ class TestMcpServer:
             status=None,
             project_id="project123",
             area_id="area123",
+            origin=None,
         )
 
     def test_create_note_tool_rejects_project_area_mismatch(self):
@@ -1656,7 +1723,7 @@ class TestMcpServer:
         fn = self.registered_tools["pzk_delete_note"]
         result = fn(note_id="note123")
 
-        assert result == "Note deleted successfully: note123"
+        assert result.startswith("Note deleted successfully: note123")
         self.mock_zettel_service.get_note.assert_called_once_with("note123")
         self.mock_zettel_service.delete_note.assert_called_once_with("note123")
 
