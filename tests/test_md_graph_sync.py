@@ -311,6 +311,27 @@ def test_hand_edited_tags_propagate_to_tag_edges(zettel_service):
     assert note.id in {n.id for n in zettel_service.get_notes_by_tag("added-by-hand")}
 
 
+def test_delete_corrupted_note_still_succeeds(zettel_service):
+    """A note whose file became unparseable must still be deletable."""
+    note = zettel_service.create_note(title="Corrupt Me", content="x")
+    # Corrupt the file so frontmatter parsing fails (no id) — get() would raise.
+    write_md(zettel_service, note.id, "this file has no frontmatter at all\n")
+    zettel_service.delete_note(note.id)  # must not raise
+    assert zettel_service.get_note(note.id) is None
+    assert not (zettel_service.repository.notes_dir / f"{note.id}.md").exists()
+
+
+def test_delete_continues_when_a_referrer_is_corrupted(zettel_service):
+    """An unparseable incoming-source note must not abort deletion of its target."""
+    target = zettel_service.create_note(title="Target", content="t")
+    src = zettel_service.create_note(title="Source", content="s")
+    zettel_service.create_link(src.id, target.id, LinkType.REFERENCE)
+    # Corrupt the source so scrubbing its references would raise on read.
+    write_md(zettel_service, src.id, "garbage with no frontmatter id\n")
+    zettel_service.delete_note(target.id)  # best-effort scrub, must not raise
+    assert zettel_service.get_note(target.id) is None
+
+
 # ---------------------------------------------------------------------------
 # 2. Tool-level operations wire routing links in md AND graph
 # ---------------------------------------------------------------------------

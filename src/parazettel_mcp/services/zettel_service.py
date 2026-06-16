@@ -20,7 +20,7 @@ from parazettel_mcp.models.schema import (
     normalize_tag,
 )
 from parazettel_mcp.storage.note_repository import (
-    _WIKI_TARGET_SUFFIX,
+    WIKI_TARGET_SUFFIX,
     NoteRepository,
 )
 
@@ -446,10 +446,17 @@ class ZettelService:
         existing_by_key = {
             (link.target_id, link.link_type): link for link in note.links
         }
-        note.links = [
-            existing_by_key.get((link.target_id, link.link_type), link)
-            for link in parsed
-        ]
+        # Take each surviving link from the parsed (edited) content so a
+        # description edit in the ## Links line is honored, but carry over the
+        # durable ``created_at`` from the stored link (the hand-edit may have
+        # dropped the invisible provenance comment).
+        reconciled: List[Link] = []
+        for link in parsed:
+            existing = existing_by_key.get((link.target_id, link.link_type))
+            if existing is not None:
+                link = link.model_copy(update={"created_at": existing.created_at})
+            reconciled.append(link)
+        note.links = reconciled
         present = {(link.target_id, link.link_type) for link in note.links}
         for key in self._routing_link_keys(note):
             if key in present:
@@ -599,7 +606,7 @@ class ZettelService:
         # id.md#frag), capturing the suffix so it survives the rewrite.
         inline_alias_pattern = re.compile(
             r"\[\[\s*" + re.escape(note_id)
-            + r"(?P<sfx>" + _WIKI_TARGET_SUFFIX + r")\s*\|[^\]]*\]\]"
+            + r"(?P<sfx>" + WIKI_TARGET_SUFFIX + r")\s*\|[^\]]*\]\]"
         )
 
         def _rewrite_alias(match: "re.Match[str]") -> str:

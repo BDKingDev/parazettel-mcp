@@ -232,10 +232,11 @@ def test_links_section_edit_is_reconciled_on_update(zettel_service):
         if link.target_id == b.id
     ).created_at
 
-    # Hand-edit the ## Links section: keep B, drop C, add D (supports).
+    # Hand-edit the ## Links section: keep B (now with an edited description),
+    # drop C, add D (supports).
     new_content = (
         "# Reconcile Me\n\nUpdated body.\n\n## Links\n"
-        f"- reference [[{b.id}]]\n"
+        f"- reference [[{b.id}]] edited description\n"
         f"- supports [[{d.id}]] hand-written\n"
     )
     zettel_service.update_note(a.id, content=new_content)
@@ -245,7 +246,9 @@ def test_links_section_edit_is_reconciled_on_update(zettel_service):
     assert set(by_target) == {b.id, d.id}
     assert by_target[d.id].link_type == LinkType.SUPPORTS
     assert by_target[d.id].description == "hand-written"
-    # The surviving link keeps its original creation time.
+    # The surviving link honors the edited description...
+    assert by_target[b.id].description == "edited description"
+    # ...while keeping its original creation time.
     assert by_target[b.id].created_at.replace(microsecond=0) == (
         kept_created_at.replace(microsecond=0)
     )
@@ -333,7 +336,7 @@ def test_embedding_text_keeps_prose_mention_of_links_heading(zettel_service):
     assert "zebracorn" in embed_text
 
 
-def test_to_markdown_excludes_inline_links(zettel_service):
+def test_to_markdown_excludes_inline_links():
     """Note.to_markdown (used by export) must not render derived INLINE links
     into the ## Links section."""
     from parazettel_mcp.models.schema import LinkType as _LT

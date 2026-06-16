@@ -185,7 +185,9 @@ _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
 # rename-alias-refresh patterns so every form that _parse_inline_refs indexes is
 # also cleaned up. Safe against a longer id with the same prefix: neither branch
 # matches a trailing digit, so the surrounding "|"/"]]"/whitespace anchor fails.
-_WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
+# Public (no underscore) because the service layer builds the rename pattern
+# from the same fragment — keeping one source of truth for the wiki-link grammar.
+WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
 
 
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
@@ -2191,8 +2193,12 @@ class NoteRepository(Repository[Note]):
             raise ValueError(f"Note with ID {id} does not exist")
 
         # Read the note before removal so inline refs can be replaced with its
-        # title when they carry no alias.
-        deleted_note = self.get(id)
+        # title when they carry no alias. A corrupted/unparseable note must
+        # still be deletable, so fall back to its id as the replacement text.
+        try:
+            deleted_note = self.get(id)
+        except Exception:
+            deleted_note = None
         deleted_title = deleted_note.title if deleted_note else id
 
         # Incoming sources come from the graph, which includes inline edges, so
@@ -2206,7 +2212,7 @@ class NoteRepository(Repository[Note]):
         # Match every inline form that normalizes to this id — bare, aliased,
         # and with a ".md"/"#fragment" suffix — so none dangle after delete.
         inline_ref_pattern = re.compile(
-            r"\[\[\s*" + re.escape(id) + _WIKI_TARGET_SUFFIX
+            r"\[\[\s*" + re.escape(id) + WIKI_TARGET_SUFFIX
             + r"(?:\|([^\]]*))?\s*\]\]"
         )
 
@@ -2216,7 +2222,19 @@ class NoteRepository(Repository[Note]):
             return alias or deleted_title
 
         for source_note in source_notes:
-            file_backed_source = self.get(source_note.id)
+            # Best-effort scrub: an unreadable/unparseable source note must not
+            # abort the delete and leave the vault half-scrubbed.
+            try:
+                file_backed_source = self.get(source_note.id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not scrub references to %s in source %s during "
+                    "delete: %s",
+                    id,
+                    source_note.id,
+                    exc,
+                )
+                continue
             if not file_backed_source:
                 continue
             existing_source = file_backed_source.model_copy(deep=True)
