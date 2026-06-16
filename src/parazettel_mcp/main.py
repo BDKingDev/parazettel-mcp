@@ -293,22 +293,30 @@ def _build_daemon_command(args: argparse.Namespace) -> list[str]:
 def _build_windows_daemon_bootstrap_command(
     args: argparse.Namespace,
 ) -> list[str]:
-    """Build a helper command that detaches the daemon from the MCP process tree."""
+    """Build a helper command that detaches the daemon from the MCP process tree.
+
+    The daemon is spawned with ``CREATE_BREAKAWAY_FROM_JOB`` (0x01000000) so it
+    leaves the launcher's Windows *job object*. Without this, the daemon stays in
+    the job of whatever spawned it — a transient ``!``/restart shell, or a facade
+    that later gets recycled — and the OS silently terminates it (no crash, no
+    shutdown log) the moment that job closes, killing the shared daemon out from
+    under every other client. Breakaway requires the job to permit it
+    (``JOB_OBJECT_LIMIT_BREAKAWAY_OK``); if it does not, ``CreateProcess`` raises
+    and we fall back to spawning without breakaway (the prior behaviour).
+    """
     helper_code = (
-        "import subprocess, sys;"
-        "flags=("
+        "import subprocess, sys\n"
+        "base=("
         "getattr(subprocess,'DETACHED_PROCESS',0)|"
         "getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|"
         "getattr(subprocess,'CREATE_NO_WINDOW',0)"
-        ");"
-        "subprocess.Popen("
-        "sys.argv[1:],"
-        "stdout=subprocess.DEVNULL,"
-        "stderr=subprocess.DEVNULL,"
-        "stdin=subprocess.DEVNULL,"
-        "close_fds=True,"
-        "creationflags=flags"
-        ")"
+        ")\n"
+        "kw=dict(stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+        "stdin=subprocess.DEVNULL,close_fds=True)\n"
+        "try:\n"
+        "    subprocess.Popen(sys.argv[1:],creationflags=base|0x01000000,**kw)\n"
+        "except OSError:\n"
+        "    subprocess.Popen(sys.argv[1:],creationflags=base,**kw)\n"
     )
     return [_get_windows_background_python(), "-c", helper_code, *_build_daemon_command(args)]
 
