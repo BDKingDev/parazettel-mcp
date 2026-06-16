@@ -49,8 +49,9 @@ htmlcov/
 config.local.json
 claude_desktop_config.json
 
-# Local agent & tool state
-.claude/
+# Local agent & tool state — but keep shareable project slash commands tracked
+.claude/*
+!.claude/commands/
 .playwright-mcp/
 
 # Temporary files

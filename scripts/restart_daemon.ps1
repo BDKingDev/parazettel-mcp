@@ -5,8 +5,8 @@
 .DESCRIPTION
   Stops any running daemon and starts a fresh detached one bound to THIS repo's
   vault. Because the package is installed editable, the new daemon picks up the
-  latest code, and new graph columns are added idempotently on open — so this is
-  the right way to apply code changes to a running daemon.
+  latest code, and new graph columns are added idempotently on open -- so this
+  is the right way to apply code changes to a running daemon.
 
   Embedding settings default to this vault's GPU config, but any PARAZETTEL_* /
   FASTEMBED_* value already present in the environment takes precedence (so a
@@ -19,7 +19,12 @@
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path "$PSScriptRoot\..").Path
 $py = Join-Path $repo ".venv\Scripts\python.exe"
-if (-not (Test-Path $py)) { $py = "python" }
+if (-not (Test-Path $py)) {
+  $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+}
+if (-not $py) {
+  throw "Python not found: no interpreter at .venv\Scripts\python.exe and none on PATH. Create the venv (uv venv --python 3.13) or activate one first."
+}
 
 function Set-DefaultEnv([string]$name, [string]$value) {
   if (-not (Test-Path "env:$name")) { Set-Item "env:$name" $value }

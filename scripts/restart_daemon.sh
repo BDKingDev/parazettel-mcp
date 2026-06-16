@@ -16,7 +16,12 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 py="$repo/.venv/Scripts/python.exe"          # Windows venv layout
 [ -x "$py" ] || py="$repo/.venv/bin/python"  # POSIX venv layout
-[ -x "$py" ] || py="python"
+[ -x "$py" ] || py="$(command -v python || true)"
+if [ -z "$py" ]; then
+  echo "Python not found: no interpreter in .venv and none on PATH." >&2
+  echo "Create the venv (uv venv --python 3.13) or activate one first." >&2
+  exit 1
+fi
 
 : "${PARAZETTEL_NOTES_DIR:=$repo/data/notes}"
 : "${PARAZETTEL_GRAPH_DB_PATH:=$repo/data/db/graph.kuzu}"
