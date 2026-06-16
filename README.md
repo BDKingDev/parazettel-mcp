@@ -348,7 +348,7 @@ See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-
 | Document | Description |
 | --- | --- |
 | [`docs/para-gtd-guide.md`](docs/para-gtd-guide.md) | PARA/GTD workflow — areas, projects, tasks, today view, reminders |
-| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 31 tools with example calls and expected output |
+| [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) | All 36 tools with example calls and expected output |
 | [`docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md`](docs/project-knowledge/user/link-types-in-zettelkasten-mcp-server.md) | Full link type reference |
 | [`docs/prompts/system/system-prompt.md`](docs/prompts/system/system-prompt.md) | System prompt for Claude |
 | [`docs/prompts/chat/`](docs/prompts/chat/) | Chat prompts for knowledge workflows |

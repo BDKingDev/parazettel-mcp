@@ -4,7 +4,6 @@ import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
-import pytest
 
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError

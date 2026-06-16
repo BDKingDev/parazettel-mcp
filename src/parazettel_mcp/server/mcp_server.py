@@ -5,9 +5,9 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import (
     DaemonRpcClient,
@@ -21,7 +21,6 @@ from parazettel_mcp.models.schema import (
     NoteSource,
     NoteStatus,
     NoteType,
-    Tag,
 )
 from parazettel_mcp.services.reranker import build_reranker
 from parazettel_mcp.services.search_service import SearchService
@@ -1023,7 +1022,7 @@ class ZettelkastenMcpServer:
                     return f"Link created from {source_id} to {target_id}"
             except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
-                    return f"A link of this type already exists between these notes. Try a different link type."
+                    return "A link of this type already exists between these notes. Try a different link type."
                 return self.format_error_response(e)
 
         self.pzk_create_link = pzk_create_link

@@ -340,7 +340,7 @@ def test_to_markdown_excludes_inline_links():
     """Note.to_markdown (used by export) must not render derived INLINE links
     into the ## Links section."""
     from parazettel_mcp.models.schema import LinkType as _LT
-    from parazettel_mcp.models.schema import Note, Tag
+    from parazettel_mcp.models.schema import Note
 
     note = Note(title="Exportable", content="# Exportable\n\nBody.")
     note.add_link("20260101T000000000000009", _LT.INLINE)

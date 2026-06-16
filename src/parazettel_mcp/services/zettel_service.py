@@ -6,7 +6,7 @@ import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import (

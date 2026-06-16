@@ -1,6 +1,5 @@
 """Tests for the ZettelService class."""
 
-import pytest
 
 from parazettel_mcp.models.schema import LinkType, NoteStatus, NoteType
 
@@ -459,7 +458,8 @@ def test_search_notes(zettel_service):
         note_type=NoteType.PERMANENT,
         tags=["python", "advanced", "service"],
     )
-    note3 = zettel_service.create_note(
+    # Created for the corpus (searched by tag below); the handle is unused.
+    zettel_service.create_note(
         title="JavaScript Introduction",
         content="Basics of JavaScript programming.",
         note_type=NoteType.PERMANENT,
@@ -504,7 +504,8 @@ def test_find_similar_notes(zettel_service):
         note_type=NoteType.PERMANENT,
         tags=["python", "data science"],
     )
-    note4 = zettel_service.create_note(
+    # Created for the corpus; the handle is unused (no links involve it).
+    zettel_service.create_note(
         title="History of Computing",
         content="Evolution of computing technology.",
         note_type=NoteType.PERMANENT,
