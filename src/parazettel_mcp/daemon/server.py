@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,38 @@ from parazettel_mcp.services.zettel_service import ZettelService
 
 logger = logging.getLogger(__name__)
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that refuses to co-bind an already-in-use port.
+
+    The stdlib ``HTTPServer`` sets ``allow_reuse_address = True`` (``SO_REUSEADDR``).
+    On POSIX that only permits reusing a port stuck in ``TIME_WAIT`` — harmless,
+    and kept so the daemon can restart promptly. On **Windows**, ``SO_REUSEADDR``
+    is far more permissive: a second socket may bind a port that is *already
+    actively bound*, silently stealing its incoming connections. Two daemons
+    could then co-bind the daemon port — the original becomes a zombie (often
+    fallen back to a read-only graph) and clients flap between the two.
+
+    So on Windows we disable ``SO_REUSEADDR`` and set ``SO_EXCLUSIVEADDRUSE``,
+    making a second bind fail loudly (``WinError 10048``). The losing daemon then
+    exits cleanly — exactly the "loser of the start race dies" behaviour the
+    daemon-start lock already assumes (which ``SO_REUSEADDR`` had quietly broken
+    on Windows). POSIX behaviour is unchanged.
+    """
+
+    # Keep POSIX TIME_WAIT reuse; drop the address-stealing reuse on Windows.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
+            except OSError:  # pragma: no cover - best-effort hardening
+                pass
+        super().server_bind()
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -167,13 +200,30 @@ class ParazettelDaemonServer:
         )
         self._idle_monitor_thread.start()
 
-    def serve_forever(self) -> None:
-        """Start the daemon HTTP server and block until shutdown."""
-        self.initialize()
-        self._httpd = ThreadingHTTPServer(
+    def bind(self) -> None:
+        """Bind the daemon's listening socket (idempotent, fail-fast).
+
+        Separated from :meth:`serve_forever` so a caller can claim the port
+        *before* writing the shared PID file and before the (heavier) service
+        warmup. Raises ``OSError`` when the port is already in use — on Windows
+        that is the decisive "another daemon owns this port" signal, because the
+        socket binds exclusively (see :class:`_ExclusiveThreadingHTTPServer`).
+        Callers treat that as losing the start race and exit without touching
+        the winner's PID file.
+        """
+        if self._httpd is not None:
+            return
+        self._httpd = _ExclusiveThreadingHTTPServer(
             (self.host, self.port),
             self._build_handler(),
         )
+
+    def serve_forever(self) -> None:
+        """Start the daemon HTTP server and block until shutdown."""
+        # Bind first (cheap; fails fast if another daemon owns the port) so a
+        # loser does not pay the service-init cost before discovering it lost.
+        self.bind()
+        self.initialize()
         self._closed = False
         self._shutdown_event.clear()
         self._mark_activity()

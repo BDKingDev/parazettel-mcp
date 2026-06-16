@@ -470,14 +470,35 @@ def main():
     server = None
     try:
         if args.run_daemon:
-            logger.info("Starting Parazettel daemon at %s", config.get_daemon_base_url())
             daemon = ParazettelDaemonServer(
                 config.daemon_host,
                 config.daemon_port,
                 idle_timeout_seconds=config.daemon_idle_timeout_seconds,
             )
-            _write_daemon_pid_file(os.getpid())
-            daemon.serve_forever()
+            try:
+                # Claim the port before writing the shared PID file. On Windows
+                # the bind is exclusive, so a second daemon fails here instead of
+                # silently co-binding and stealing traffic.
+                daemon.bind()
+            except OSError as exc:
+                # Lost the start race: another daemon already owns the port. Exit
+                # cleanly and DO NOT touch the PID file — it belongs to the
+                # winner (writing/removing it here is what corrupted status).
+                logger.warning(
+                    "Parazettel daemon port %s is already in use (%s); another "
+                    "daemon is running. Exiting without serving.",
+                    config.get_daemon_base_url(),
+                    exc,
+                )
+                daemon.close()
+                daemon = None
+            else:
+                logger.info(
+                    "Starting Parazettel daemon at %s",
+                    config.get_daemon_base_url(),
+                )
+                _write_daemon_pid_file(os.getpid())
+                daemon.serve_forever()
         else:
             if config.backend_mode == "daemon":
                 ensure_daemon_running(args)

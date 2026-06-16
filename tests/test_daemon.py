@@ -1,5 +1,6 @@
 """Tests for the local Parazettel daemon and thin client."""
 
+import os
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -512,3 +513,57 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
         config.daemon_port = original_daemon_port
         config.server_transport = original_transport
         config.daemon_rpc_timeout_seconds = original_rpc_timeout
+
+
+# --- Single-owner port binding (daemon flapping regression) -----------------
+#
+# On Windows the stdlib HTTPServer's SO_REUSEADDR let a second daemon co-bind
+# the daemon port and steal connections from the live one, so two daemons
+# "served" 8766 at once (the loser fell back to a read-only graph) and clients
+# flapped. The daemon now binds exclusively so a second start loses cleanly.
+
+
+def test_daemon_http_server_keeps_posix_reuse_but_not_windows():
+    """SO_REUSEADDR is kept on POSIX (TIME_WAIT reuse) but dropped on Windows
+    (where it permits address stealing)."""
+    from parazettel_mcp.daemon.server import _ExclusiveThreadingHTTPServer
+
+    assert _ExclusiveThreadingHTTPServer.allow_reuse_address == (os.name != "nt")
+
+
+def test_second_daemon_loses_the_port_race(test_config):
+    """A second daemon binding an already-bound port must fail, never co-bind.
+
+    Reproduces the flapping bug: before the fix, this second bind SUCCEEDED on
+    Windows (port theft). Mock services keep it a pure socket-bind test (no Kuzu).
+    """
+    first = ParazettelDaemonServer(
+        "127.0.0.1", 0, zettel_service=MagicMock(), search_service=MagicMock()
+    )
+    first.bind()
+    try:
+        _host, port = first.server_address
+        second = ParazettelDaemonServer(
+            "127.0.0.1", port, zettel_service=MagicMock(), search_service=MagicMock()
+        )
+        with pytest.raises(OSError):
+            second.bind()
+    finally:
+        if first._httpd is not None:
+            first._httpd.server_close()
+
+
+def test_daemon_bind_is_idempotent(test_config):
+    """Calling bind() twice keeps the same bound socket (serve_forever re-calls
+    it after main already bound)."""
+    server = ParazettelDaemonServer(
+        "127.0.0.1", 0, zettel_service=MagicMock(), search_service=MagicMock()
+    )
+    server.bind()
+    httpd = server._httpd
+    try:
+        server.bind()
+        assert server._httpd is httpd
+    finally:
+        if server._httpd is not None:
+            server._httpd.server_close()
