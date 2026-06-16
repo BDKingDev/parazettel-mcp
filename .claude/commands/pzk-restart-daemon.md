@@ -11,7 +11,7 @@ Do this:
 
 1. From the repository root, run the restart script:
 
-   ```
+   ```shell
    pwsh scripts/restart_daemon.ps1     # Windows / PowerShell
    bash scripts/restart_daemon.sh      # POSIX / Git Bash
    ```
