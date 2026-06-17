@@ -112,8 +112,10 @@ Operating rules (empirically calibrated on this vault):
   confirm it is the same atomic claim before treating it as a duplicate.
 - Never fabricate note IDs. Copy them exactly from tool output, or pass the
   note title instead — most lookup tools accept either.
-- Reuse existing tags (pzk_get_all_tags) before minting new ones. Tags are
-  normalized to lowercase-hyphenated form on write.
+- Reuse existing tags before minting new ones: pzk_suggest_tags(text) returns
+  the closest existing tags by meaning (pzk_get_all_tags lists every tag). Tags
+  are normalized to lowercase-hyphenated form on write. pzk_suggest_areas(text)
+  likewise shortlists the area to route a note under.
 - Start a work session with pzk_briefing (active projects, due tasks,
   reminders, recent notes) so the vault is consulted before new work begins.
 - For multi-note captures (ingesting a transcript or document), use
@@ -122,6 +124,9 @@ Operating rules (empirically calibrated on this vault):
 - Editing the "## Links" section inside note content via pzk_update_note IS
   honored (entries are reconciled into the link graph). Inline [[id]] refs in
   prose are indexed automatically and cleaned up on delete/rename.
+- pzk_get_note omits a note's "## Links" section by default (it is large for
+  area/hub notes); explore links with pzk_get_linked_notes / pzk_get_neighborhood,
+  or pass include_links=true.
 """
 
 
@@ -691,7 +696,8 @@ class ZettelkastenMcpServer:
 
             Creating many notes at once (e.g. ingesting a transcript)? Use
             pzk_ingest_batch instead — notes, links, and tasks in one call.
-            Reuse existing tags (see pzk_get_all_tags) before minting new ones;
+            Reuse existing tags (pzk_suggest_tags shortlists the closest by
+            meaning; pzk_get_all_tags lists them all) before minting new ones;
             tags are normalized to lowercase-hyphenated form.
 
             Args:

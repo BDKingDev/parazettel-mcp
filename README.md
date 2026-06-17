@@ -113,7 +113,7 @@ All tools are prefixed `pzk_`.
 | Tool | Description |
 | --- | --- |
 | `pzk_create_note` | Create a note with title, content, source, and required area/project routing for non-area notes |
-| `pzk_get_note` | Retrieve a note by ID or title |
+| `pzk_get_note` | Retrieve a note by ID or title (omits the `## Links` section by default — huge for areas/hubs; pass `include_links=true` to inline it) |
 | `pzk_get_notes` | Retrieve multiple notes by ID or title in one call |
 | `pzk_get_notes_by_tag` | Retrieve multiple notes with an exact tag match in one call |
 | `pzk_update_note` | Update content, type, tags, and project/area routing |
@@ -123,6 +123,7 @@ All tools are prefixed `pzk_`.
 | `pzk_search_notes` | Search by text, tags, type, status, project_id, or area_id |
 | `pzk_get_linked_notes` | Get notes linked to/from a note |
 | `pzk_get_all_tags` | List every tag in use across the vault (reuse these before inventing new ones) |
+| `pzk_suggest_tags` | Semantic tag search: the existing tags closest in meaning to a text — a free-text shortlist to reuse before minting (needs embeddings) |
 | `pzk_find_similar_notes` | Find notes similar to a given note (content-aware: title/content overlap plus shared tags/links) |
 | `pzk_find_central_notes` | Find most-connected notes |
 | `pzk_find_orphaned_notes` | Find notes with no connections |
@@ -156,6 +157,7 @@ All tools are prefixed `pzk_`.
 | `pzk_create_area` | Create an area note with optional review cadence |
 | `pzk_get_area` | Get an area with linked projects and task counts |
 | `pzk_list_areas` | List all areas |
+| `pzk_suggest_areas` | Semantic area search: the areas closest in meaning to a text — for routing a new note to the right area (needs embeddings) |
 | `pzk_create_project` | Create a top-level project or a subproject with `parent_project_id` |
 | `pzk_create_subproject` | Create a subproject under an existing parent project |
 | `pzk_list_projects` | List active projects sorted by deadline |
