@@ -357,6 +357,47 @@ class TestMcpServer:
         assert "dup-rr-nan" in result
         self.mock_zettel_service.create_note.assert_not_called()
 
+    def test_create_note_rerank_failure_surfaces_error(self):
+        """A stuck/failed reranker surfaces a loud error and does NOT create.
+
+        The deliberate choice (2026-06-17) is to fail loudly rather than silently
+        degrade to BM25-only, so a wedged reranker is visible instead of looking
+        like a hang. The actionable message must reach the caller verbatim.
+        """
+        from parazettel_mcp.services.reranker import RerankerLoadTimeoutError
+
+        existing = SimpleNamespace(
+            id="dup-boom", title="A reworded duplicate",
+            content="same claim, other words", tags=[], note_type=NoteType.PERMANENT,
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+
+        def _boom(_query, _docs):
+            raise RerankerLoadTimeoutError(
+                "dedup reranker model load exceeded 45s (likely a stuck "
+                "fastembed/HuggingFace model-cache lock)."
+            )
+
+        self.server._reranker = SimpleNamespace(score=_boom)
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="The same idea", content="Identical claim.",
+            note_type="permanent", source="transcript", area_id="area123",
+        )
+
+        # The actionable reranker message is surfaced; the note is NOT created
+        # and we do NOT silently fall back to BM25.
+        assert "Error" in result
+        assert "reranker" in result.lower()
+        self.mock_zettel_service.create_note.assert_not_called()
+
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""
         weak = SimpleNamespace(

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -22,7 +23,7 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
 )
-from parazettel_mcp.services.reranker import build_reranker
+from parazettel_mcp.services.reranker import RerankerError, build_reranker
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
 
@@ -202,6 +203,13 @@ class ZettelkastenMcpServer:
             # Read-only fallback errors are safe and actionable for users
             logger.error(f"Read-only graph error [{error_id}]: {str(error)}")
             return f"Error: {str(error)}"
+        elif isinstance(error, RerankerError):
+            # The dedup reranker stalled or failed. Its message is controlled and
+            # actionable (it names the fix), so surface it verbatim rather than a
+            # generic error — this is the loud failure we deliberately chose over a
+            # silent BM25 fallback so a stuck reranker is visible, not invisible.
+            logger.error(f"Dedup reranker error [{error_id}]: {str(error)}")
+            return f"Error: {str(error)}"
         elif isinstance(error, (IOError, OSError)):
             # File system errors - don't expose paths or detailed error messages
             logger.error(f"File system error [{error_id}]: {str(error)}", exc_info=True)
@@ -218,8 +226,11 @@ class ZettelkastenMcpServer:
 
         Uses the same BM25 text search as pzk_search_notes. The title is the
         strongest dedup signal, so it leads the query, with a little content
-        context appended. Best-effort: any search failure yields no candidates
-        (creation should never be blocked by a flaky dedup probe).
+        context appended. The BM25 SEARCH is best-effort (a search failure yields
+        no candidates so a flaky search never blocks creation); the cross-encoder
+        rerank confirm, however, surfaces its errors (see :meth:`_rerank_confirm`)
+        — a stuck/failed reranker fails the create loudly rather than silently
+        degrading dedup.
         """
         query = title.strip()
         if content:
@@ -230,11 +241,17 @@ class ZettelkastenMcpServer:
                 query = f"{query} {content_lead}"
         if not query.strip():
             return []
+        search_started = time.perf_counter()
         try:
             results = self.search_service.search_combined(text=query)
         except Exception as exc:  # pragma: no cover - dedup is advisory only
             logger.warning("Duplicate check skipped (search failed): %s", exc)
             return []
+        logger.debug(
+            "dedup probe: BM25 search returned in %.2fs for query lead %r",
+            time.perf_counter() - search_started,
+            query[:80],
+        )
 
         candidates: List[Tuple[Note, float]] = []
         for result in results:
@@ -267,9 +284,16 @@ class ZettelkastenMcpServer:
 
         BM25 over-flags on shared vocabulary; the reranker reads both notes
         together and is far more precise, so it drops topically-adjacent-but-
-        distinct false positives. Best-effort: if the reranker is disabled or
-        fails to load/score, the BM25 candidates pass through unchanged — dedup
-        must never crash or block creation on a flaky probe.
+        distinct false positives.
+
+        A reranker LOAD/SCORE failure (e.g. a wedged model-cache lock that hits
+        the load timeout) is surfaced, NOT swallowed: we deliberately do not fall
+        back to BM25-only here. A silent fallback hides a broken dedup probe and
+        was indistinguishable from a hang during debugging; failing loudly makes
+        the problem visible and points at the fix (decision 2026-06-17). Only the
+        benign shape guards below (wrong score count / non-numeric score) keep the
+        BM25 candidates, since there the reranker ran but returned something
+        unusable — that is a quirk, not a stall.
         """
         if not candidates or self._reranker is None:
             return candidates
@@ -277,11 +301,30 @@ class ZettelkastenMcpServer:
         documents = [
             self._dedup_text(note.title, note.content) for note, _ in candidates
         ]
+        logger.debug(
+            "dedup rerank: confirming %d BM25 candidate(s) with %s",
+            len(documents),
+            getattr(self._reranker, "model_id", "reranker"),
+        )
+        started = time.perf_counter()
         try:
             scores = self._reranker.score(query, documents)
-        except Exception as exc:  # pragma: no cover - advisory only
-            logger.warning("Dedup rerank skipped (reranker failed): %s", exc)
-            return candidates
+        except RerankerError:
+            logger.error(
+                "dedup rerank FAILED after %.1fs — surfacing error (no BM25 "
+                "fallback)",
+                time.perf_counter() - started,
+                exc_info=True,
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "dedup rerank FAILED unexpectedly after %.1fs: %s — surfacing error",
+                time.perf_counter() - started,
+                exc,
+                exc_info=True,
+            )
+            raise RerankerError(f"dedup reranker failed: {exc}") from exc
         if len(scores) != len(candidates):
             logger.warning(
                 "Dedup rerank skipped (unexpected score count): expected %d, got %d",
@@ -299,6 +342,14 @@ class ZettelkastenMcpServer:
                 return candidates
             if rerank_score >= threshold:
                 confirmed.append((note, bm25))
+        logger.debug(
+            "dedup rerank: confirmed %d/%d candidate(s) as duplicates in %.2fs "
+            "(threshold=%.1f)",
+            len(confirmed),
+            len(candidates),
+            time.perf_counter() - started,
+            threshold,
+        )
         return confirmed
 
     @staticmethod

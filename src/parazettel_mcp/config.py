@@ -39,6 +39,13 @@ DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
 DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+# Hard ceiling on the cross-encoder's first-use model LOAD (the one unbounded step
+# in the facade — it acquires a filelock on the shared fastembed/HF model cache,
+# which can wedge if a prior process died mid-load). A warm load is ~2s; a cold
+# GPU init with a download is well under this. Exceeding it means the load is
+# genuinely stuck, so we surface a loud, actionable error instead of hanging the
+# session forever. Override with PARAZETTEL_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS.
+DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS = 45.0
 
 
 class ZettelkastenConfig(BaseModel):
@@ -175,6 +182,17 @@ class ZettelkastenConfig(BaseModel):
     # (dedup falls back to the BM25 prefilter alone).
     dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
     dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
+    # Timeout on the reranker's first-use model load (see
+    # DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS). On timeout the dedup probe raises
+    # rather than hanging, so note creation fails loudly instead of silently.
+    dedup_rerank_load_timeout_seconds: float = Field(
+        default=float(
+            os.getenv(
+                "PARAZETTEL_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS",
+                str(DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS),
+            )
+        )
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""
