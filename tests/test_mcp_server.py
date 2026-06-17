@@ -1056,6 +1056,72 @@ class TestMcpServer:
         assert result.count("# Renamed Note") == 1
         assert "# Old Note" not in result
 
+    def test_get_note_strips_links_section_by_default(self):
+        """pzk_get_note omits the ## Links section (huge for areas) unless asked."""
+        mock_note = MagicMock()
+        mock_note.id = "n-strip"
+        mock_note.title = "Area X"
+        mock_note.content = (
+            "# Area X\n\n## Content\n\nThe area body.\n\n"
+            "## Links\n- has_part: aaa\n- has_part: bbb\n"
+        )
+        mock_note.note_type = NoteType.AREA
+        mock_note.project_id = None
+        mock_note.area_id = None
+        mock_note.created_at.isoformat.return_value = "2026-01-01T00:00:00"
+        mock_note.updated_at.isoformat.return_value = "2026-01-02T00:00:00"
+        mock_note.tags = []
+        self.mock_zettel_service.get_note.return_value = mock_note
+
+        get_note_func = self.registered_tools["pzk_get_note"]
+        out = get_note_func(identifier="n-strip")
+        assert "The area body." in out
+        assert "has_part: aaa" not in out
+        assert "2 link(s) hidden" in out
+
+        out_with = get_note_func(identifier="n-strip", include_links=True)
+        assert "has_part: aaa" in out_with
+        assert "link(s) hidden" not in out_with
+
+    def test_suggest_tags_formats_ranked_results(self):
+        """pzk_suggest_tags renders the ranked (tag, similarity) pairs."""
+        self.mock_zettel_service.suggest_tags.return_value = [
+            ("kuzu", 0.91),
+            ("fts", 0.77),
+        ]
+        tool = self.registered_tools["pzk_suggest_tags"]
+        out = tool(text="kuzu full text search crashes", limit=5)
+        assert "kuzu" in out and "0.91" in out
+        assert "fts" in out
+        self.mock_zettel_service.suggest_tags.assert_called_once()
+
+    def test_suggest_tags_fallback_when_embeddings_disabled(self):
+        """With embeddings off, pzk_suggest_tags points at pzk_get_all_tags."""
+        from parazettel_mcp.config import config as cfg
+
+        self.mock_zettel_service.suggest_tags.return_value = []
+        old = cfg.embedding_enabled
+        cfg.embedding_enabled = False
+        try:
+            tool = self.registered_tools["pzk_suggest_tags"]
+            out = tool(text="something concrete", limit=5)
+            assert "embeddings" in out.lower()
+            assert "pzk_get_all_tags" in out
+        finally:
+            cfg.embedding_enabled = old
+
+    def test_suggest_areas_formats_results(self):
+        """pzk_suggest_areas renders areas with id + similarity for routing."""
+        area = MagicMock()
+        area.id = "area-1"
+        area.title = "Knowledge Management"
+        self.mock_zettel_service.suggest_areas.return_value = [(area, 0.82)]
+        tool = self.registered_tools["pzk_suggest_areas"]
+        out = tool(text="capturing durable ideas", limit=3)
+        assert "Knowledge Management" in out
+        assert "area-1" in out
+        assert "0.82" in out
+
     def test_get_notes_tool_formats_multiple_notes_and_missing_identifiers(self):
         """pzk_get_notes should batch note retrieval and report missing identifiers."""
         first_note = MagicMock()

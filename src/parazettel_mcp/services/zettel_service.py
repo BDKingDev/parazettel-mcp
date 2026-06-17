@@ -918,6 +918,80 @@ class ZettelService:
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:limit]
 
+    @staticmethod
+    def _cosine(a: List[float], b: List[float]) -> float:
+        """Cosine similarity of two provider vectors, clamped to [0, 1].
+
+        Provider embeddings are L2-normalized, so cosine reduces to the dot
+        product; the clamp keeps thresholds well-defined against tiny negatives.
+        """
+        return max(0.0, min(1.0, sum(x * y for x, y in zip(a, b))))
+
+    def suggest_tags(self, text: str, limit: int = 10) -> List[Tuple[str, float]]:
+        """Return existing tags most semantically similar to *text*, high→low.
+
+        Embeds *text* and every existing tag name and ranks by cosine similarity,
+        so an agent can reuse the closest existing tag instead of minting a near
+        duplicate (a free-text counterpart to pzk_get_all_tags' flat list).
+        Returns ``[]`` when embeddings are disabled or the vault has no tags, so
+        callers fall back to get_all_tags.
+        """
+        if not text or not text.strip() or limit <= 0:
+            return []
+        if not config.embedding_enabled:
+            return []
+        query_vec = self.repository.embed_query(text)
+        if not query_vec:
+            return []
+        names = [tag.name for tag in self.repository.get_all_tags()]
+        if not names:
+            return []
+        vectors = self.repository.embed_tags(names)
+        scored = [
+            (name, self._cosine(query_vec, vectors[name]))
+            for name in names
+            if name in vectors
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:limit]
+
+    def suggest_areas(self, text: str, limit: int = 5) -> List[Tuple[Note, float]]:
+        """Return existing AREA notes most semantically similar to *text*, high→low.
+
+        Ranks the PARA areas against *text* so a new note can be routed to the
+        closest area. Reuses each area's stored document vector (the exact vector
+        the index holds) and embeds the title of any area lacking a current-model
+        vector. Returns ``[]`` when embeddings are disabled, so callers fall back
+        to list_areas.
+        """
+        if not text or not text.strip() or limit <= 0:
+            return []
+        if not config.embedding_enabled:
+            return []
+        query_vec = self.repository.embed_query(text)
+        if not query_vec:
+            return []
+        areas = self.search_notes(note_type=NoteType.AREA)
+        if not areas:
+            return []
+        scored: List[Tuple[Note, float]] = []
+        needs_embed: List[Note] = []
+        for area in areas:
+            stored = self.repository.get_note_embedding(area.id)
+            if stored:
+                scored.append((area, self._cosine(query_vec, stored)))
+            else:
+                needs_embed.append(area)
+        if needs_embed:
+            fallback_vecs = self.repository.embed_documents(
+                [area.title for area in needs_embed]
+            )
+            for area, vec in zip(needs_embed, fallback_vecs):
+                if vec:
+                    scored.append((area, self._cosine(query_vec, vec)))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:limit]
+
     def _similarity_context(
         self, note: Note
     ) -> Tuple[Set[str], Set[str], Set[str]]:
