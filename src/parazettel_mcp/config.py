@@ -18,12 +18,16 @@ if _REPO_ENV_PATH.exists():
     load_dotenv(_REPO_ENV_PATH, override=False)
 
 
-# --- Resource-tuning defaults (code constants, not environment-configurable) ---
-# Max Kuzu buffer-pool size in bytes. 0 = Kuzu's own default (~80% of physical
-# RAM *per database instance*) — fine for one long-lived daemon. The test suite
-# bounds this to a small value via the conftest fixture so per-test databases
-# stay tiny and the suite can run in parallel.
-DEFAULT_KUZU_BUFFER_POOL_BYTES = 0
+# --- Resource-tuning defaults ---
+# Max Kuzu buffer-pool size in bytes. The buffer pool is a lazy page cache: under
+# sustained query load (many vector searches paging the DB + HNSW index in) it
+# grows toward this cap and stays resident. Kuzu's own default (selected by 0) is
+# ~80% of physical RAM *per database instance*, which on a long-lived daemon
+# balloons commit charge to tens of GB and inflates the Windows pagefile. So we
+# cap it at a bounded default and expose PARAZETTEL_KUZU_BUFFER_POOL_BYTES to tune
+# it (0 restores Kuzu's ~80%-RAM default). The test suite bounds it further via
+# the conftest fixture so per-test databases stay tiny.
+DEFAULT_KUZU_BUFFER_POOL_BYTES = 8 * 1024**3  # 8 GiB
 # Seconds of inactivity after which the daemon shuts itself down (it is
 # auto-restarted on the next request). A non-zero default means a daemon left
 # behind when an MCP client exits without reaping it reaps itself instead of
@@ -176,7 +180,15 @@ class ZettelkastenConfig(BaseModel):
         .lower()
     )
     # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
-    kuzu_buffer_pool_bytes: int = Field(default=DEFAULT_KUZU_BUFFER_POOL_BYTES)
+    # PARAZETTEL_KUZU_BUFFER_POOL_BYTES overrides it (0 = Kuzu's ~80%-RAM default).
+    kuzu_buffer_pool_bytes: int = Field(
+        default=int(
+            os.getenv(
+                "PARAZETTEL_KUZU_BUFFER_POOL_BYTES",
+                str(DEFAULT_KUZU_BUFFER_POOL_BYTES),
+            )
+        )
+    )
     # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
     # active when embeddings are enabled; empty string disables the rerank confirm
     # (dedup falls back to the BM25 prefilter alone).

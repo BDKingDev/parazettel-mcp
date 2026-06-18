@@ -33,10 +33,12 @@ _DB_CACHE: Dict[str, Tuple[kuzu.Database, int]] = {}
 _DB_CACHE_BUFFER_POOL: Dict[str, int] = {}
 
 # Process-wide fallback buffer-pool size for callers that don't pass one
-# explicitly. ``0`` keeps Kuzu's own default (~80% of RAM) in production; the
-# test suite bounds this so direct ``init_graph_db(path)`` callers stay light
-# under pytest-xdist without having to thread the size through every call site.
-_DEFAULT_BUFFER_POOL_SIZE = 0
+# explicitly. A bounded cap (matching config.DEFAULT_KUZU_BUFFER_POOL_BYTES) keeps
+# a long-lived process from letting Kuzu's ~80%-of-RAM default balloon — and keeps
+# a rebuild's temp DB + live DB from each grabbing 80% of RAM at once. ``0`` would
+# restore Kuzu's own default; the test suite bounds this smaller so direct
+# ``init_graph_db(path)`` callers stay light under pytest-xdist.
+_DEFAULT_BUFFER_POOL_SIZE = 8 * 1024**3  # 8 GiB
 _NOTE_FTS_INDEXES = {
     "note_text_fts": ["title", "content"],
     "note_title_fts": ["title"],
@@ -66,9 +68,9 @@ def init_graph_db(
                  this function.
         read_only: Open the database without write access.
         buffer_pool_size: Max Kuzu buffer-pool size in bytes. ``None`` (default)
-                 falls back to ``_DEFAULT_BUFFER_POOL_SIZE`` (``0`` in production,
-                 i.e. Kuzu's own ~80%-of-RAM default; bounded in tests). ``0``
-                 explicitly requests Kuzu's default; a positive value bounds it
+                 falls back to ``_DEFAULT_BUFFER_POOL_SIZE`` (a bounded cap in
+                 production; smaller still in tests). ``0`` explicitly requests
+                 Kuzu's own ~80%-of-RAM default; a positive value bounds it
                  (see ``config.kuzu_buffer_pool_bytes``).
 
     Returns:
