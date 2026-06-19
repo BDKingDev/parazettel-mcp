@@ -439,6 +439,9 @@ class TestMcpServer:
         assert "2 note(s) created" in result
         assert "dedup disabled" in result.lower()
         assert self.mock_zettel_service.create_note.call_count == 2
+        # The fallback contract: dedup probes the FIRST item, the reranker fails,
+        # and dedup is then disabled — so the second item must not probe at all.
+        assert self.mock_search_service.search_combined.call_count == 1
 
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""

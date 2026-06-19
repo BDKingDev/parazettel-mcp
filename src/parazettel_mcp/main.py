@@ -504,6 +504,12 @@ def _snapshot_processes_windows():  # pragma: no cover - Windows-only, ctypes
             ("szExeFile", ctypes.c_char * 260),
         ]
 
+    # INVALID_HANDLE_VALUE is ((HANDLE)-1); compute it once here rather than
+    # reconstruct it inline. It is local (not module-level) on purpose: ctypes is
+    # imported lazily inside the Windows-only branches so non-Windows import paths
+    # never pay for it.
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
     k32 = ctypes.windll.kernel32
     k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
     k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -517,7 +523,7 @@ def _snapshot_processes_windows():  # pragma: no cover - Windows-only, ctypes
     # CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE (-1) on failure, which
     # is truthy — guard it explicitly so we never walk an invalid handle, and
     # don't CloseHandle it.
-    if not snap or snap == ctypes.c_void_p(-1).value:
+    if not snap or snap == INVALID_HANDLE_VALUE:
         return ppid_of, name_of
     try:
         entry = PROCESSENTRY32()
