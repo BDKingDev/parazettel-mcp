@@ -75,11 +75,12 @@ def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
                 counters.PagefileUsage / 1048576.0,
             )
         import resource
+        import sys
 
-        # ru_maxrss is KB on Linux, bytes on macOS; normalize to MB conservatively
-        # as KB (the common Linux daemon case).
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return (rss_kb / 1024.0, None)
+        # ru_maxrss is KB on Linux but BYTES on macOS — convert to MB per platform.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss / 1048576.0 if sys.platform == "darwin" else rss / 1024.0
+        return (rss_mb, None)
     except Exception:  # pragma: no cover - diagnostics must never raise
         return None
 

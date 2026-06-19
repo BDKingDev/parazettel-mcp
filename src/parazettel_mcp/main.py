@@ -514,7 +514,10 @@ def _snapshot_processes_windows():  # pragma: no cover - Windows-only, ctypes
     ppid_of: Dict[int, int] = {}
     name_of: Dict[int, str] = {}
     snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not snap:
+    # CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE (-1) on failure, which
+    # is truthy — guard it explicitly so we never walk an invalid handle, and
+    # don't CloseHandle it.
+    if not snap or snap == ctypes.c_void_p(-1).value:
         return ppid_of, name_of
     try:
         entry = PROCESSENTRY32()
