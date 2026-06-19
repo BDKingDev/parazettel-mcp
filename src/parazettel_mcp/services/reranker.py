@@ -71,10 +71,15 @@ class FastEmbedReranker:
     CUDA/cuDNN DLLs preloaded from the nvidia-* wheels); otherwise it runs on CPU.
     """
 
-    # ONNX Runtime execution providers per device (CPU is kept as a fallback).
+    # ONNX Runtime execution providers per device. The "cpu" entry is explicit on
+    # purpose: fastembed defaults to trying CUDAExecutionProvider when NO providers
+    # are passed, so a "cpu" device with no providers would still spin up (and fail
+    # over from) CUDA on every load — pinning a GPU context. Forcing the CPU-only
+    # list keeps the per-session reranker entirely off the card.
     _DEVICE_PROVIDERS = {
         "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
         "gpu": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cpu": ["CPUExecutionProvider"],
     }
 
     def __init__(
@@ -94,6 +99,10 @@ class FastEmbedReranker:
         self._load_lock = threading.Lock()
         self._load_thread: Optional[threading.Thread] = None
         self._load_future: "Optional[concurrent.futures.Future]" = None
+        # Set once a wait on the current load future has hit the full timeout, so
+        # later callers (e.g. each note in a batch) fast-fail instead of each
+        # re-paying the timeout on the same wedged load.
+        self._load_timed_out = False
 
     @staticmethod
     def _preload_cuda_dlls() -> None:
@@ -130,10 +139,12 @@ class FastEmbedReranker:
         )
         started = time.perf_counter()
         kwargs: Dict[str, Any] = {"model_name": self.model_name}
-        providers = self._DEVICE_PROVIDERS.get(self._device)
-        if providers:
+        # Always pass providers explicitly (default to CPU-only) so fastembed does
+        # not fall back to its CUDA-first default for an unrecognized/cpu device.
+        providers = self._DEVICE_PROVIDERS.get(self._device, ["CPUExecutionProvider"])
+        if "CUDAExecutionProvider" in providers:
             self._preload_cuda_dlls()
-            kwargs["providers"] = providers
+        kwargs["providers"] = providers
         try:
             model = TextCrossEncoder(**kwargs)
         except TypeError:
@@ -180,6 +191,7 @@ class FastEmbedReranker:
                 )
                 future: "concurrent.futures.Future" = concurrent.futures.Future()
                 self._load_future = future
+                self._load_timed_out = False
                 self._load_thread = threading.Thread(
                     target=self._run_load,
                     args=(future,),
@@ -188,6 +200,19 @@ class FastEmbedReranker:
                 )
                 self._load_thread.start()
             future = self._load_future
+            timed_out_already = self._load_timed_out
+
+        # If an earlier call already paid the full timeout on this same, still-
+        # pending load, don't make every later caller re-pay it — a batch of N
+        # notes would otherwise block N * timeout. Fail fast until the background
+        # load actually completes (then self._model is set and this is moot).
+        if timed_out_already and not future.done():
+            raise RerankerLoadTimeoutError(
+                f"dedup reranker model load still pending after a prior "
+                f"{self._load_timeout:.0f}s timeout — failing fast. Restart the "
+                "daemon/session to clear it, or disable the reranker with "
+                "PARAZETTEL_DEDUP_RERANK_MODEL=''."
+            )
 
         waited_from = time.perf_counter()
         try:
@@ -195,7 +220,10 @@ class FastEmbedReranker:
         except concurrent.futures.TimeoutError as exc:
             # Leave the future running: the load is still in flight on the worker,
             # so a later call reuses it if it eventually completes — but THIS call
-            # refuses to wait any longer and surfaces the stall.
+            # refuses to wait any longer and surfaces the stall. Mark it so the
+            # rest of a batch fast-fails instead of each re-paying the timeout.
+            with self._load_lock:
+                self._load_timed_out = True
             logger.error(
                 "dedup reranker: model load did NOT complete within %.0fs — the "
                 "shared fastembed/HuggingFace model-cache filelock (or GPU init) "

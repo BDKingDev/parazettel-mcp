@@ -2,6 +2,7 @@
 
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -78,7 +79,9 @@ def test_score_forwards_query_and_documents(monkeypatch):
     assert scores == [3.5, -1.0]
     assert captured["query"] == "q"
     assert captured["docs"] == ["a", "b"]
-    assert "providers" not in captured["init"]  # CPU passes no providers
+    # CPU must pass an EXPLICIT CPU-only provider list, else fastembed defaults to
+    # trying CUDA (spinning up / failing over from the GPU on every load).
+    assert captured["init"].get("providers") == ["CPUExecutionProvider"]
 
 
 def test_cuda_device_requests_provider_and_preloads(monkeypatch):
@@ -97,6 +100,22 @@ def test_cuda_device_requests_provider_and_preloads(monkeypatch):
         "CPUExecutionProvider",
     ]
     assert preloaded["called"] is True
+
+
+def test_cpu_device_uses_cpu_provider_and_does_not_preload_cuda(monkeypatch):
+    """A CPU device passes a CPU-only provider list and never touches CUDA."""
+    captured = {}
+    preloaded = {"called": False}
+    _fake_cross_encoder(monkeypatch, captured, [1.0])
+
+    ort = types.ModuleType("onnxruntime")
+    ort.preload_dlls = lambda: preloaded.__setitem__("called", True)
+    monkeypatch.setitem(sys.modules, "onnxruntime", ort)
+
+    FastEmbedReranker("m", device="cpu").score("q", ["d"])
+
+    assert captured["init"].get("providers") == ["CPUExecutionProvider"]
+    assert preloaded["called"] is False  # no CUDA DLL preload for a CPU device
 
 
 def _blocking_cross_encoder(monkeypatch, started, release):
@@ -145,8 +164,9 @@ def test_score_raises_on_load_timeout(monkeypatch):
             reranker._load_thread.join(timeout=5)
 
 
-def test_score_reuses_in_flight_load_after_a_timeout(monkeypatch):
-    """A load that finishes after one call's timeout is reused by the next call."""
+def test_score_succeeds_once_a_wedged_load_finally_completes(monkeypatch):
+    """After a timeout the next calls fast-fail, but once the load actually
+    finishes the SAME load is reused and scoring works (no second load)."""
     started = threading.Event()
     release = threading.Event()
     _blocking_cross_encoder(monkeypatch, started, release)
@@ -155,9 +175,40 @@ def test_score_reuses_in_flight_load_after_a_timeout(monkeypatch):
     try:
         with pytest.raises(RerankerLoadTimeoutError):
             reranker.score("q", ["a"])  # first call times out on the wedged load
-        release.set()  # the wedged load now completes in the background
-        # The same in-flight future is reused — no second load, no error.
+        release.set()  # let the wedged load complete...
+        reranker._load_thread.join(timeout=5)  # ...and wait until it actually has
+        # The completed in-flight future is reused — no second load, no error.
         assert reranker.score("q", ["a", "b"]) == [0.0, 0.0]
+    finally:
+        release.set()
+        if reranker._load_thread is not None:
+            reranker._load_thread.join(timeout=5)
+
+
+def test_second_call_fast_fails_after_a_load_timeout(monkeypatch):
+    """Once a wait hits the timeout, later calls fail fast instead of re-paying it.
+
+    A batch of N notes must not block N * timeout on the same wedged load.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    _blocking_cross_encoder(monkeypatch, started, release)
+
+    reranker = FastEmbedReranker("m", device="cpu", load_timeout=0.3)
+    try:
+        t0 = time.perf_counter()
+        with pytest.raises(RerankerLoadTimeoutError):
+            reranker.score("q", ["a"])  # first call pays the full timeout
+        first = time.perf_counter() - t0
+
+        t1 = time.perf_counter()
+        with pytest.raises(RerankerLoadTimeoutError):
+            reranker.score("q", ["a"])  # second call fast-fails (load still wedged)
+        second = time.perf_counter() - t1
+
+        assert reranker._load_timed_out is True
+        assert second < first / 2  # didn't re-pay the timeout
+        assert second < 0.1
     finally:
         release.set()
         if reranker._load_thread is not None:
