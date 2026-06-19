@@ -531,7 +531,7 @@ def test_daemon_http_server_keeps_posix_reuse_but_not_windows():
     assert _ExclusiveThreadingHTTPServer.allow_reuse_address == (os.name != "nt")
 
 
-def test_second_daemon_loses_the_port_race(test_config):
+def test_second_daemon_loses_the_port_race():
     """A second daemon binding an already-bound port must fail, never co-bind.
 
     Reproduces the flapping bug: before the fix, this second bind SUCCEEDED on
@@ -546,7 +546,9 @@ def test_second_daemon_loses_the_port_race(test_config):
         second = ParazettelDaemonServer(
             "127.0.0.1", port, zettel_service=MagicMock(), search_service=MagicMock()
         )
-        with pytest.raises(OSError):
+        # Match the address-in-use error cross-platform (EADDRINUSE / WinError
+        # 10048) so an unrelated OSError can't pass the test.
+        with pytest.raises(OSError, match=r"(?i)(address.*in use|10048)"):
             second.bind()
     finally:
         if first._httpd is not None:

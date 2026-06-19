@@ -1745,6 +1745,13 @@ class NoteRepository(Repository[Note]):
             except Exception as exc:
                 logger.warning("Tag embedding failed: %s", exc)
                 vectors = []
+            if len(vectors) != len(missing):
+                logger.warning(
+                    "Tag embedding count mismatch: expected %d, got %d (caching "
+                    "only the returned prefix; the rest re-embed next call)",
+                    len(missing),
+                    len(vectors),
+                )
             for name, vec in zip(missing, vectors):
                 cache[name] = vec
         return {n: cache[n] for n in wanted if n in cache}

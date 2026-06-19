@@ -84,16 +84,34 @@ def setup_logging(
             target = None
 
     if target and enable_faulthandler:
+        prior_stream = _faulthandler_stream
+        try:
+            new_stream = open(target, "a", encoding="utf-8")
+            # Re-point faulthandler at the new stream BEFORE closing the old one,
+            # so there's no window where it would write to a closed file.
+            faulthandler.enable(file=new_stream)
+            _faulthandler_stream = new_stream
+        except OSError:
+            pass
+        else:
+            try:
+                if prior_stream is not None and prior_stream is not new_stream:
+                    prior_stream.close()
+            except Exception:
+                pass
+    else:
+        # Re-init WITHOUT faulthandler: tear down any prior install so the old
+        # handler stays disabled and its file stream doesn't leak.
+        try:
+            faulthandler.disable()
+        except Exception:
+            pass
         try:
             if _faulthandler_stream is not None:
                 _faulthandler_stream.close()
         except Exception:
             pass
-        try:
-            _faulthandler_stream = open(target, "a", encoding="utf-8")
-            faulthandler.enable(file=_faulthandler_stream)
-        except OSError:
-            pass
+        _faulthandler_stream = None
 
 
 def parse_tags(tags_str: str) -> list[str]:

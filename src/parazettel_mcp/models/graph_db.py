@@ -23,6 +23,8 @@ from typing import Dict, Optional, Tuple
 
 import kuzu
 
+from parazettel_mcp.config import DEFAULT_KUZU_BUFFER_POOL_BYTES
+
 logger = logging.getLogger(__name__)
 
 _DB_CACHE_LOCK = threading.Lock()
@@ -33,12 +35,12 @@ _DB_CACHE: Dict[str, Tuple[kuzu.Database, int]] = {}
 _DB_CACHE_BUFFER_POOL: Dict[str, int] = {}
 
 # Process-wide fallback buffer-pool size for callers that don't pass one
-# explicitly. A bounded cap (matching config.DEFAULT_KUZU_BUFFER_POOL_BYTES) keeps
-# a long-lived process from letting Kuzu's ~80%-of-RAM default balloon — and keeps
-# a rebuild's temp DB + live DB from each grabbing 80% of RAM at once. ``0`` would
-# restore Kuzu's own default; the test suite bounds this smaller so direct
+# explicitly. Reuses config.DEFAULT_KUZU_BUFFER_POOL_BYTES (a bounded cap) so a
+# long-lived process never lets Kuzu's ~80%-of-RAM default balloon, and a
+# rebuild's temp DB + live DB don't each grab 80% of RAM. ``0`` would restore
+# Kuzu's own default; the test suite bounds this smaller so direct
 # ``init_graph_db(path)`` callers stay light under pytest-xdist.
-_DEFAULT_BUFFER_POOL_SIZE = 8 * 1024**3  # 8 GiB
+_DEFAULT_BUFFER_POOL_SIZE = DEFAULT_KUZU_BUFFER_POOL_BYTES
 _NOTE_FTS_INDEXES = {
     "note_text_fts": ["title", "content"],
     "note_title_fts": ["title"],

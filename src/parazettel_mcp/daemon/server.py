@@ -51,10 +51,22 @@ def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
                     ("PeakPagefileUsage", ctypes.c_size_t),
                 ]
 
+            # Declare signatures so 64-bit HANDLEs aren't truncated through
+            # ctypes' default c_int return/args.
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.GetCurrentProcess.argtypes = []
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_PMC),
+                wintypes.DWORD,
+            ]
             counters = _PMC()
             counters.cb = ctypes.sizeof(_PMC)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if not ctypes.windll.psapi.GetProcessMemoryInfo(
+            handle = kernel32.GetCurrentProcess()
+            if not psapi.GetProcessMemoryInfo(
                 handle, ctypes.byref(counters), counters.cb
             ):
                 return None

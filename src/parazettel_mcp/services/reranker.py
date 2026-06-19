@@ -145,14 +145,7 @@ class FastEmbedReranker:
         if "CUDAExecutionProvider" in providers:
             self._preload_cuda_dlls()
         kwargs["providers"] = providers
-        try:
-            model = TextCrossEncoder(**kwargs)
-        except TypeError:
-            # Older fastembed without a `providers` kwarg: fall back to CPU.
-            logger.info(
-                "dedup reranker: fastembed has no 'providers' kwarg; loading on CPU"
-            )
-            model = TextCrossEncoder(model_name=self.model_name)
+        model = TextCrossEncoder(**kwargs)
         logger.info(
             "dedup reranker: model loaded in %.2fs (model=%s device=%s)",
             time.perf_counter() - started,
@@ -260,6 +253,7 @@ class FastEmbedReranker:
             if self._load_future is future:
                 self._load_future = None
                 self._load_thread = None
+                self._load_timed_out = False
 
     def score(self, query: str, documents: Sequence[str]) -> List[float]:
         """Score each document against *query* with the cross-encoder."""

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -377,10 +378,13 @@ class ZettelkastenMcpServer:
         threshold = config.dedup_rerank_min_score
         confirmed: List[Tuple[Note, float]] = []
         for (note, bm25), rerank_score in zip(candidates, scores):
-            if not isinstance(rerank_score, (int, float)):
-                # A non-numeric score would crash the threshold compare; stay
-                # best-effort and fall back to the BM25 candidates.
-                logger.warning("Dedup rerank skipped (non-numeric score %r)", rerank_score)
+            if not isinstance(rerank_score, (int, float)) or not math.isfinite(
+                float(rerank_score)
+            ):
+                # A non-numeric OR non-finite score makes the threshold compare
+                # unsafe (NaN >= x is always False, so it would silently drop a
+                # real duplicate); stay best-effort and fall back to BM25.
+                logger.warning("Dedup rerank skipped (invalid score %r)", rerank_score)
                 return candidates
             if rerank_score >= threshold:
                 confirmed.append((note, bm25))
@@ -2798,6 +2802,10 @@ class ZettelkastenMcpServer:
                 created_notes = skipped_notes = flagged_notes = 0
                 created_tasks = created_links = 0
                 errors = 0
+                # If the dedup reranker wedges mid-batch, dedup is disabled for the
+                # rest: batch dedup is advisory ("create and flag, never block"),
+                # so a broken reranker must not abandon the user's content.
+                dedup_disabled = False
 
                 for idx, item in enumerate(note_items):
                     ref = f"#{idx}"
@@ -2829,11 +2837,29 @@ class ZettelkastenMcpServer:
                                 t.strip() for t in tag_list.split(",") if t.strip()
                             ]
                         do_dedup = bool(item.get("check_duplicates", check_duplicates))
-                        duplicates = (
-                            self._find_duplicate_candidates(title, body)
-                            if do_dedup
-                            else []
-                        )
+                        duplicates: List[Tuple[Note, float]] = []
+                        if do_dedup and not dedup_disabled:
+                            try:
+                                duplicates = self._find_duplicate_candidates(
+                                    title, body
+                                )
+                            except RerankerError as exc:
+                                # Advisory dedup must never abandon the batch: on a
+                                # wedged/broken reranker, disable dedup for the
+                                # remaining items and create the notes anyway,
+                                # warning once.
+                                dedup_disabled = True
+                                logger.warning(
+                                    "Batch dedup disabled mid-run (reranker "
+                                    "unavailable): %s",
+                                    exc,
+                                )
+                                lines.append(
+                                    "NOTE: dedup disabled for the rest of this "
+                                    "batch (reranker unavailable) — remaining "
+                                    "notes created WITHOUT a duplicate check; "
+                                    "re-run a dedup pass later."
+                                )
                         if duplicates and on_duplicate == "skip":
                             existing, score = duplicates[0]
                             refs[ref] = existing.id

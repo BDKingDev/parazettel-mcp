@@ -986,6 +986,13 @@ class ZettelService:
             fallback_vecs = self.repository.embed_documents(
                 [area.title for area in needs_embed]
             )
+            if len(fallback_vecs) != len(needs_embed):
+                logger.warning(
+                    "Area fallback embedding count mismatch: expected %d, got %d "
+                    "(unembedded areas are skipped from ranking)",
+                    len(needs_embed),
+                    len(fallback_vecs),
+                )
             for area, vec in zip(needs_embed, fallback_vecs):
                 if vec:
                     scored.append((area, self._cosine(query_vec, vec)))

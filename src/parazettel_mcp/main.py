@@ -474,6 +474,9 @@ def _resolve_session_host(
         parent = ppid_of.get(cur)
         if not parent or parent not in name_of:
             return None
+        # Keep this "name starts with python" launcher rule in sync with
+        # scripts/restart_daemon.ps1 Test-FacadeOrphaned (the reaper walks the
+        # same chain to decide orphan vs active).
         if not name_of[parent].startswith("python"):
             return parent
         cur = parent

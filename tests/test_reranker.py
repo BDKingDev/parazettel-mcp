@@ -263,7 +263,11 @@ def test_build_reranker_defaults_to_cpu_not_embedding_device(monkeypatch):
     card and flaps the embedding path; the reranker defaults to CPU independently.
     """
     monkeypatch.delenv("PARAZETTEL_DEDUP_RERANK_DEVICE", raising=False)
-    cfg = ZettelkastenConfig(embedding_enabled=True, embedding_device="cuda")
+    cfg = ZettelkastenConfig(
+        embedding_enabled=True,
+        embedding_device="cuda",
+        dedup_rerank_model="x/model",  # explicit so an empty ambient config can't no-op
+    )
     reranker = build_reranker(cfg)
     assert isinstance(reranker, FastEmbedReranker)
     assert reranker._device == "cpu"
@@ -275,5 +279,6 @@ def test_build_reranker_honors_explicit_rerank_device():
         embedding_enabled=True,
         embedding_device="cuda",
         dedup_rerank_device="cuda",
+        dedup_rerank_model="x/model",  # explicit so an empty ambient config can't no-op
     )
     assert build_reranker(cfg)._device == "cuda"

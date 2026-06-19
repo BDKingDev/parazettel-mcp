@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from parazettel_mcp.utils import format_note_for_display, parse_tags, setup_logging
 
 
-def _restore_root_logging(saved_level, saved_handlers):
+def _restore_root_logging(saved_level: int, saved_handlers: list) -> None:
     """Close any handlers we added and restore the root logger to its prior state."""
     root = logging.getLogger()
     for handler in list(root.handlers):
@@ -63,6 +63,23 @@ def test_setup_logging_adds_file_handler_alongside_stderr(tmp_path):
         for handler in file_handlers:
             handler.flush()
         assert "hello-file-handler" in log_file.read_text(encoding="utf-8")
+    finally:
+        _restore_root_logging(saved_level, saved_handlers)
+
+
+def test_setup_logging_without_faulthandler_tears_down_prior_install(tmp_path):
+    """Re-initializing without faulthandler must disable it and close its stream."""
+    import parazettel_mcp.utils as utils_mod
+
+    root = logging.getLogger()
+    saved_level, saved_handlers = root.level, list(root.handlers)
+    try:
+        log_file = tmp_path / "fh.log"
+        setup_logging("info", log_file=str(log_file), enable_faulthandler=True)
+        assert utils_mod._faulthandler_stream is not None
+        # Re-init without faulthandler: the prior stream must be torn down, not leaked.
+        setup_logging("info", log_file=str(log_file), enable_faulthandler=False)
+        assert utils_mod._faulthandler_stream is None
     finally:
         _restore_root_logging(saved_level, saved_handlers)
 

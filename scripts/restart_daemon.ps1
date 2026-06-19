@@ -61,6 +61,8 @@ function Test-FacadeOrphaned {
     $parent = $byId[[int]$cur.ParentProcessId]
     if (-not $parent) { return $true }                               # ancestor gone
     if ($parent.CreationDate -gt $cur.CreationDate) { return $true }  # PID recycled -> real parent dead
+    # Keep this "name starts with python" launcher rule in sync with main.py's
+    # _resolve_session_host (the in-process watchdog walks the same chain).
     if ($parent.Name -notmatch '^python') { return $false }          # live, older session host -> active
     $cur = $parent                                                   # climb through python launchers
   }
@@ -84,11 +86,12 @@ function Remove-OrphanFacades([switch]$DryRun) {
   foreach ($f in $facades) {
     if (-not (Test-FacadeOrphaned -facade $f -byId $byId)) { continue }
     $reaped++
+    $created = $f.CreationDate.ToString('yyyy-MM-dd HH:mm:ss')
     if ($DryRun) {
-      Write-Host "[dry-run] would reap orphan facade PID $($f.ProcessId) (parent PID $($f.ParentProcessId) is gone/recycled)"
+      Write-Host "[dry-run] would reap orphan facade PID $($f.ProcessId) (created $created; parent PID $($f.ParentProcessId) is gone/recycled)"
       continue
     }
-    Write-Host "Reaping orphan facade PID $($f.ProcessId) (no live session ancestor)"
+    Write-Host "Reaping orphan facade PID $($f.ProcessId) (created $created; no live session ancestor)"
     try { Stop-Process -Id $f.ProcessId -Force -ErrorAction Stop }
     catch { Write-Host "  (could not stop $($f.ProcessId): $($_.Exception.Message))" }
   }

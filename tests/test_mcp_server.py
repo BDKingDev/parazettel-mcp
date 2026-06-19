@@ -392,11 +392,53 @@ class TestMcpServer:
             note_type="permanent", source="transcript", area_id="area123",
         )
 
-        # The actionable reranker message is surfaced; the note is NOT created
-        # and we do NOT silently fall back to BM25.
+        # The ACTIONABLE reranker message is surfaced verbatim (not a generic
+        # "unexpected error"); the note is NOT created and we do NOT fall back.
         assert "Error" in result
         assert "reranker" in result.lower()
+        assert "exceeded 45s" in result  # the specific, actionable timeout detail
         self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_ingest_batch_disables_dedup_but_still_creates_on_reranker_failure(self):
+        """A wedged reranker must NOT abandon a batch — dedup is advisory there.
+
+        Single-create fails loud (above), but batch ingest is "create-and-flag,
+        never block": on a RerankerError it disables dedup for the rest and still
+        creates every note, warning once.
+        """
+        from parazettel_mcp.services.reranker import RerankerLoadTimeoutError
+
+        existing = SimpleNamespace(
+            id="x", title="t", content="c", tags=[], note_type=NoteType.PERMANENT
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+
+        def _boom(_query, _docs):
+            raise RerankerLoadTimeoutError("dedup reranker model load exceeded 45s")
+
+        self.server._reranker = SimpleNamespace(score=_boom)
+        self.mock_zettel_service.create_note.side_effect = [
+            SimpleNamespace(id="n1"),
+            SimpleNamespace(id="n2"),
+        ]
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        ingest = self.registered_tools["pzk_ingest_batch"]
+        result = ingest(
+            notes=[
+                {"title": "A", "content": "aaa", "area_id": "area1"},
+                {"title": "B", "content": "bbb", "area_id": "area1"},
+            ]
+        )
+
+        assert "2 note(s) created" in result
+        assert "dedup disabled" in result.lower()
+        assert self.mock_zettel_service.create_note.call_count == 2
 
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""

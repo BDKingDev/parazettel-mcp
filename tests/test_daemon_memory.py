@@ -57,3 +57,18 @@ def test_record_request_memory_silent_when_probe_unavailable(monkeypatch, caplog
 
     assert daemon._request_count == 1
     assert not any("daemon memory" in r.getMessage() for r in caplog.records)
+
+
+def test_record_request_memory_logs_rss_only_when_no_commit(monkeypatch, caplog):
+    """The POSIX-style reading (commit_mb=None) logs rss with no commit figure."""
+    monkeypatch.setattr(daemon_server, "_MEMORY_LOG_EVERY_N_REQUESTS", 1)
+    monkeypatch.setattr(daemon_server, "_process_memory_mb", lambda: (789.0, None))
+    daemon = _make_daemon()
+
+    with caplog.at_level("INFO", logger="parazettel_mcp.daemon.server"):
+        daemon._record_request_memory()
+
+    logged = [r.getMessage() for r in caplog.records if "daemon memory" in r.getMessage()]
+    assert len(logged) == 1
+    assert "rss=789 MB" in logged[0]
+    assert "commit=" not in logged[0]
