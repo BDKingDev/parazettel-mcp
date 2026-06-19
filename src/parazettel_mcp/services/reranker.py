@@ -9,17 +9,25 @@ BM25 candidate set (<=5), so the cost is negligible.
 The backend (``fastembed``'s ``TextCrossEncoder``) is imported lazily and the
 model is loaded on first use, so nothing is required until embeddings are enabled
 with a reranker model configured. :func:`build_reranker` returns ``None`` when the
-feature is off.
+feature is off; :func:`reranker_enabled` reports the same on/off decision without
+constructing anything (so a remote caller can decide whether to ask for a rerank).
 
-The first-use model load is the ONE unbounded step in the per-session facade: it
-acquires a ``filelock`` on the *shared* fastembed/HuggingFace model cache, and a
-prior process that died mid-load can leave that lock wedged — which would hang the
-session forever with no catchable exception. So the load runs on a dedicated
+Ownership: the reranker lives in the data-owning service (the daemon in daemon
+mode), NOT in every per-session MCP facade. The facade reaches it over RPC via
+``ZettelService.rerank``. This is deliberate — importing fastembed's C-extensions
+(numpy/OpenBLAS/onnxruntime) on a facade *worker* thread, while the facade's
+asyncio loop and anyio workers are already running, deadlocks on the Windows
+loader lock and never returns. Loading once in the daemon, pre-warmed on the main
+thread (:meth:`FastEmbedReranker.prewarm` from ``ZettelService.initialize``),
+sidesteps that entirely and removes the per-facade memory/GPU cost.
+
+The model load can still wedge on a ``filelock`` over the *shared*
+fastembed/HuggingFace model cache (a prior process that died mid-load). The
+:meth:`FastEmbedReranker.score` fallback path therefore loads on a dedicated
 worker thread under a hard timeout (:attr:`FastEmbedReranker._load_timeout`); on
-timeout :meth:`score` raises :class:`RerankerLoadTimeoutError` and the caller
-surfaces a loud, actionable error instead of hanging. The load lifecycle is logged
-at INFO (and failures at ERROR) so a hang is debuggable from the logs after the
-fact.
+timeout it raises :class:`RerankerLoadTimeoutError` and the caller surfaces a
+loud, actionable error instead of hanging. The load lifecycle is logged at INFO
+(failures at ERROR) so a stall is debuggable from the logs after the fact.
 """
 
 from __future__ import annotations
@@ -75,7 +83,7 @@ class FastEmbedReranker:
     # purpose: fastembed defaults to trying CUDAExecutionProvider when NO providers
     # are passed, so a "cpu" device with no providers would still spin up (and fail
     # over from) CUDA on every load — pinning a GPU context. Forcing the CPU-only
-    # list keeps the per-session reranker entirely off the card.
+    # list keeps the reranker entirely off the card (leaving it to the embedder).
     _DEVICE_PROVIDERS = {
         "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
         "gpu": ["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -90,12 +98,12 @@ class FastEmbedReranker:
         self.model_id = f"fastembed-rerank:{model_name}"
         self._device = (device or "cpu").strip().lower()
         self._load_timeout = max(1.0, float(load_timeout))
-        self._model = None  # lazy-loaded on first use
-        # The (possibly wedged) load runs on a dedicated DAEMON thread so the
-        # caller can walk away from it on timeout AND so a wedged load can never
-        # block the facade's process exit (a non-daemon worker joined at exit
-        # would zombie the process). One shared future means the load happens
-        # exactly once and every concurrent waiter reuses it.
+        self._model = None  # lazy-loaded on first use (or eagerly via prewarm())
+        # The lazy fallback load (when prewarm() wasn't called or failed) runs on a
+        # dedicated DAEMON thread so the caller can walk away from it on timeout AND
+        # so a wedged load can never block process exit (a non-daemon worker joined
+        # at exit would zombie the process). One shared future means the load
+        # happens exactly once and every concurrent waiter reuses it.
         self._load_lock = threading.Lock()
         self._load_thread: Optional[threading.Thread] = None
         self._load_future: "Optional[concurrent.futures.Future]" = None
@@ -255,6 +263,37 @@ class FastEmbedReranker:
                 self._load_thread = None
                 self._load_timed_out = False
 
+    def prewarm(self) -> bool:
+        """Load the model NOW, synchronously, on the CALLING thread.
+
+        Call this once at startup on the MAIN thread (e.g. from a service's
+        ``initialize`` before any event-loop or request-handler threads exist).
+        Importing fastembed's C-extensions (numpy/OpenBLAS/onnxruntime) on a
+        *non-main* thread while the process is already multi-threaded deadlocks
+        on the Windows loader lock — which is exactly what the lazy worker-thread
+        load in :meth:`_ensure_model` hits inside a running MCP facade (asyncio
+        loop + anyio workers already live). Loading on the main thread at startup
+        sidesteps that entirely AND warms the cache so the first real
+        :meth:`score` is instant.
+
+        Returns ``True`` on success. On failure it logs and returns ``False``
+        without raising — startup must not crash on a degraded reranker, and a
+        later :meth:`score` can still fall back to the lazy load.
+        """
+        if self._model is not None:
+            return True
+        try:
+            self._model = self._build_model()
+            return True
+        except BaseException as exc:  # noqa: BLE001 - startup must survive this
+            logger.error(
+                "dedup reranker: pre-warm load failed (%s) — the reranker will "
+                "lazy-load on first use instead",
+                exc,
+                exc_info=True,
+            )
+            return False
+
     def score(self, query: str, documents: Sequence[str]) -> List[float]:
         """Score each document against *query* with the cross-encoder."""
         docs = list(documents)
@@ -272,20 +311,34 @@ class FastEmbedReranker:
         return scores
 
 
+def reranker_enabled(config) -> bool:  # type: ignore[no-untyped-def]
+    """Whether the dedup reranker is configured — WITHOUT constructing it.
+
+    Lets the per-session facade decide if it should request a rerank from the
+    backend (the daemon, over RPC) without building or importing anything
+    locally — the reranker now lives in the service that owns the data, not in
+    every facade.
+    """
+    if not getattr(config, "embedding_enabled", False):
+        return False
+    return bool((getattr(config, "dedup_rerank_model", "") or "").strip())
+
+
 def build_reranker(config) -> Optional[RerankerProvider]:  # type: ignore[no-untyped-def]
     """Construct the dedup reranker, or ``None`` when it is disabled.
 
     Off unless embeddings are enabled *and* a reranker model is configured. Note:
-    this only constructs the provider — the model is loaded lazily on first use.
+    this only constructs the provider — the model is loaded lazily on first use
+    (or eagerly via :meth:`FastEmbedReranker.prewarm`).
     """
-    if not getattr(config, "embedding_enabled", False):
+    if not reranker_enabled(config):
         return None
     model = (getattr(config, "dedup_rerank_model", "") or "").strip()
-    if not model:
-        return None
-    # The reranker is per-facade, so it must NOT default to the GPU: every live or
-    # orphaned session would stack another cross-encoder onto the card. Its device
-    # is configured independently of the embedder (defaults to CPU).
+    # Device is configured independently of the embedder and defaults to CPU. The
+    # reranker now lives once in the data-owning service (the daemon), not in every
+    # facade, so the old GPU-flap risk (each session stacking a cross-encoder onto
+    # the card) is gone — but CPU stays the default since the cross-encoder is tiny
+    # and runs only on the <=5 BM25 candidates, leaving the GPU to the embedder.
     device = (getattr(config, "dedup_rerank_device", "") or "cpu").strip().lower()
     load_timeout = float(
         getattr(config, "dedup_rerank_load_timeout_seconds", 45.0) or 45.0

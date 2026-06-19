@@ -24,7 +24,7 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
 )
-from parazettel_mcp.services.reranker import RerankerError, build_reranker
+from parazettel_mcp.services.reranker import RerankerError, reranker_enabled
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
 
@@ -191,10 +191,13 @@ class ZettelkastenMcpServer:
         self.backend = self._build_backend()
         self.zettel_service = self.backend.zettel_service
         self.search_service = self.backend.search_service
-        # Optional cross-encoder that confirms dedup-on-create candidates. Built
-        # cheaply here (the model is loaded lazily on first use); None when the
-        # feature is off, in which case dedup uses the BM25 prefilter alone.
-        self._reranker = build_reranker(config)
+        # Whether dedup-on-create should confirm BM25 candidates with the
+        # cross-encoder. The reranker itself lives in the data-owning service
+        # (the daemon in daemon mode), reached via self.zettel_service.rerank;
+        # the facade only needs to know whether to ASK for a rerank — it never
+        # imports fastembed (a facade-thread fastembed import deadlocks on the
+        # Windows loader lock). False => dedup uses the BM25 prefilter alone.
+        self._rerank_enabled = reranker_enabled(config)
         # Initialize services
         self.initialize()
         # Register tools
@@ -338,20 +341,21 @@ class ZettelkastenMcpServer:
         BM25 candidates, since there the reranker ran but returned something
         unusable — that is a quirk, not a stall.
         """
-        if not candidates or self._reranker is None:
+        if not candidates or not self._rerank_enabled:
             return candidates
         query = self._dedup_text(title, content)
         documents = [
             self._dedup_text(note.title, note.content) for note, _ in candidates
         ]
         logger.debug(
-            "dedup rerank: confirming %d BM25 candidate(s) with %s",
+            "dedup rerank: confirming %d BM25 candidate(s) via the backend reranker",
             len(documents),
-            getattr(self._reranker, "model_id", "reranker"),
         )
         started = time.perf_counter()
         try:
-            scores = self._reranker.score(query, documents)
+            # Routes to the data-owning service: in-process in direct mode, over
+            # RPC to the daemon (where the model is pre-warmed) in daemon mode.
+            scores = self.zettel_service.rerank(query, documents)
         except RerankerError:
             logger.error(
                 "dedup rerank FAILED after %.1fs — surfacing error (no BM25 "

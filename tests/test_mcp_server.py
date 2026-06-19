@@ -58,8 +58,10 @@ class TestMcpServer:
 
         # Create a server instance AFTER setting up the mocks
         self.server = ZettelkastenMcpServer()
-        # Default to BM25-only dedup; the rerank tests opt in with a fake reranker.
-        self.server._reranker = None
+        # Default to BM25-only dedup; the rerank tests opt in by enabling rerank
+        # and stubbing the backend's zettel_service.rerank (the facade no longer
+        # holds a reranker — it asks the data service to score).
+        self.server._rerank_enabled = False
 
     def teardown_method(self):
         """Clean up after each test."""
@@ -276,7 +278,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker says "not a duplicate" (below the default threshold of 3.0).
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: [0.5 for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: [0.5 for _ in docs]
 
         created = SimpleNamespace(id="new-rr-1")
         self.mock_zettel_service.create_note.return_value = created
@@ -311,7 +314,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker confirms the duplicate (above the default threshold of 3.0).
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: [9.0 for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: [9.0 for _ in docs]
 
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
@@ -341,7 +345,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker returns a same-length list of non-numeric values.
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: ["bad" for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: ["bad" for _ in docs]
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
         self.mock_zettel_service.get_note.return_value = mock_area
@@ -381,7 +386,8 @@ class TestMcpServer:
                 "fastembed/HuggingFace model-cache lock)."
             )
 
-        self.server._reranker = SimpleNamespace(score=_boom)
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = _boom
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
         self.mock_zettel_service.get_note.return_value = mock_area
@@ -419,7 +425,8 @@ class TestMcpServer:
         def _boom(_query, _docs):
             raise RerankerLoadTimeoutError("dedup reranker model load exceeded 45s")
 
-        self.server._reranker = SimpleNamespace(score=_boom)
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = _boom
         self.mock_zettel_service.create_note.side_effect = [
             SimpleNamespace(id="n1"),
             SimpleNamespace(id="n2"),

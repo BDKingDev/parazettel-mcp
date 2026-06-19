@@ -213,9 +213,9 @@ class ZettelkastenConfig(BaseModel):
         )
     )
     # Reranker execution device (see DEFAULT_DEDUP_RERANK_DEVICE). Decoupled from
-    # embedding_device on purpose so the per-facade reranker doesn't pile onto the
-    # GPU. PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda' for a single
-    # always-on session).
+    # embedding_device so the dedup cross-encoder defaults to CPU and leaves the
+    # GPU to the embedder (the reranker is tiny — it runs only on the <=5 BM25
+    # candidates). PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda').
     dedup_rerank_device: str = Field(
         default_factory=lambda: os.getenv(
             "PARAZETTEL_DEDUP_RERANK_DEVICE", DEFAULT_DEDUP_RERANK_DEVICE

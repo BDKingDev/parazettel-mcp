@@ -3,12 +3,17 @@
 import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from parazettel_mcp.config import config
-from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
+from parazettel_mcp.daemon.client import (
+    DaemonRpcClient,
+    DaemonUnavailableError,
+    RemoteServiceProxy,
+)
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.models.schema import Note, NoteSource, NoteType
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
@@ -52,6 +57,39 @@ def test_daemon_health_reports_ready_state(daemon_server):
     assert health["graph_writable"] is True
     assert health["version"] == config.server_version
     assert health["pid"] > 0
+
+
+def test_rerank_rpc_round_trip(daemon_server):
+    """The dedup reranker is reachable over RPC and returns the scores.
+
+    The reranker lives in the daemon's ZettelService now; the facade reaches it
+    via this RPC instead of importing fastembed itself. Inject a fake scorer into
+    the live daemon's service and confirm the score list crosses the boundary.
+    """
+    daemon_server.zettel_service._reranker = SimpleNamespace(
+        score=lambda _query, docs: [float(len(d)) for d in docs]
+    )
+    proxy = RemoteServiceProxy(
+        DaemonRpcClient(daemon_server.base_url, timeout_seconds=10), "zettel_service"
+    )
+    assert proxy.rerank("query", ["ab", "abcd"]) == [2.0, 4.0]
+
+
+def test_rerank_rpc_surfaces_reranker_error_as_reranker_error(daemon_server):
+    """A daemon-side RerankerError relays back to the client as RerankerError.
+
+    The facade's dedup path catches RerankerError specifically (fail loud, no
+    silent BM25 fallback), so the type must survive the RPC boundary — which it
+    does only because client.ERROR_REGISTRY maps it.
+    """
+    from parazettel_mcp.services.reranker import RerankerError
+
+    daemon_server.zettel_service._reranker = None  # disabled -> rerank raises
+    proxy = RemoteServiceProxy(
+        DaemonRpcClient(daemon_server.base_url, timeout_seconds=10), "zettel_service"
+    )
+    with pytest.raises(RerankerError):
+        proxy.rerank("query", ["a"])
 
 
 def test_daemon_rejects_non_loopback_bind():
