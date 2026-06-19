@@ -64,6 +64,21 @@ def test_initialize_is_a_noop_when_the_reranker_is_disabled():
     service.initialize()  # no exception
 
 
+def test_initialize_is_idempotent():
+    """A second initialize() does not pre-warm again.
+
+    The daemon calls zettel_service.initialize() AND SearchService.initialize()
+    forwards to the same shared instance, so the eager load must run once only.
+    """
+    service = _service_without_db()
+    fake = MagicMock()
+    fake.prewarm.return_value = True
+    service._reranker = fake
+    service.initialize()
+    service.initialize()
+    fake.prewarm.assert_called_once_with()
+
+
 def test_rerank_is_an_allowed_daemon_rpc_method():
     """The facade reaches the daemon's reranker via the zettel_service RPC surface."""
     assert "rerank" in ALLOWED_SERVICE_METHODS["zettel_service"]

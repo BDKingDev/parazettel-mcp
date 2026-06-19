@@ -70,6 +70,9 @@ class ZettelService:
         # worker thread deadlocks on the Windows loader lock. Built cheaply here
         # (no model load); loaded eagerly on the main thread in :meth:`initialize`.
         self._reranker = build_reranker(config)
+        # initialize() is idempotent: the daemon calls it AND SearchService.initialize
+        # forwards to the same shared instance, so the pre-warm must run once only.
+        self._initialized = False
 
     @contextmanager
     def _write_locked(self) -> Iterator[None]:
@@ -84,11 +87,15 @@ class ZettelService:
             yield
 
     def initialize(self) -> None:
-        """Initialize the service and dependencies.
+        """Initialize the service and dependencies (idempotent).
 
         The repository is initialized in its constructor; the only work here is
-        pre-warming the dedup reranker on THIS (startup) thread.
+        pre-warming the dedup reranker on THIS (startup) thread. Guarded so the
+        daemon's call and SearchService's forwarded call don't pre-warm twice.
         """
+        if self._initialized:
+            return
+        self._initialized = True
         self._prewarm_reranker()
 
     def _prewarm_reranker(self) -> None:
