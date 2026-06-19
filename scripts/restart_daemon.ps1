@@ -13,19 +13,23 @@
   shell that already sourced the MCP client's env wins). Edit the defaults below
   if your vault uses a different model/device.
 
+  Before starting the fresh daemon it also reaps ORPHANED facade processes —
+  MCP facades whose Claude session has exited but which never cleaned up and
+  keep holding memory/handles (and, before the reranker moved to CPU, GPU VRAM).
+  Orphans are detected by parent liveness (a facade with no running session
+  ancestor), so they are reaped at any age while active sessions are never
+  touched. Stale model-cache / daemon-start locks are cleared too. Use -DryRun
+  to preview the reap without killing anything or restarting.
+
 .EXAMPLE
   pwsh scripts/restart_daemon.ps1
 
 .EXAMPLE
-  pwsh scripts/restart_daemon.ps1 -OrphanMaxAgeHours 12   # only reap very old strays
+  pwsh scripts/restart_daemon.ps1 -DryRun   # preview which facades would be reaped; nothing killed
 #>
 param(
-  # Before restarting, reap stray (non-daemon) parazettel facade processes older
-  # than this many hours. Orphaned MCP facades never get cleaned up on session
-  # end and keep pinning VRAM (a loaded reranker/CUDA context) and cache file
-  # locks. Active sessions are far younger than this default, so they are never
-  # touched. Set very high to disable reaping.
-  [double]$OrphanMaxAgeHours = 6
+  # Preview the orphan reap without killing anything or restarting the daemon.
+  [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path "$PSScriptRoot\..").Path
@@ -42,26 +46,54 @@ function Set-DefaultEnv([string]$name, [string]$value) {
   if (-not (Test-Path "env:$name")) { Set-Item "env:$name" $value }
 }
 
-function Remove-OrphanFacades([double]$maxAgeHours) {
-  # Kill stray facade processes (python -m parazettel_mcp.main WITHOUT
-  # --run-daemon) older than $maxAgeHours. These are sessions that ended without
-  # cleaning up; each still pins its CUDA context / model and OS handles. The
-  # live daemon and any active session (younger than the threshold) are spared.
-  $now = Get-Date
-  $orphans = @(
-    Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" |
-      Where-Object { $_.CommandLine -match 'parazettel_mcp\.main' -and $_.CommandLine -notmatch '--run-daemon' } |
-      ForEach-Object {
-        $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-        if ($p -and (($now - $p.StartTime).TotalHours -gt $maxAgeHours)) { $p }
-      }
-  )
-  if (-not $orphans) { Write-Host "No orphan facades older than ${maxAgeHours}h."; return }
-  foreach ($p in $orphans) {
-    $age = [math]::Round(($now - $p.StartTime).TotalHours, 1)
-    Write-Host "Reaping orphan facade PID $($p.Id) (age ${age}h)"
-    try { Stop-Process -Id $p.Id -Force -ErrorAction Stop }
-    catch { Write-Host "  (could not stop $($p.Id): $($_.Exception.Message))" }
+function Test-FacadeOrphaned {
+  # A facade is ORPHANED when no live Claude session spawned it. We decide by
+  # walking up the parent chain: an ACTIVE facade reaches a live, older,
+  # NON-python ancestor (claude.exe / the shell that launched the session)
+  # through its python launcher parents (a venv stub re-execs the real python,
+  # so there can be a python->python link). A parent that is GONE — or whose
+  # creation time is NEWER than its child, meaning that PID was recycled and the
+  # real parent is dead — proves the session is gone. This catches an orphan the
+  # instant its session dies, at ANY age, and never flags a running session.
+  param($facade, $byId)
+  $cur = $facade
+  for ($depth = 0; $depth -lt 8; $depth++) {
+    $parent = $byId[[int]$cur.ParentProcessId]
+    if (-not $parent) { return $true }                               # ancestor gone
+    if ($parent.CreationDate -gt $cur.CreationDate) { return $true }  # PID recycled -> real parent dead
+    if ($parent.Name -notmatch '^python') { return $false }          # live, older session host -> active
+    $cur = $parent                                                   # climb through python launchers
+  }
+  return $true  # implausibly deep python chain with no host -> treat as orphan
+}
+
+function Remove-OrphanFacades([switch]$DryRun) {
+  # Reap facade processes (python -m parazettel_mcp.main, NOT --run-daemon) whose
+  # spawning Claude session is gone. Independent of age, so a freshly-orphaned
+  # facade is reaped immediately while active sessions are never touched, however
+  # long they have been open.
+  # Map ALL processes by PID (not just python) so the walk can resolve the
+  # non-python session host (claude.exe / shell) at the top of the chain.
+  $all = @(Get-CimInstance Win32_Process)
+  $byId = @{}; foreach ($p in $all) { $byId[[int]$p.ProcessId] = $p }
+  $facades = $all | Where-Object {
+    ($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe') -and
+    $_.CommandLine -match 'parazettel_mcp\.main' -and $_.CommandLine -notmatch '--run-daemon'
+  }
+  $reaped = 0
+  foreach ($f in $facades) {
+    if (-not (Test-FacadeOrphaned -facade $f -byId $byId)) { continue }
+    $reaped++
+    if ($DryRun) {
+      Write-Host "[dry-run] would reap orphan facade PID $($f.ProcessId) (parent PID $($f.ParentProcessId) is gone/recycled)"
+      continue
+    }
+    Write-Host "Reaping orphan facade PID $($f.ProcessId) (no live session ancestor)"
+    try { Stop-Process -Id $f.ProcessId -Force -ErrorAction Stop }
+    catch { Write-Host "  (could not stop $($f.ProcessId): $($_.Exception.Message))" }
+  }
+  if ($reaped -eq 0) {
+    Write-Host "No orphan facades found (every live facade is attached to a running session)."
   }
 }
 
@@ -100,11 +132,17 @@ Set-DefaultEnv "PARAZETTEL_EMBEDDING_DEVICE"   "cuda"
 Set-DefaultEnv "PARAZETTEL_DEDUP_RERANK_DEVICE" "cpu"
 Set-DefaultEnv "FASTEMBED_CACHE_PATH"        (Join-Path $repo "data\fastembed_cache")
 
+if ($DryRun) {
+  Write-Host "[dry-run] previewing orphan reap only -- nothing is killed and the daemon is left running."
+  Remove-OrphanFacades -DryRun
+  return
+}
+
 Write-Host "Stopping any running Parazettel daemon..."
 & $py -m parazettel_mcp.main --stop-daemon
 
-Write-Host "Reaping orphan facade processes (older than ${OrphanMaxAgeHours}h)..."
-Remove-OrphanFacades $OrphanMaxAgeHours
+Write-Host "Reaping orphan facades (sessions that are no longer running)..."
+Remove-OrphanFacades
 Write-Host "Clearing stale model-cache / daemon-start locks..."
 Clear-StaleLocks $repo
 
