@@ -1692,6 +1692,70 @@ class NoteRepository(Repository[Note]):
         distances = self._search_by_vector(query_vector, limit)
         return sorted(distances.items(), key=lambda kv: kv[1])[:limit]
 
+    def embed_query(self, text: str) -> Optional[List[float]]:
+        """Embed *text* as a search query (L2-normalized), or None if unavailable.
+
+        Thin public accessor over the embedding provider so services can rank
+        arbitrary text (tags, areas) against the same vector space the index uses,
+        without reaching into the private provider. None when embeddings are off
+        or the text can't be embedded.
+        """
+        provider = self._embedding_provider
+        if provider is None or not text or not text.strip():
+            return None
+        try:
+            return provider.embed_query(text)
+        except Exception as exc:
+            logger.warning("Query embedding failed: %s", exc)
+            return None
+
+    def embed_documents(self, texts: Iterable[str]) -> List[List[float]]:
+        """Embed *texts* as documents (L2-normalized); [] when embeddings are off."""
+        provider = self._embedding_provider
+        items = [t for t in texts]
+        if provider is None or not items:
+            return []
+        try:
+            return provider.embed_documents(items)
+        except Exception as exc:
+            logger.warning("Document embedding failed: %s", exc)
+            return []
+
+    def embed_tags(self, names: Iterable[str]) -> Dict[str, List[float]]:
+        """Return ``{tag_name: vector}`` for *names*, cached per embedding model.
+
+        Tags change rarely, so caching their vectors means a repeated semantic
+        tag search only embeds the (usually empty) set of new tags plus the one
+        query — not the whole tag list each call. The cache resets if the active
+        embedding model changes (stale vectors would be incomparable).
+        """
+        provider = self._embedding_provider
+        wanted = [n for n in names]
+        if provider is None or not wanted:
+            return {}
+        model_id = provider.model_id
+        if getattr(self, "_tag_embed_cache_model", None) != model_id:
+            self._tag_embed_cache: Dict[str, List[float]] = {}
+            self._tag_embed_cache_model = model_id
+        cache = self._tag_embed_cache
+        missing = [n for n in dict.fromkeys(wanted) if n not in cache]
+        if missing:
+            try:
+                vectors = provider.embed_documents(missing)
+            except Exception as exc:
+                logger.warning("Tag embedding failed: %s", exc)
+                vectors = []
+            if len(vectors) != len(missing):
+                logger.warning(
+                    "Tag embedding count mismatch: expected %d, got %d (caching "
+                    "only the returned prefix; the rest re-embed next call)",
+                    len(missing),
+                    len(vectors),
+                )
+            for name, vec in zip(missing, vectors):
+                cache[name] = vec
+        return {n: cache[n] for n in wanted if n in cache}
+
     def get_note_embedding(self, note_id: str) -> Optional[List[float]]:
         """Return a note's stored *current-model* document embedding, freshest first.
 
@@ -1916,7 +1980,16 @@ class NoteRepository(Repository[Note]):
         conjunctive: bool = False,
     ) -> List[Tuple[str, float]]:
         """Return (note_id, BM25 score) pairs from a full-text query, ranked by score."""
-        normalized_query = query.strip()
+        # Kuzu's FTS query parser crashes the whole process (Windows access
+        # violation / heap corruption 0xC0000374) on structural characters in the
+        # query string — markdown '#'/'**', newlines, brackets. A dedup probe
+        # built from raw note content, or a user pasting markdown into search,
+        # readily contains these, and a native crash cannot be caught with
+        # try/except — it takes the daemon down silently, leaving every client
+        # hanging. So reduce the query to plain word tokens before it reaches
+        # Kuzu. The FTS engine tokenizes on word boundaries anyway, so this does
+        # not change recall; \w keeps Unicode letters/digits for non-ASCII terms.
+        normalized_query = " ".join(re.findall(r"\w+", query or ""))
         if not normalized_query:
             return []
 

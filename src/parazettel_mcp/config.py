@@ -18,12 +18,16 @@ if _REPO_ENV_PATH.exists():
     load_dotenv(_REPO_ENV_PATH, override=False)
 
 
-# --- Resource-tuning defaults (code constants, not environment-configurable) ---
-# Max Kuzu buffer-pool size in bytes. 0 = Kuzu's own default (~80% of physical
-# RAM *per database instance*) — fine for one long-lived daemon. The test suite
-# bounds this to a small value via the conftest fixture so per-test databases
-# stay tiny and the suite can run in parallel.
-DEFAULT_KUZU_BUFFER_POOL_BYTES = 0
+# --- Resource-tuning defaults ---
+# Max Kuzu buffer-pool size in bytes. The buffer pool is a lazy page cache: under
+# sustained query load (many vector searches paging the DB + HNSW index in) it
+# grows toward this cap and stays resident. Kuzu's own default (selected by 0) is
+# ~80% of physical RAM *per database instance*, which on a long-lived daemon
+# balloons commit charge to tens of GB and inflates the Windows pagefile. So we
+# cap it at a bounded default and expose PARAZETTEL_KUZU_BUFFER_POOL_BYTES to tune
+# it (0 restores Kuzu's ~80%-RAM default). The test suite bounds it further via
+# the conftest fixture so per-test databases stay tiny.
+DEFAULT_KUZU_BUFFER_POOL_BYTES = 8 * 1024**3  # 8 GiB
 # Seconds of inactivity after which the daemon shuts itself down (it is
 # auto-restarted on the next request). A non-zero default means a daemon left
 # behind when an MCP client exits without reaping it reaps itself instead of
@@ -39,6 +43,20 @@ DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
 DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+# Execution device for the dedup reranker. Defaults to CPU and is INTENTIONALLY
+# decoupled from embedding_device: the reranker is loaded per-session in each MCP
+# facade, so on CUDA every concurrent (and every orphaned) session stacks another
+# cross-encoder onto the GPU — exhausting an 8 GB card and flapping the embedding
+# path when a new agent spins up. The model is tiny (~80 MB) and only scores <=5
+# short pairs per dedup, so CPU is plenty. Override with PARAZETTEL_DEDUP_RERANK_DEVICE.
+DEFAULT_DEDUP_RERANK_DEVICE = "cpu"
+# Hard ceiling on the cross-encoder's first-use model LOAD (the one unbounded step
+# in the facade — it acquires a filelock on the shared fastembed/HF model cache,
+# which can wedge if a prior process died mid-load). A warm load is ~2s; a cold
+# GPU init with a download is well under this. Exceeding it means the load is
+# genuinely stuck, so we surface a loud, actionable error instead of hanging the
+# session forever. Override with PARAZETTEL_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS.
+DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS = 45.0
 
 
 class ZettelkastenConfig(BaseModel):
@@ -169,12 +187,42 @@ class ZettelkastenConfig(BaseModel):
         .lower()
     )
     # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
-    kuzu_buffer_pool_bytes: int = Field(default=DEFAULT_KUZU_BUFFER_POOL_BYTES)
+    # PARAZETTEL_KUZU_BUFFER_POOL_BYTES overrides it (0 = Kuzu's ~80%-RAM default).
+    kuzu_buffer_pool_bytes: int = Field(
+        default=int(
+            os.getenv(
+                "PARAZETTEL_KUZU_BUFFER_POOL_BYTES",
+                str(DEFAULT_KUZU_BUFFER_POOL_BYTES),
+            )
+        )
+    )
     # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
     # active when embeddings are enabled; empty string disables the rerank confirm
     # (dedup falls back to the BM25 prefilter alone).
     dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
     dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
+    # Timeout on the reranker's first-use model load (see
+    # DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS). On timeout the dedup probe raises
+    # rather than hanging, so note creation fails loudly instead of silently.
+    dedup_rerank_load_timeout_seconds: float = Field(
+        default=float(
+            os.getenv(
+                "PARAZETTEL_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS",
+                str(DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS),
+            )
+        )
+    )
+    # Reranker execution device (see DEFAULT_DEDUP_RERANK_DEVICE). Decoupled from
+    # embedding_device on purpose so the per-facade reranker doesn't pile onto the
+    # GPU. PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda' for a single
+    # always-on session).
+    dedup_rerank_device: str = Field(
+        default_factory=lambda: os.getenv(
+            "PARAZETTEL_DEDUP_RERANK_DEVICE", DEFAULT_DEDUP_RERANK_DEVICE
+        )
+        .strip()
+        .lower()
+    )
 
     def get_absolute_path(self, path: Path) -> Path:
         """Convert a relative path to an absolute path based on base_dir."""

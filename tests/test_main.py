@@ -573,3 +573,22 @@ def test_spawn_daemon_process_hides_windows_console(monkeypatch):
     startupinfo = captured["kwargs"]["startupinfo"]
     assert startupinfo.dwFlags & main_module.subprocess.STARTF_USESHOWWINDOW
     assert startupinfo.wShowWindow == getattr(main_module.subprocess, "SW_HIDE", 0)
+
+
+def test_daemon_bootstrap_breaks_away_from_job():
+    """The Windows daemon bootstrap must spawn the daemon with
+    CREATE_BREAKAWAY_FROM_JOB (0x01000000) so it leaves the launcher's job object
+    and is not reaped when a transient `!`/restart shell (or recycled facade)
+    closes that job. The exec'd helper must be valid Python with a no-breakaway
+    fallback (CreateProcess raises if the job forbids breakaway)."""
+    import ast
+
+    args = argparse.Namespace(log_level="INFO")
+    command = main_module._build_windows_daemon_bootstrap_command(args)
+    helper_code = command[2]
+
+    # A syntax error here would make EVERY Windows daemon auto-start silently fail.
+    ast.parse(helper_code)
+    assert "0x01000000" in helper_code  # CREATE_BREAKAWAY_FROM_JOB
+    assert "except OSError" in helper_code  # graceful fallback when breakaway denied
+    assert "--run-daemon" in command  # still launches the daemon

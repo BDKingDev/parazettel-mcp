@@ -1283,3 +1283,68 @@ def test_atomic_write_fsyncs_temp_file_before_replace(note_repository):
         f"fsync must precede replace, got order: {events}"
     )
     assert target.read_text(encoding="utf-8") == "# hi\n\nbody\n"
+
+
+# --- FTS query sanitization (Kuzu native-crash regression) ------------------
+#
+# Kuzu's FTS parser segfaults (Windows access violation / heap corruption) on
+# structural characters in the query string — markdown '#'/'**', newlines,
+# brackets. The ingest_batch dedup probe builds its FTS query from a note's raw
+# markdown content, so this crashed the whole daemon (a native crash no
+# try/except can catch) and left clients hanging. The query must be reduced to
+# plain word tokens before it reaches Kuzu.
+
+
+def test_fts_query_is_reduced_to_word_tokens():
+    """The FTS query passed to Kuzu must contain only word tokens — the markdown
+    structure that crashes Kuzu's parser is stripped before conn.execute."""
+    captured = {}
+
+    class _FakeResult:
+        def has_next(self):
+            return False
+
+        def get_next(self):  # pragma: no cover - never called
+            return None
+
+    class _FakeConn:
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+            captured["params"] = params or {}
+            return _FakeResult()
+
+    # Unbound call: _query_fts_index_scored only touches the conn it is given.
+    NoteRepository._query_fts_index_scored(
+        MagicMock(),
+        _FakeConn(),
+        "note_text_fts",
+        "# Heading\n\n- **Bold (e.g. x)** runs the flow",
+    )
+
+    sent = captured["params"]["query"]
+    assert sent == "Heading Bold e g x runs the flow"
+    for bad in ("#", "*", "(", ")", "\n"):
+        assert bad not in sent
+
+
+def test_fts_search_with_markdown_query_does_not_crash(note_repository):
+    """A real FTS search whose query is full of markdown structure (the exact
+    shape that crashed Kuzu) must return cleanly and still match on the words."""
+    note = note_repository.create(
+        Note(
+            title="Two-CRM stack for delivery",
+            content="Marketing automation runs the lead flow until a call is booked.",
+            note_type=NoteType.STRUCTURE,
+        )
+    )
+
+    markdown_query = (
+        "# Two-CRM stack: a marketing-automation tool\n\n"
+        "- **Marketing automation (e.g. Cartra)** runs the lead flow\n"
+        "- **Project / delivery CRM (e.g. Dubsado)** houses active projects"
+    )
+
+    scores = note_repository.text_fts_scores(markdown_query)
+
+    assert isinstance(scores, dict)
+    assert note.id in scores

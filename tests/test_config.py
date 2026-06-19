@@ -8,8 +8,18 @@ from parazettel_mcp.config import (
 
 
 def test_kuzu_buffer_pool_field_uses_constant():
-    """The buffer-pool field defaults to the code constant (0 = Kuzu default)."""
+    """The buffer-pool field defaults to the code constant (env var overrides it)."""
     assert ZettelkastenConfig().kuzu_buffer_pool_bytes == DEFAULT_KUZU_BUFFER_POOL_BYTES
+
+
+def test_kuzu_buffer_pool_default_is_bounded():
+    """The default must be a positive cap, not 0 (Kuzu's ~80%-of-RAM default).
+
+    A long-lived daemon left at 0 balloons commit charge to tens of GB; guard the
+    bound so an accidental revert to 0 is caught.
+    """
+    assert DEFAULT_KUZU_BUFFER_POOL_BYTES == 8 * 1024**3  # 8 GiB
+    assert DEFAULT_KUZU_BUFFER_POOL_BYTES > 0
 
 
 def test_daemon_idle_timeout_field_uses_constant():

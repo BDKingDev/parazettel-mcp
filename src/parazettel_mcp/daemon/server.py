@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +19,102 @@ from parazettel_mcp.services.zettel_service import ZettelService
 
 logger = logging.getLogger(__name__)
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
+# Log this process's memory every N RPC requests so a slow climb over a long
+# session is visible in the daemon log — which distinguishes a true leak
+# (monotonic climb) from the Kuzu buffer pool's bounded high-water plateau.
+_MEMORY_LOG_EVERY_N_REQUESTS = 200
+
+
+def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
+    """Return (working_set_MB, commit_MB) for this process, or None.
+
+    Windows: Win32 GetProcessMemoryInfo (working set + private commit /
+    PagefileUsage). POSIX: resource.getrusage RSS (no commit figure). Best-effort
+    — any failure returns None so memory logging never affects request handling.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            # Declare signatures so 64-bit HANDLEs aren't truncated through
+            # ctypes' default c_int return/args.
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.GetCurrentProcess.argtypes = []
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(_PMC),
+                wintypes.DWORD,
+            ]
+            counters = _PMC()
+            counters.cb = ctypes.sizeof(_PMC)
+            handle = kernel32.GetCurrentProcess()
+            if not psapi.GetProcessMemoryInfo(
+                handle, ctypes.byref(counters), counters.cb
+            ):
+                return None
+            return (
+                counters.WorkingSetSize / 1048576.0,
+                counters.PagefileUsage / 1048576.0,
+            )
+        import resource
+        import sys
+
+        # ru_maxrss is KB on Linux but BYTES on macOS — convert to MB per platform.
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss / 1048576.0 if sys.platform == "darwin" else rss / 1024.0
+        return (rss_mb, None)
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        return None
+
+
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that refuses to co-bind an already-in-use port.
+
+    The stdlib ``HTTPServer`` sets ``allow_reuse_address = True`` (``SO_REUSEADDR``).
+    On POSIX that only permits reusing a port stuck in ``TIME_WAIT`` — harmless,
+    and kept so the daemon can restart promptly. On **Windows**, ``SO_REUSEADDR``
+    is far more permissive: a second socket may bind a port that is *already
+    actively bound*, silently stealing its incoming connections. Two daemons
+    could then co-bind the daemon port — the original becomes a zombie (often
+    fallen back to a read-only graph) and clients flap between the two.
+
+    So on Windows we disable ``SO_REUSEADDR`` and set ``SO_EXCLUSIVEADDRUSE``,
+    making a second bind fail loudly (``WinError 10048``). The losing daemon then
+    exits cleanly — exactly the "loser of the start race dies" behaviour the
+    daemon-start lock already assumes (which ``SO_REUSEADDR`` had quietly broken
+    on Windows). POSIX behaviour is unchanged.
+    """
+
+    # Keep POSIX TIME_WAIT reuse; drop the address-stealing reuse on Windows.
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
+            except OSError:  # pragma: no cover - best-effort hardening
+                pass
+        super().server_bind()
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -55,6 +152,8 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "export_note",
         "find_similar_notes",
         "find_similar_to_text",
+        "suggest_tags",
+        "suggest_areas",
         "record_retrieval",
         "get_retrieval_signals",
         "create_task",
@@ -118,6 +217,8 @@ class ParazettelDaemonServer:
         self._idle_monitor_thread: Optional[threading.Thread] = None
         self._maintenance_state_lock = threading.Lock()
         self._maintenance_reason: Optional[str] = None
+        self._request_count = 0
+        self._request_count_lock = threading.Lock()
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -141,6 +242,37 @@ class ParazettelDaemonServer:
     def _mark_activity(self) -> None:
         """Record the latest daemon activity time."""
         self._last_activity = time.monotonic()
+
+    def _record_request_memory(self) -> None:
+        """Count an RPC request; every N, log this process's memory.
+
+        Gives an after-the-fact view of whether the long-lived daemon's memory is
+        plateauing (bounded buffer-pool high-water) or genuinely climbing (a leak)
+        without needing an external profiler. Best-effort and never raises.
+        """
+        with self._request_count_lock:
+            self._request_count += 1
+            count = self._request_count
+        if count % _MEMORY_LOG_EVERY_N_REQUESTS != 0:
+            return
+        mem = _process_memory_mb()
+        if mem is None:
+            return
+        working_set_mb, commit_mb = mem
+        if commit_mb is not None:
+            logger.info(
+                "daemon memory after %d requests: working_set=%.0f MB, "
+                "commit=%.0f MB",
+                count,
+                working_set_mb,
+                commit_mb,
+            )
+        else:
+            logger.info(
+                "daemon memory after %d requests: rss=%.0f MB",
+                count,
+                working_set_mb,
+            )
 
     def _start_idle_monitor(self) -> None:
         """Start background idle shutdown monitoring when configured."""
@@ -167,30 +299,61 @@ class ParazettelDaemonServer:
         )
         self._idle_monitor_thread.start()
 
-    def serve_forever(self) -> None:
-        """Start the daemon HTTP server and block until shutdown."""
-        self.initialize()
-        self._httpd = ThreadingHTTPServer(
+    def bind(self) -> None:
+        """Bind the daemon's listening socket (idempotent, fail-fast).
+
+        Separated from :meth:`serve_forever` so a caller can claim the port
+        *before* writing the shared PID file and before the (heavier) service
+        warmup. Raises ``OSError`` when the port is already in use — on Windows
+        that is the decisive "another daemon owns this port" signal, because the
+        socket binds exclusively (see :class:`_ExclusiveThreadingHTTPServer`).
+        Callers treat that as losing the start race and exit without touching
+        the winner's PID file.
+        """
+        if self._httpd is not None:
+            return
+        self._httpd = _ExclusiveThreadingHTTPServer(
             (self.host, self.port),
             self._build_handler(),
         )
-        self._closed = False
-        self._shutdown_event.clear()
-        self._mark_activity()
-        self._start_idle_monitor()
-        logger.info("Starting Parazettel daemon at %s", self.base_url)
+
+    def serve_forever(self) -> None:
+        """Start the daemon HTTP server and block until shutdown."""
+        # Bind first (cheap; fails fast if another daemon owns the port) so a
+        # loser does not pay the service-init cost before discovering it lost.
+        self.bind()
         try:
+            self.initialize()
+            self._closed = False
+            self._shutdown_event.clear()
+            self._mark_activity()
+            self._start_idle_monitor()
+            logger.info("Starting Parazettel daemon at %s", self.base_url)
             self._httpd.serve_forever()
+        except BaseException:
+            # Warmup (initialize) or serving failed: don't leave the port bound
+            # but dead — otherwise callers/tests would see a live-looking
+            # server_address for a server that never ran. Close + clear it.
+            self._close_socket()
+            raise
         finally:
             self.close()
+
+    def _close_socket(self) -> None:
+        """Close the listening socket and clear the handle (best-effort)."""
+        if self._httpd is not None:
+            try:
+                self._httpd.server_close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+            self._httpd = None
 
     def shutdown(self) -> None:
         """Stop the running HTTP server."""
         self._shutdown_event.set()
         if self._httpd is not None:
             self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
+            self._close_socket()
         self.close()
 
     def close(self) -> None:
@@ -297,6 +460,7 @@ class ParazettelDaemonServer:
                     return
 
                 self._send_json(200, {"ok": True, "result": encode_value(result)})
+                daemon._record_request_memory()
 
             def log_message(self, format: str, *args: Any) -> None:
                 logger.debug("Parazettel daemon HTTP: " + format, *args)

@@ -357,6 +357,92 @@ class TestMcpServer:
         assert "dup-rr-nan" in result
         self.mock_zettel_service.create_note.assert_not_called()
 
+    def test_create_note_rerank_failure_surfaces_error(self):
+        """A stuck/failed reranker surfaces a loud error and does NOT create.
+
+        The deliberate choice (2026-06-17) is to fail loudly rather than silently
+        degrade to BM25-only, so a wedged reranker is visible instead of looking
+        like a hang. The actionable message must reach the caller verbatim.
+        """
+        from parazettel_mcp.services.reranker import RerankerLoadTimeoutError
+
+        existing = SimpleNamespace(
+            id="dup-boom", title="A reworded duplicate",
+            content="same claim, other words", tags=[], note_type=NoteType.PERMANENT,
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+
+        def _boom(_query, _docs):
+            raise RerankerLoadTimeoutError(
+                "dedup reranker model load exceeded 45s (likely a stuck "
+                "fastembed/HuggingFace model-cache lock)."
+            )
+
+        self.server._reranker = SimpleNamespace(score=_boom)
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="The same idea", content="Identical claim.",
+            note_type="permanent", source="transcript", area_id="area123",
+        )
+
+        # The ACTIONABLE reranker message is surfaced verbatim (not a generic
+        # "unexpected error"); the note is NOT created and we do NOT fall back.
+        assert "Error" in result
+        assert "reranker" in result.lower()
+        assert "exceeded 45s" in result  # the specific, actionable timeout detail
+        self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_ingest_batch_disables_dedup_but_still_creates_on_reranker_failure(self):
+        """A wedged reranker must NOT abandon a batch — dedup is advisory there.
+
+        Single-create fails loud (above), but batch ingest is "create-and-flag,
+        never block": on a RerankerError it disables dedup for the rest and still
+        creates every note, warning once.
+        """
+        from parazettel_mcp.services.reranker import RerankerLoadTimeoutError
+
+        existing = SimpleNamespace(
+            id="x", title="t", content="c", tags=[], note_type=NoteType.PERMANENT
+        )
+        match = SimpleNamespace(
+            note=existing, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [match]
+
+        def _boom(_query, _docs):
+            raise RerankerLoadTimeoutError("dedup reranker model load exceeded 45s")
+
+        self.server._reranker = SimpleNamespace(score=_boom)
+        self.mock_zettel_service.create_note.side_effect = [
+            SimpleNamespace(id="n1"),
+            SimpleNamespace(id="n2"),
+        ]
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        ingest = self.registered_tools["pzk_ingest_batch"]
+        result = ingest(
+            notes=[
+                {"title": "A", "content": "aaa", "area_id": "area1"},
+                {"title": "B", "content": "bbb", "area_id": "area1"},
+            ]
+        )
+
+        assert "2 note(s) created" in result
+        assert "dedup disabled" in result.lower()
+        assert self.mock_zettel_service.create_note.call_count == 2
+        # The fallback contract: dedup probes the FIRST item, the reranker fails,
+        # and dedup is then disabled — so the second item must not probe at all.
+        assert self.mock_search_service.search_combined.call_count == 1
+
     def test_create_note_weak_match_does_not_block(self):
         """A below-threshold match is ignored; the note is still created."""
         weak = SimpleNamespace(
@@ -1014,6 +1100,72 @@ class TestMcpServer:
 
         assert result.count("# Renamed Note") == 1
         assert "# Old Note" not in result
+
+    def test_get_note_strips_links_section_by_default(self):
+        """pzk_get_note omits the ## Links section (huge for areas) unless asked."""
+        mock_note = MagicMock()
+        mock_note.id = "n-strip"
+        mock_note.title = "Area X"
+        mock_note.content = (
+            "# Area X\n\n## Content\n\nThe area body.\n\n"
+            "## Links\n- has_part: aaa\n- has_part: bbb\n"
+        )
+        mock_note.note_type = NoteType.AREA
+        mock_note.project_id = None
+        mock_note.area_id = None
+        mock_note.created_at.isoformat.return_value = "2026-01-01T00:00:00"
+        mock_note.updated_at.isoformat.return_value = "2026-01-02T00:00:00"
+        mock_note.tags = []
+        self.mock_zettel_service.get_note.return_value = mock_note
+
+        get_note_func = self.registered_tools["pzk_get_note"]
+        out = get_note_func(identifier="n-strip")
+        assert "The area body." in out
+        assert "has_part: aaa" not in out
+        assert "2 link(s) hidden" in out
+
+        out_with = get_note_func(identifier="n-strip", include_links=True)
+        assert "has_part: aaa" in out_with
+        assert "link(s) hidden" not in out_with
+
+    def test_suggest_tags_formats_ranked_results(self):
+        """pzk_suggest_tags renders the ranked (tag, similarity) pairs."""
+        self.mock_zettel_service.suggest_tags.return_value = [
+            ("kuzu", 0.91),
+            ("fts", 0.77),
+        ]
+        tool = self.registered_tools["pzk_suggest_tags"]
+        out = tool(text="kuzu full text search crashes", limit=5)
+        assert "kuzu" in out and "0.91" in out
+        assert "fts" in out
+        self.mock_zettel_service.suggest_tags.assert_called_once()
+
+    def test_suggest_tags_fallback_when_embeddings_disabled(self):
+        """With embeddings off, pzk_suggest_tags points at pzk_get_all_tags."""
+        from parazettel_mcp.config import config as cfg
+
+        self.mock_zettel_service.suggest_tags.return_value = []
+        old = cfg.embedding_enabled
+        cfg.embedding_enabled = False
+        try:
+            tool = self.registered_tools["pzk_suggest_tags"]
+            out = tool(text="something concrete", limit=5)
+            assert "embeddings" in out.lower()
+            assert "pzk_get_all_tags" in out
+        finally:
+            cfg.embedding_enabled = old
+
+    def test_suggest_areas_formats_results(self):
+        """pzk_suggest_areas renders areas with id + similarity for routing."""
+        area = MagicMock()
+        area.id = "area-1"
+        area.title = "Knowledge Management"
+        self.mock_zettel_service.suggest_areas.return_value = [(area, 0.82)]
+        tool = self.registered_tools["pzk_suggest_areas"]
+        out = tool(text="capturing durable ideas", limit=3)
+        assert "Knowledge Management" in out
+        assert "area-1" in out
+        assert "0.82" in out
 
     def test_get_notes_tool_formats_multiple_notes_and_missing_identifiers(self):
         """pzk_get_notes should batch note retrieval and report missing identifiers."""

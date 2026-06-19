@@ -2,7 +2,9 @@
 
 import json
 import logging
+import math
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -22,7 +24,7 @@ from parazettel_mcp.models.schema import (
     NoteStatus,
     NoteType,
 )
-from parazettel_mcp.services.reranker import build_reranker
+from parazettel_mcp.services.reranker import RerankerError, build_reranker
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
 
@@ -58,6 +60,43 @@ _SIM_MODERATE = 0.60
 # by a fabricated/typo'd ID fails.
 _NOTE_ID_SHAPE_RE = re.compile(r"^\d{8}T\d+$")
 
+
+def _strip_links_section(content: str) -> Tuple[str, int]:
+    """Remove the materialized ``## Links`` section from note content for display.
+
+    Note bodies carry a ``## Links`` section that mirrors the link graph (one
+    line per edge). For hub/area notes that is one line per member — hundreds of
+    lines that bloat context every time the note is read. This drops that section
+    (heading through the next ``## `` heading or EOF) and returns
+    ``(stripped_content, hidden_link_count)``. Inline ``[[id]]`` references in
+    prose are left untouched — only the structured section is removed.
+    """
+    lines = content.splitlines()
+    out: List[str] = []
+    hidden = 0
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        if line.strip().lower() == "## links":
+            j = i + 1
+            while j < n and not lines[j].lstrip().startswith("## "):
+                if lines[j].strip().startswith("- "):
+                    hidden += 1
+                j += 1
+            # Drop any blank lines we already emitted just before the heading so
+            # the body doesn't end with a dangling gap.
+            while out and out[-1].strip() == "":
+                out.pop()
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    stripped = "\n".join(out).rstrip()
+    if stripped:
+        stripped += "\n"
+    return stripped, hidden
+
 # Operating manual injected into every MCP client session. This is the one
 # piece of documentation the calling model is guaranteed to see, so the
 # empirically-derived usage rules live here rather than only in the README.
@@ -74,8 +113,10 @@ Operating rules (empirically calibrated on this vault):
   confirm it is the same atomic claim before treating it as a duplicate.
 - Never fabricate note IDs. Copy them exactly from tool output, or pass the
   note title instead — most lookup tools accept either.
-- Reuse existing tags (pzk_get_all_tags) before minting new ones. Tags are
-  normalized to lowercase-hyphenated form on write.
+- Reuse existing tags before minting new ones: pzk_suggest_tags(text) returns
+  the closest existing tags by meaning (pzk_get_all_tags lists every tag). Tags
+  are normalized to lowercase-hyphenated form on write. pzk_suggest_areas(text)
+  likewise shortlists the area to route a note under.
 - Start a work session with pzk_briefing (active projects, due tasks,
   reminders, recent notes) so the vault is consulted before new work begins.
 - For multi-note captures (ingesting a transcript or document), use
@@ -84,6 +125,9 @@ Operating rules (empirically calibrated on this vault):
 - Editing the "## Links" section inside note content via pzk_update_note IS
   honored (entries are reconciled into the link graph). Inline [[id]] refs in
   prose are indexed automatically and cleaned up on delete/rename.
+- pzk_get_note omits a note's "## Links" section by default (it is large for
+  area/hub notes); explore links with pzk_get_linked_notes / pzk_get_neighborhood,
+  or pass include_links=true.
 """
 
 
@@ -202,6 +246,13 @@ class ZettelkastenMcpServer:
             # Read-only fallback errors are safe and actionable for users
             logger.error(f"Read-only graph error [{error_id}]: {str(error)}")
             return f"Error: {str(error)}"
+        elif isinstance(error, RerankerError):
+            # The dedup reranker stalled or failed. Its message is controlled and
+            # actionable (it names the fix), so surface it verbatim rather than a
+            # generic error — this is the loud failure we deliberately chose over a
+            # silent BM25 fallback so a stuck reranker is visible, not invisible.
+            logger.error(f"Dedup reranker error [{error_id}]: {str(error)}")
+            return f"Error: {str(error)}"
         elif isinstance(error, (IOError, OSError)):
             # File system errors - don't expose paths or detailed error messages
             logger.error(f"File system error [{error_id}]: {str(error)}", exc_info=True)
@@ -218,8 +269,11 @@ class ZettelkastenMcpServer:
 
         Uses the same BM25 text search as pzk_search_notes. The title is the
         strongest dedup signal, so it leads the query, with a little content
-        context appended. Best-effort: any search failure yields no candidates
-        (creation should never be blocked by a flaky dedup probe).
+        context appended. The BM25 SEARCH is best-effort (a search failure yields
+        no candidates so a flaky search never blocks creation); the cross-encoder
+        rerank confirm, however, surfaces its errors (see :meth:`_rerank_confirm`)
+        — a stuck/failed reranker fails the create loudly rather than silently
+        degrading dedup.
         """
         query = title.strip()
         if content:
@@ -230,11 +284,17 @@ class ZettelkastenMcpServer:
                 query = f"{query} {content_lead}"
         if not query.strip():
             return []
+        search_started = time.perf_counter()
         try:
             results = self.search_service.search_combined(text=query)
         except Exception as exc:  # pragma: no cover - dedup is advisory only
             logger.warning("Duplicate check skipped (search failed): %s", exc)
             return []
+        logger.debug(
+            "dedup probe: BM25 search returned in %.2fs for query lead %r",
+            time.perf_counter() - search_started,
+            query[:80],
+        )
 
         candidates: List[Tuple[Note, float]] = []
         for result in results:
@@ -267,9 +327,16 @@ class ZettelkastenMcpServer:
 
         BM25 over-flags on shared vocabulary; the reranker reads both notes
         together and is far more precise, so it drops topically-adjacent-but-
-        distinct false positives. Best-effort: if the reranker is disabled or
-        fails to load/score, the BM25 candidates pass through unchanged — dedup
-        must never crash or block creation on a flaky probe.
+        distinct false positives.
+
+        A reranker LOAD/SCORE failure (e.g. a wedged model-cache lock that hits
+        the load timeout) is surfaced, NOT swallowed: we deliberately do not fall
+        back to BM25-only here. A silent fallback hides a broken dedup probe and
+        was indistinguishable from a hang during debugging; failing loudly makes
+        the problem visible and points at the fix (decision 2026-06-17). Only the
+        benign shape guards below (wrong score count / non-numeric score) keep the
+        BM25 candidates, since there the reranker ran but returned something
+        unusable — that is a quirk, not a stall.
         """
         if not candidates or self._reranker is None:
             return candidates
@@ -277,11 +344,30 @@ class ZettelkastenMcpServer:
         documents = [
             self._dedup_text(note.title, note.content) for note, _ in candidates
         ]
+        logger.debug(
+            "dedup rerank: confirming %d BM25 candidate(s) with %s",
+            len(documents),
+            getattr(self._reranker, "model_id", "reranker"),
+        )
+        started = time.perf_counter()
         try:
             scores = self._reranker.score(query, documents)
-        except Exception as exc:  # pragma: no cover - advisory only
-            logger.warning("Dedup rerank skipped (reranker failed): %s", exc)
-            return candidates
+        except RerankerError:
+            logger.error(
+                "dedup rerank FAILED after %.1fs — surfacing error (no BM25 "
+                "fallback)",
+                time.perf_counter() - started,
+                exc_info=True,
+            )
+            raise
+        except Exception as exc:
+            logger.error(
+                "dedup rerank FAILED unexpectedly after %.1fs: %s — surfacing error",
+                time.perf_counter() - started,
+                exc,
+                exc_info=True,
+            )
+            raise RerankerError(f"dedup reranker failed: {exc}") from exc
         if len(scores) != len(candidates):
             logger.warning(
                 "Dedup rerank skipped (unexpected score count): expected %d, got %d",
@@ -292,13 +378,24 @@ class ZettelkastenMcpServer:
         threshold = config.dedup_rerank_min_score
         confirmed: List[Tuple[Note, float]] = []
         for (note, bm25), rerank_score in zip(candidates, scores):
-            if not isinstance(rerank_score, (int, float)):
-                # A non-numeric score would crash the threshold compare; stay
-                # best-effort and fall back to the BM25 candidates.
-                logger.warning("Dedup rerank skipped (non-numeric score %r)", rerank_score)
+            if not isinstance(rerank_score, (int, float)) or not math.isfinite(
+                float(rerank_score)
+            ):
+                # A non-numeric OR non-finite score makes the threshold compare
+                # unsafe (NaN >= x is always False, so it would silently drop a
+                # real duplicate); stay best-effort and fall back to BM25.
+                logger.warning("Dedup rerank skipped (invalid score %r)", rerank_score)
                 return candidates
             if rerank_score >= threshold:
                 confirmed.append((note, bm25))
+        logger.debug(
+            "dedup rerank: confirmed %d/%d candidate(s) as duplicates in %.2fs "
+            "(threshold=%.1f)",
+            len(confirmed),
+            len(candidates),
+            time.perf_counter() - started,
+            threshold,
+        )
         return confirmed
 
     @staticmethod
@@ -334,8 +431,15 @@ class ZettelkastenMcpServer:
         return "\n".join(lines)
 
     @staticmethod
-    def _format_note_result(note: Note) -> str:
-        """Render a note using the standard MCP note output."""
+    def _format_note_result(note: Note, include_links: bool = False) -> str:
+        """Render a note using the standard MCP note output.
+
+        The body's ``## Links`` section is omitted by default: it mirrors the link
+        graph and is one line per edge, which for hub/area notes is hundreds of
+        lines that bloat context on every read. Explore links with
+        pzk_get_linked_notes / pzk_get_neighborhood, or pass ``include_links=True``
+        to inline them.
+        """
         result = f"ID: {note.id}\n"
         result += f"Type: {note.note_type.value}\n"
         result += f"Created: {note.created_at.isoformat()}\n"
@@ -346,7 +450,16 @@ class ZettelkastenMcpServer:
             result += f"Area ID: {note.area_id}\n"
         if note.tags:
             result += f"Tags: {', '.join(tag.name for tag in note.tags)}\n"
-        result += f"\n{note.content}\n"
+        body = note.content
+        hidden = 0
+        if not include_links:
+            body, hidden = _strip_links_section(body)
+        result += f"\n{body}\n"
+        if hidden:
+            result += (
+                f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
+                "pzk_get_neighborhood, or re-fetch with include_links=true]\n"
+            )
         return result
 
     def _resolve_note_identifier(self, identifier: str) -> Optional[Note]:
@@ -458,13 +571,17 @@ class ZettelkastenMcpServer:
             line += f"\n  Preview: {preview}"
         return line
 
-    def _render_notes_with_detail(self, notes: List[Note], detail: str) -> str:
+    def _render_notes_with_detail(
+        self, notes: List[Note], detail: str, include_links: bool = False
+    ) -> str:
         """Render a note list at the requested detail level (ids/summary/full)."""
         if detail == "ids":
             return "\n".join(f"- {note.title} (ID: {note.id})" for note in notes)
         if detail == "summary":
             return "\n".join(self._format_note_summary(note) for note in notes)
-        return "\n---\n\n".join(self._format_note_result(note) for note in notes)
+        return "\n---\n\n".join(
+            self._format_note_result(note, include_links) for note in notes
+        )
 
     @staticmethod
     def _truncation_notice(shown: int, total: int, hint: str = "") -> str:
@@ -583,7 +700,8 @@ class ZettelkastenMcpServer:
 
             Creating many notes at once (e.g. ingesting a transcript)? Use
             pzk_ingest_batch instead — notes, links, and tasks in one call.
-            Reuse existing tags (see pzk_get_all_tags) before minting new ones;
+            Reuse existing tags (pzk_suggest_tags shortlists the closest by
+            meaning; pzk_get_all_tags lists them all) before minting new ones;
             tags are normalized to lowercase-hyphenated form.
 
             Args:
@@ -720,11 +838,19 @@ class ZettelkastenMcpServer:
 
         # Get a note by ID or title
         @self.mcp.tool(name="pzk_get_note")
-        def pzk_get_note(identifier: str) -> str:
+        def pzk_get_note(identifier: str, include_links: bool = False) -> str:
             """Retrieve a note by ID or title.
+
+            The note's ``## Links`` section is omitted by default — it mirrors the
+            link graph and is huge for hub/area notes (one line per member). To see
+            a note's links, use pzk_get_linked_notes or pzk_get_neighborhood, or
+            pass include_links=True here.
+
             Args:
                 identifier: The ID or title of the note (IDs must be copied
                     from prior tool output, never guessed)
+                include_links: Inline the note's ## Links section in the body
+                    (default False to keep area/hub reads small)
             """
             try:
                 identifier = str(identifier)
@@ -734,18 +860,24 @@ class ZettelkastenMcpServer:
                 # Track explicit retrieval (recency/frequency signals for
                 # future recall ranking). Best-effort; never blocks the read.
                 self.zettel_service.record_retrieval([note.id])
-                return self._format_note_result(note)
+                return self._format_note_result(note, bool(include_links))
             except Exception as e:
                 return self.format_error_response(e)
 
         @self.mcp.tool(name="pzk_get_notes")
-        def pzk_get_notes(identifiers: List[str], detail: str = "full") -> str:
+        def pzk_get_notes(
+            identifiers: List[str],
+            detail: str = "full",
+            include_links: bool = False,
+        ) -> str:
             """Retrieve multiple notes by ID or title in one call.
             Args:
                 identifiers: Note IDs or titles to retrieve
                 detail: Output detail — 'full' (default, complete content),
                     'summary' (title/tags/preview), or 'ids' (titles + IDs only).
                     Prefer 'summary' when skimming many notes to save context.
+                include_links: With detail='full', inline each note's ## Links
+                    section (default False to keep area/hub reads small).
             """
             try:
                 detail = str(detail).strip().lower()
@@ -779,7 +911,9 @@ class ZettelkastenMcpServer:
 
                 self.zettel_service.record_retrieval([n.id for n in notes])
                 out = f"Notes retrieved ({len(notes)}/{len(normalized)}):\n\n"
-                out += self._render_notes_with_detail(notes, detail)
+                out += self._render_notes_with_detail(
+                    notes, detail, bool(include_links)
+                )
                 if missing:
                     out += "\n\nMissing identifiers:\n"
                     out += "\n".join(f"- {identifier}" for identifier in missing)
@@ -1237,7 +1371,8 @@ class ZettelkastenMcpServer:
             Call this BEFORE tagging new notes and reuse the closest existing
             tag; only mint a new tag when the concept is genuinely absent.
             New tags are normalized to lowercase-hyphenated form on write
-            (a leading @ for GTD contexts is preserved).
+            (a leading @ for GTD contexts is preserved). For a meaning-based
+            shortlist instead of the full alphabetical list, use pzk_suggest_tags.
             """
             try:
                 tags = self.zettel_service.get_all_tags()
@@ -1251,6 +1386,98 @@ class ZettelkastenMcpServer:
                 for i, tag in enumerate(tags, 1):
                     output += f"{i}. {tag.name}\n"
                 return output
+            except Exception as e:
+                return self.format_error_response(e)
+
+        @self.mcp.tool(name="pzk_suggest_tags")
+        def pzk_suggest_tags(text: str, limit: int = 10) -> str:
+            """Semantic tag search: the existing tags most related to *text*.
+
+            A free-text counterpart to pzk_get_all_tags — instead of scanning the
+            whole alphabetical list, pass a draft note's title/body (or a concept)
+            and get the closest existing tags by MEANING, so you reuse an existing
+            tag rather than minting a near-duplicate. Requires embeddings; falls
+            back to pzk_get_all_tags when they are off.
+
+            Args:
+                text: Text to match tags against (a claim, draft body, or concept).
+                limit: Maximum tags to return (default 10).
+            """
+            try:
+                text = str(text or "").strip()
+                if not text:
+                    return (
+                        "Provide text (a draft note's title/body, or a concept) "
+                        "to find related tags."
+                    )
+                results = self.zettel_service.suggest_tags(
+                    text, limit=max(1, int(limit))
+                )
+                if not results:
+                    if not config.embedding_enabled:
+                        return (
+                            "Semantic tag search needs embeddings enabled. Use "
+                            "pzk_get_all_tags and pick the closest tag by eye."
+                        )
+                    return (
+                        "No tags to suggest yet — the vault has no tags. Mint a "
+                        "concise lowercase-hyphenated tag when you create the note."
+                    )
+                lines = [
+                    f"Tags most related to your text ({len(results)} shown) — "
+                    "reuse the closest; mint a new tag only if the concept is "
+                    "genuinely absent:",
+                    "",
+                ]
+                for i, (name, sim) in enumerate(results, 1):
+                    lines.append(f"{i}. {name}  (similarity {sim:.2f})")
+                return "\n".join(lines)
+            except Exception as e:
+                return self.format_error_response(e)
+
+        @self.mcp.tool(name="pzk_suggest_areas")
+        def pzk_suggest_areas(text: str, limit: int = 5) -> str:
+            """Semantic area search: the PARA areas most related to *text* (routing).
+
+            Pass a draft note's title/body (or a concept) to find the area it most
+            likely belongs under, so a new note is routed to the closest area_id
+            instead of floating unrouted. A free-text counterpart to pzk_list_areas.
+            Requires embeddings; falls back to pzk_list_areas when they are off.
+
+            Args:
+                text: Text to match areas against (a claim, draft body, or concept).
+                limit: Maximum areas to return (default 5).
+            """
+            try:
+                text = str(text or "").strip()
+                if not text:
+                    return (
+                        "Provide text to find the most relevant area(s) to route "
+                        "a note under."
+                    )
+                results = self.zettel_service.suggest_areas(
+                    text, limit=max(1, int(limit))
+                )
+                if not results:
+                    if not config.embedding_enabled:
+                        return (
+                            "Semantic area search needs embeddings enabled. Use "
+                            "pzk_list_areas and pick the area by topic."
+                        )
+                    return (
+                        "No areas to suggest. Create one with pzk_create_area, or "
+                        "see pzk_list_areas."
+                    )
+                lines = [
+                    "Areas most related to your text — route the note to the "
+                    "closest (pass its ID as area_id):",
+                    "",
+                ]
+                for i, (note, sim) in enumerate(results, 1):
+                    lines.append(
+                        f"{i}. {note.title} (ID: {note.id})  similarity {sim:.2f}"
+                    )
+                return "\n".join(lines)
             except Exception as e:
                 return self.format_error_response(e)
 
@@ -2575,6 +2802,10 @@ class ZettelkastenMcpServer:
                 created_notes = skipped_notes = flagged_notes = 0
                 created_tasks = created_links = 0
                 errors = 0
+                # If the dedup reranker wedges mid-batch, dedup is disabled for the
+                # rest: batch dedup is advisory ("create and flag, never block"),
+                # so a broken reranker must not abandon the user's content.
+                dedup_disabled = False
 
                 for idx, item in enumerate(note_items):
                     ref = f"#{idx}"
@@ -2606,11 +2837,29 @@ class ZettelkastenMcpServer:
                                 t.strip() for t in tag_list.split(",") if t.strip()
                             ]
                         do_dedup = bool(item.get("check_duplicates", check_duplicates))
-                        duplicates = (
-                            self._find_duplicate_candidates(title, body)
-                            if do_dedup
-                            else []
-                        )
+                        duplicates: List[Tuple[Note, float]] = []
+                        if do_dedup and not dedup_disabled:
+                            try:
+                                duplicates = self._find_duplicate_candidates(
+                                    title, body
+                                )
+                            except RerankerError as exc:
+                                # Advisory dedup must never abandon the batch: on a
+                                # wedged/broken reranker, disable dedup for the
+                                # remaining items and create the notes anyway,
+                                # warning once.
+                                dedup_disabled = True
+                                logger.warning(
+                                    "Batch dedup disabled mid-run (reranker "
+                                    "unavailable): %s",
+                                    exc,
+                                )
+                                lines.append(
+                                    "NOTE: dedup disabled for the rest of this "
+                                    "batch (reranker unavailable) — remaining "
+                                    "notes created WITHOUT a duplicate check; "
+                                    "re-run a dedup pass later."
+                                )
                         if duplicates and on_duplicate == "skip":
                             existing, score = duplicates[0]
                             refs[ref] = existing.id

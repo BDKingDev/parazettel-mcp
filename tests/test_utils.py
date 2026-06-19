@@ -4,32 +4,84 @@ import logging
 import sys
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from parazettel_mcp.utils import format_note_for_display, parse_tags, setup_logging
 
 
-def test_setup_logging_falls_back_to_info_and_stderr():
-    """Unknown log levels should fall back to INFO and log to stderr."""
-    with patch("parazettel_mcp.utils.logging.basicConfig") as basic_config:
-        setup_logging("not-a-real-level")
+def _restore_root_logging(saved_level: int, saved_handlers: list) -> None:
+    """Close any handlers we added and restore the root logger to its prior state."""
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.FileHandler):
+            handler.close()
+        root.removeHandler(handler)
+    for handler in saved_handlers:
+        root.addHandler(handler)
+    root.setLevel(saved_level)
 
-    kwargs = basic_config.call_args.kwargs
-    assert kwargs["level"] == logging.INFO
-    assert kwargs["stream"] is sys.stderr
-    assert "filename" not in kwargs
+
+def test_setup_logging_falls_back_to_info_and_logs_to_stderr(monkeypatch):
+    """Unknown levels fall back to INFO; stderr is always a handler; no file."""
+    import parazettel_mcp.utils as utils_mod
+
+    monkeypatch.setattr(utils_mod, "_default_log_file", lambda: None)
+    root = logging.getLogger()
+    saved_level, saved_handlers = root.level, list(root.handlers)
+    try:
+        setup_logging("not-a-real-level", enable_faulthandler=False)
+        assert root.level == logging.INFO
+        assert any(
+            isinstance(h, logging.StreamHandler)
+            and not isinstance(h, logging.FileHandler)
+            and getattr(h, "stream", None) is sys.stderr
+            for h in root.handlers
+        )
+        assert not any(isinstance(h, logging.FileHandler) for h in root.handlers)
+    finally:
+        _restore_root_logging(saved_level, saved_handlers)
 
 
-def test_setup_logging_uses_file_handler_when_log_file_is_set():
-    """Supplying a log file should configure basicConfig for file output."""
-    with patch("parazettel_mcp.utils.logging.basicConfig") as basic_config:
-        setup_logging("debug", log_file="parazettel.log")
+def test_setup_logging_adds_file_handler_alongside_stderr(tmp_path):
+    """An explicit log file is added as a FileHandler in addition to stderr."""
+    log_file = tmp_path / "parazettel.log"
+    root = logging.getLogger()
+    saved_level, saved_handlers = root.level, list(root.handlers)
+    try:
+        setup_logging("debug", log_file=str(log_file), enable_faulthandler=False)
+        assert root.level == logging.DEBUG
+        file_handlers = [
+            h for h in root.handlers if isinstance(h, logging.FileHandler)
+        ]
+        assert len(file_handlers) == 1
+        assert any(
+            isinstance(h, logging.StreamHandler)
+            and not isinstance(h, logging.FileHandler)
+            and getattr(h, "stream", None) is sys.stderr
+            for h in root.handlers
+        )
+        logging.getLogger("pzk.test").warning("hello-file-handler")
+        for handler in file_handlers:
+            handler.flush()
+        assert "hello-file-handler" in log_file.read_text(encoding="utf-8")
+    finally:
+        _restore_root_logging(saved_level, saved_handlers)
 
-    kwargs = basic_config.call_args.kwargs
-    assert kwargs["level"] == logging.DEBUG
-    assert kwargs["filename"] == "parazettel.log"
-    assert kwargs["filemode"] == "a"
-    assert "stream" not in kwargs
+
+def test_setup_logging_without_faulthandler_tears_down_prior_install(tmp_path):
+    """Re-initializing without faulthandler must disable it and close its stream."""
+    import parazettel_mcp.utils as utils_mod
+
+    root = logging.getLogger()
+    saved_level, saved_handlers = root.level, list(root.handlers)
+    try:
+        log_file = tmp_path / "fh.log"
+        setup_logging("info", log_file=str(log_file), enable_faulthandler=True)
+        assert utils_mod._faulthandler_stream is not None
+        # Re-init without faulthandler: the prior stream must be torn down, not leaked.
+        setup_logging("info", log_file=str(log_file), enable_faulthandler=False)
+        assert utils_mod._faulthandler_stream is None
+    finally:
+        _restore_root_logging(saved_level, saved_handlers)
 
 
 def test_parse_tags_trims_values_and_skips_empty_entries():
