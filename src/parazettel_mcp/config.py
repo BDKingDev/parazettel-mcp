@@ -43,6 +43,13 @@ DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
 DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+# Execution device for the dedup reranker. Defaults to CPU and is INTENTIONALLY
+# decoupled from embedding_device: the reranker is loaded per-session in each MCP
+# facade, so on CUDA every concurrent (and every orphaned) session stacks another
+# cross-encoder onto the GPU — exhausting an 8 GB card and flapping the embedding
+# path when a new agent spins up. The model is tiny (~80 MB) and only scores <=5
+# short pairs per dedup, so CPU is plenty. Override with PARAZETTEL_DEDUP_RERANK_DEVICE.
+DEFAULT_DEDUP_RERANK_DEVICE = "cpu"
 # Hard ceiling on the cross-encoder's first-use model LOAD (the one unbounded step
 # in the facade — it acquires a filelock on the shared fastembed/HF model cache,
 # which can wedge if a prior process died mid-load). A warm load is ~2s; a cold
@@ -204,6 +211,17 @@ class ZettelkastenConfig(BaseModel):
                 str(DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS),
             )
         )
+    )
+    # Reranker execution device (see DEFAULT_DEDUP_RERANK_DEVICE). Decoupled from
+    # embedding_device on purpose so the per-facade reranker doesn't pile onto the
+    # GPU. PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda' for a single
+    # always-on session).
+    dedup_rerank_device: str = Field(
+        default_factory=lambda: os.getenv(
+            "PARAZETTEL_DEDUP_RERANK_DEVICE", DEFAULT_DEDUP_RERANK_DEVICE
+        )
+        .strip()
+        .lower()
     )
 
     def get_absolute_path(self, path: Path) -> Path:

@@ -203,3 +203,26 @@ def test_build_passes_load_timeout_from_config():
     reranker = build_reranker(cfg)
     assert isinstance(reranker, FastEmbedReranker)
     assert reranker._load_timeout == 12.5
+
+
+def test_build_reranker_defaults_to_cpu_not_embedding_device(monkeypatch):
+    """The per-facade reranker must NOT inherit a GPU embedder's device.
+
+    On CUDA every live or orphaned session stacks another cross-encoder onto the
+    card and flaps the embedding path; the reranker defaults to CPU independently.
+    """
+    monkeypatch.delenv("PARAZETTEL_DEDUP_RERANK_DEVICE", raising=False)
+    cfg = ZettelkastenConfig(embedding_enabled=True, embedding_device="cuda")
+    reranker = build_reranker(cfg)
+    assert isinstance(reranker, FastEmbedReranker)
+    assert reranker._device == "cpu"
+
+
+def test_build_reranker_honors_explicit_rerank_device():
+    """An explicit dedup_rerank_device (e.g. for a single always-on session) wins."""
+    cfg = ZettelkastenConfig(
+        embedding_enabled=True,
+        embedding_device="cuda",
+        dedup_rerank_device="cuda",
+    )
+    assert build_reranker(cfg)._device == "cuda"

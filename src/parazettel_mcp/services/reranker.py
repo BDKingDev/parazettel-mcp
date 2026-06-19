@@ -261,7 +261,10 @@ def build_reranker(config) -> Optional[RerankerProvider]:  # type: ignore[no-unt
     model = (getattr(config, "dedup_rerank_model", "") or "").strip()
     if not model:
         return None
-    device = getattr(config, "embedding_device", "cpu")
+    # The reranker is per-facade, so it must NOT default to the GPU: every live or
+    # orphaned session would stack another cross-encoder onto the card. Its device
+    # is configured independently of the embedder (defaults to CPU).
+    device = (getattr(config, "dedup_rerank_device", "") or "cpu").strip().lower()
     load_timeout = float(
         getattr(config, "dedup_rerank_load_timeout_seconds", 45.0) or 45.0
     )
