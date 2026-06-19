@@ -6,16 +6,19 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Dict, Iterator, Optional
 
 from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
 from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
 from parazettel_mcp.utils import setup_logging
+
+logger = logging.getLogger(__name__)
 
 _DAEMON_START_TIMEOUT_SECONDS = 10.0
 _DAEMON_HEALTH_POLL_INTERVAL_SECONDS = 0.25
@@ -451,6 +454,149 @@ def ensure_daemon_running(args: argparse.Namespace) -> None:
             ) from exc
 
 
+def _resolve_session_host(
+    start_pid: int,
+    ppid_of: Dict[int, int],
+    name_of: Dict[int, str],
+    *,
+    max_depth: int = 12,
+) -> Optional[int]:
+    """Walk parent links up from *start_pid* to the first non-python ancestor.
+
+    An MCP facade is launched python(real) <- python(venv launcher) <- the
+    Claude session host (claude.exe / a shell), so the host is the first ancestor
+    that is not a python process. Returns its PID, or ``None`` when the chain
+    breaks before reaching one — i.e. the process is already orphaned or the host
+    can't be resolved (the caller then just skips the watchdog).
+    """
+    cur = start_pid
+    for _ in range(max_depth):
+        parent = ppid_of.get(cur)
+        if not parent or parent not in name_of:
+            return None
+        if not name_of[parent].startswith("python"):
+            return parent
+        cur = parent
+    return None
+
+
+def _snapshot_processes_windows():  # pragma: no cover - Windows-only, ctypes
+    """Return ({pid: ppid}, {pid: exe_name_lower}) from the Toolhelp snapshot."""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.Process32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    k32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    ppid_of: Dict[int, int] = {}
+    name_of: Dict[int, str] = {}
+    snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap:
+        return ppid_of, name_of
+    try:
+        entry = PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if not k32.Process32First(snap, ctypes.byref(entry)):
+            return ppid_of, name_of
+        while True:
+            pid = int(entry.th32ProcessID)
+            ppid_of[pid] = int(entry.th32ParentProcessID)
+            name_of[pid] = entry.szExeFile.decode("ascii", "ignore").lower()
+            if not k32.Process32Next(snap, ctypes.byref(entry)):
+                break
+    finally:
+        k32.CloseHandle(snap)
+    return ppid_of, name_of
+
+
+def _start_parent_death_watchdog() -> None:
+    """Self-exit this MCP facade when its Claude session host process dies.
+
+    Claude spawns the facade and should close our stdin when the session ends —
+    but if that EOF is ever missed, the facade lingers as an orphan holding memory
+    and OS handles. This is a hard backstop: a daemon thread waits on the session
+    host and force-exits the instant it disappears, so orphans never accumulate
+    between restart-script reaps. Best-effort and silent on failure (the reap
+    remains the fallback). Only the per-session facade calls this; the daemon is
+    intentionally detached from its launcher and must NOT self-exit.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            ppid_of, name_of = _snapshot_processes_windows()
+            host_pid = _resolve_session_host(os.getpid(), ppid_of, name_of)
+            if not host_pid:
+                return
+            SYNCHRONIZE = 0x00100000
+            INFINITE = 0xFFFFFFFF
+            k32 = ctypes.windll.kernel32
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.WaitForSingleObject.restype = wintypes.DWORD
+            k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            # A handle to the host's process OBJECT stays valid after it exits and
+            # is immune to PID recycling (it refers to the original process).
+            handle = k32.OpenProcess(SYNCHRONIZE, False, host_pid)
+            if not handle:
+                return
+
+            def _wait() -> None:
+                k32.WaitForSingleObject(handle, INFINITE)
+                logger.warning(
+                    "Claude session host (PID %s) exited; shutting down this MCP "
+                    "facade to avoid orphaning it.",
+                    host_pid,
+                )
+                os._exit(0)
+
+            threading.Thread(
+                target=_wait, name="pzk-parent-watchdog", daemon=True
+            ).start()
+        else:
+            start_ppid = os.getppid()
+            if start_ppid <= 1:
+                return
+
+            def _poll() -> None:
+                # On POSIX a dead parent reparents us (getppid -> 1 / a subreaper).
+                while True:
+                    time.sleep(5.0)
+                    if os.getppid() != start_ppid:
+                        logger.warning(
+                            "Parent process exited; shutting down this MCP facade "
+                            "to avoid orphaning it."
+                        )
+                        os._exit(0)
+
+            threading.Thread(
+                target=_poll, name="pzk-parent-watchdog", daemon=True
+            ).start()
+    except Exception as exc:  # pragma: no cover - best-effort backstop
+        logger.debug("Parent-death watchdog not started: %s", exc)
+
+
 def main():
     """Run the Zettelkasten MCP server."""
     args = parse_args()
@@ -511,6 +657,10 @@ def main():
             if config.backend_mode == "daemon":
                 ensure_daemon_running(args)
             logger.info("Starting Zettelkasten MCP server")
+            # Self-terminate if the Claude session that spawned this facade dies,
+            # so it never lingers as an orphan (the restart-script reap is the
+            # backstop). Facade-only — never the detached daemon.
+            _start_parent_death_watchdog()
             server = ZettelkastenMcpServer()
             server.run(config.server_transport)
     except Exception as e:
