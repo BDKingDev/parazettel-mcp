@@ -321,24 +321,38 @@ class ParazettelDaemonServer:
         # Bind first (cheap; fails fast if another daemon owns the port) so a
         # loser does not pay the service-init cost before discovering it lost.
         self.bind()
-        self.initialize()
-        self._closed = False
-        self._shutdown_event.clear()
-        self._mark_activity()
-        self._start_idle_monitor()
-        logger.info("Starting Parazettel daemon at %s", self.base_url)
         try:
+            self.initialize()
+            self._closed = False
+            self._shutdown_event.clear()
+            self._mark_activity()
+            self._start_idle_monitor()
+            logger.info("Starting Parazettel daemon at %s", self.base_url)
             self._httpd.serve_forever()
+        except BaseException:
+            # Warmup (initialize) or serving failed: don't leave the port bound
+            # but dead — otherwise callers/tests would see a live-looking
+            # server_address for a server that never ran. Close + clear it.
+            self._close_socket()
+            raise
         finally:
             self.close()
+
+    def _close_socket(self) -> None:
+        """Close the listening socket and clear the handle (best-effort)."""
+        if self._httpd is not None:
+            try:
+                self._httpd.server_close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                pass
+            self._httpd = None
 
     def shutdown(self) -> None:
         """Stop the running HTTP server."""
         self._shutdown_event.set()
         if self._httpd is not None:
             self._httpd.shutdown()
-            self._httpd.server_close()
-            self._httpd = None
+            self._close_socket()
         self.close()
 
     def close(self) -> None:

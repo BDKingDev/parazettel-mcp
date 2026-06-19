@@ -555,6 +555,23 @@ def test_second_daemon_loses_the_port_race():
             first._httpd.server_close()
 
 
+def test_serve_forever_closes_socket_if_initialize_fails():
+    """A warmup failure must close the bound socket, not leave a dead listener.
+
+    serve_forever() binds before initialize(); if initialize() raises, the
+    socket must be closed and the handle cleared so callers/tests can't observe
+    a live-looking server_address for a server that never started serving.
+    """
+    zs = MagicMock()
+    zs.initialize.side_effect = RuntimeError("warmup boom")
+    daemon = ParazettelDaemonServer(
+        "127.0.0.1", 0, zettel_service=zs, search_service=MagicMock()
+    )
+    with pytest.raises(RuntimeError, match="warmup boom"):
+        daemon.serve_forever()
+    assert daemon._httpd is None  # socket closed + handle cleared on the failure path
+
+
 def test_daemon_bind_is_idempotent(test_config):
     """Calling bind() twice keeps the same bound socket (serve_forever re-calls
     it after main already bound)."""
