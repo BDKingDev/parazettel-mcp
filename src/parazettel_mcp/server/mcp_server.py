@@ -156,6 +156,26 @@ class DirectBackendBundle:
         self.zettel_service.close()
 
 
+def _ensure_daemon_running() -> bool:
+    """(Re)start the daemon for a mid-session RPC retry; True if it is up after.
+
+    The daemon can idle-shut-down or recycle itself (memory ceiling) between
+    requests; without this an existing session's next tool call would fail and
+    need a manual restart. Imports main lazily to avoid an import cycle (main
+    imports this module).
+    """
+    try:
+        import argparse
+
+        from parazettel_mcp import main as _main
+
+        _main.ensure_daemon_running(argparse.Namespace(log_level="INFO"))
+        return True
+    except Exception as exc:  # pragma: no cover - best-effort recovery
+        logger.warning("Auto-restart of the Parazettel daemon failed: %s", exc)
+        return False
+
+
 class DaemonBackendBundle:
     """Thin MCP bundle that proxies service calls through the local daemon."""
 
@@ -163,8 +183,12 @@ class DaemonBackendBundle:
         self.health_client = DaemonRpcClient(
             base_url, timeout_seconds=_DAEMON_HEALTH_TIMEOUT_SECONDS
         )
+        # Tool-call RPCs auto-(re)start a recycled / idle-stopped daemon and retry
+        # once, so a mid-session recycle is transparent to the caller.
         self.rpc_client = DaemonRpcClient(
-            base_url, timeout_seconds=config.daemon_rpc_timeout_seconds
+            base_url,
+            timeout_seconds=config.daemon_rpc_timeout_seconds,
+            on_unavailable=_ensure_daemon_running,
         )
         self.zettel_service = RemoteServiceProxy(self.rpc_client, "zettel_service")
         self.search_service = RemoteServiceProxy(self.rpc_client, "search_service")

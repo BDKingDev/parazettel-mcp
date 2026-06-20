@@ -98,6 +98,91 @@ def test_daemon_rejects_non_loopback_bind():
         ParazettelDaemonServer("0.0.0.0", 8766)
 
 
+class _FakeHealthResponse:
+    """Minimal context-manager response with a health-shaped JSON body."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"ok": true, "version": "test"}'
+
+
+def test_rpc_recovers_via_on_unavailable_then_retries(monkeypatch):
+    """A first connection failure triggers one (re)start + retry, then succeeds."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise urlerror.URLError("connection refused")
+        return _FakeHealthResponse()
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    result = client.health()
+
+    assert result["ok"] is True
+    assert state["restarts"] == 1  # restarted exactly once
+    assert state["calls"] == 2  # original request + one retry
+
+
+def test_rpc_without_callback_raises_immediately(monkeypatch):
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise urlerror.URLError("down")
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+    client = DaemonRpcClient("http://127.0.0.1:8766")  # no on_unavailable
+
+    with pytest.raises(DaemonUnavailableError):
+        client.health()
+    assert calls["n"] == 1  # no retry without a restart callback
+
+
+def test_rpc_retries_only_once_then_gives_up(monkeypatch):
+    """If the daemon stays down, retry exactly once — never loop forever."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        raise urlerror.URLError("still down")
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with pytest.raises(DaemonUnavailableError):
+        client.health()
+    assert state["restarts"] == 1
+    assert state["calls"] == 2  # original + a single retry
+
+
 def _create_area(client: DaemonRpcClient) -> Note:
     """Create a valid area for routing daemon-created notes."""
     return client.call(
@@ -520,7 +605,7 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
     mock_mcp.tool = fake_tool_decorator
 
     class FakeClient:
-        def __init__(self, base_url: str, timeout_seconds: float = 5.0):
+        def __init__(self, base_url: str, timeout_seconds: float = 5.0, **kwargs):
             client_calls.append((base_url, timeout_seconds))
 
         def health(self):
