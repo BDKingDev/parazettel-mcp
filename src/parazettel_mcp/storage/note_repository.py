@@ -323,9 +323,9 @@ class NoteRepository(Repository[Note]):
         # Cache of FTS term -> document frequency, used to prune corpus-common
         # (negative-IDF) terms from long text queries before they reach Kuzu's
         # BM25 — otherwise a dense vault's common domain words sink the best
-        # match's net score to <=0 and Kuzu drops it. Cleared on rebuild; small
-        # DF drift between rebuilds never flips the "term is in most of the
-        # corpus?" decision, so staleness is harmless.
+        # match's net score to <=0 and Kuzu drops it. Invalidated on every
+        # create/update/delete and on rebuild (see _invalidate_fts_term_df_cache)
+        # so a term's DF is never stale across a corpus change.
         self._fts_term_df_cache: Dict[str, int] = {}
         self._open_graph_db(allow_rebuild_if_needed=True)
 
@@ -2040,17 +2040,38 @@ class NoteRepository(Repository[Note]):
     def _term_document_frequency(self, conn: kuzu.Connection, term: str) -> int:
         """Number of notes whose indexed text contains *term* (cached per term).
 
-        A single-term FTS query returns exactly the notes containing it, so its
-        result count is the document frequency. Only computed for long queries
-        (see :meth:`_focus_query_terms`) and cached, so the per-term cost is paid
-        at most once per distinct term between rebuilds.
+        COUNTs the FTS matches rather than materializing the id list: a common
+        term (the exact case long-query pruning targets) matches thousands of
+        notes, and building/transferring that list per term per query is wasteful.
+        Cached and invalidated on writes, so the cost is paid at most once per
+        distinct term between corpus changes.
         """
         cached = self._fts_term_df_cache.get(term)
         if cached is not None:
             return cached
-        df = len(self._query_fts_index(conn, "note_text_fts", term))
+        # Reduce to word tokens (FTS-parser safety) before counting; a single
+        # \w+ token is already safe but normalize for robustness.
+        normalized = " ".join(re.findall(r"\w+", term or ""))
+        df = 0
+        if normalized:
+            with conn.execute(
+                "CALL QUERY_FTS_INDEX('Note', 'note_text_fts', $q) RETURN count(*) AS df",
+                {"q": normalized},
+            ) as result:
+                if result.has_next():
+                    df = int(result.get_next()[0])
         self._fts_term_df_cache[term] = df
         return df
+
+    def _invalidate_fts_term_df_cache(self) -> None:
+        """Drop cached term document frequencies after a corpus change.
+
+        A note create/update/delete shifts DFs; without this a term cached as 0
+        (non-occurring) stays dropped from a long query's term budget after it
+        first appears, and a now-common term cached low escapes pruning — both
+        until the next rebuild. Cheap (the cache is small), so just clear it.
+        """
+        self._fts_term_df_cache.clear()
 
     def _focus_query_terms(self, conn: kuzu.Connection, query: str) -> str:
         """Reduce a long text FTS query to its most discriminative (lowest-DF) terms.
@@ -2174,6 +2195,7 @@ class NoteRepository(Repository[Note]):
     def create(self, note: Note) -> Note:
         """Create a new note."""
         self._assert_writable()
+        self._invalidate_fts_term_df_cache()
         if not note.id:
             from parazettel_mcp.models.schema import generate_id
 
@@ -2283,6 +2305,7 @@ class NoteRepository(Repository[Note]):
         existing_links_source: Optional[Note] = None,
     ) -> Note:
         """Internal update implementation."""
+        self._invalidate_fts_term_df_cache()
         if existing_note is None:
             existing_note = self.get(note.id)
         if not existing_note:
@@ -2323,6 +2346,7 @@ class NoteRepository(Repository[Note]):
         dangling reference remains.
         """
         self._assert_writable()
+        self._invalidate_fts_term_df_cache()
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             raise ValueError(f"Note with ID {id} does not exist")

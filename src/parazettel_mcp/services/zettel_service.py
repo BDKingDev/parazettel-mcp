@@ -115,7 +115,19 @@ class ZettelService:
             return
         started = time.perf_counter()
         logger.info("dedup reranker: pre-warming model on startup thread...")
-        if prewarm():
+        # FastEmbedReranker.prewarm() already swallows its own errors, but an
+        # alternate RerankerProvider (or a test double) might not — and a raise
+        # here would abort daemon startup with _initialized already flipped, so
+        # honour the "never raises" contract for ANY provider.
+        try:
+            warmed = prewarm()
+        except Exception as exc:  # noqa: BLE001 - startup must survive a bad pre-warm
+            logger.warning(
+                "dedup reranker: pre-warm raised (%s) — falling back to lazy load",
+                exc,
+            )
+            return
+        if warmed:
             logger.info(
                 "dedup reranker: pre-warm complete in %.2fs",
                 time.perf_counter() - started,

@@ -112,6 +112,32 @@ def test_df_zero_terms_do_not_consume_the_budget(note_repository, monkeypatch):
     assert not (set(padding.split()) & kept)  # no DF-0 padding survives
 
 
+def test_writes_invalidate_the_df_cache(note_repository):
+    """create / update / delete drop cached term DFs so none go stale.
+
+    Guards CodeRabbit's case: a term cached as DF 0 must not stay dropped from a
+    long query's term budget after the corpus changes.
+    """
+    repo = note_repository
+    note = repo.create(
+        Note(title="seed", content="seed body text", note_type=NoteType.PERMANENT)
+    )
+
+    repo._fts_term_df_cache["poison"] = 999
+    repo.update(note)
+    assert "poison" not in repo._fts_term_df_cache  # update cleared it
+
+    repo._fts_term_df_cache["poison"] = 999
+    repo.create(
+        Note(title="another", content="more body text", note_type=NoteType.PERMANENT)
+    )
+    assert "poison" not in repo._fts_term_df_cache  # create cleared it
+
+    repo._fts_term_df_cache["poison"] = 999
+    repo.delete(note.id)
+    assert "poison" not in repo._fts_term_df_cache  # delete cleared it
+
+
 def test_long_common_query_still_finds_the_distinctive_note(note_repository):
     """End-to-end: a long query whose rare terms are buried still surfaces them."""
     repo = note_repository
