@@ -14,6 +14,7 @@ from parazettel_mcp.services.reranker import (
     RerankerLoadTimeoutError,
     RerankerProvider,
     build_reranker,
+    reranker_enabled,
 )
 
 
@@ -247,6 +248,95 @@ def test_missing_fastembed_raises_reranker_error(monkeypatch):
             reranker._load_thread.join(timeout=5)
 
 
+def test_prewarm_loads_synchronously_without_a_worker_thread(monkeypatch):
+    """prewarm() builds the model on the CALLING thread (no load worker spawned).
+
+    This is the deadlock-safe path: importing fastembed's C-extensions must
+    happen on the main thread at startup, NOT on the worker thread _ensure_model
+    spawns (which deadlocks on the Windows loader lock inside a live facade).
+    """
+    captured = {}
+    _fake_cross_encoder(monkeypatch, captured, [1.0, 2.0])
+
+    reranker = FastEmbedReranker("m", device="cpu")
+    assert reranker.prewarm() is True
+    assert reranker._model is not None
+    # No background load was used — the model was built inline on this thread.
+    assert reranker._load_thread is None
+    assert reranker._load_future is None
+    # A subsequent score reuses the pre-warmed model (the fake records the call).
+    assert reranker.score("q", ["a", "b"]) == [1.0, 2.0]
+    assert captured["init"].get("providers") == ["CPUExecutionProvider"]
+
+
+def test_prewarm_is_idempotent(monkeypatch):
+    """A second prewarm() is a no-op once the model is loaded."""
+    captured = {"builds": 0}
+
+    class FakeCrossEncoder:
+        def __init__(self, **kwargs):
+            captured["builds"] += 1
+
+        def rerank(self, query, documents):
+            return [0.0 for _ in documents]
+
+    fastembed = types.ModuleType("fastembed")
+    fastembed.__path__ = []
+    rerank = types.ModuleType("fastembed.rerank")
+    rerank.__path__ = []
+    cross_encoder = types.ModuleType("fastembed.rerank.cross_encoder")
+    cross_encoder.TextCrossEncoder = FakeCrossEncoder
+    fastembed.rerank = rerank
+    rerank.cross_encoder = cross_encoder
+    monkeypatch.setitem(sys.modules, "fastembed", fastembed)
+    monkeypatch.setitem(sys.modules, "fastembed.rerank", rerank)
+    monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", cross_encoder)
+
+    reranker = FastEmbedReranker("m", device="cpu")
+    assert reranker.prewarm() is True
+    assert reranker.prewarm() is True
+    assert captured["builds"] == 1  # built exactly once
+
+
+def test_prewarm_returns_false_on_failure_without_raising(monkeypatch):
+    """A failed pre-warm logs and returns False — startup must not crash."""
+    for name in list(sys.modules):
+        if name == "fastembed" or name.startswith("fastembed."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(
+        FastEmbedReranker, "_preload_cuda_dlls", staticmethod(lambda: None)
+    )
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_fastembed(name, *args, **kwargs):
+        if name == "fastembed" or name.startswith("fastembed."):
+            raise ImportError("fastembed not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_fastembed)
+
+    reranker = FastEmbedReranker("m", device="cpu")
+    assert reranker.prewarm() is False  # does not raise
+    assert reranker._model is None  # left unloaded for a later lazy attempt
+
+
+def test_reranker_enabled_matches_build_reranker():
+    """reranker_enabled mirrors build_reranker's on/off decision, without building."""
+    assert reranker_enabled(ZettelkastenConfig(embedding_enabled=False)) is False
+    assert (
+        reranker_enabled(
+            ZettelkastenConfig(embedding_enabled=True, dedup_rerank_model="")
+        )
+        is False
+    )
+    on = ZettelkastenConfig(embedding_enabled=True, dedup_rerank_model="x/model")
+    assert reranker_enabled(on) is True
+    assert (build_reranker(on) is not None) == reranker_enabled(on)
+
+
 def test_build_passes_load_timeout_from_config():
     cfg = ZettelkastenConfig(
         embedding_enabled=True, dedup_rerank_load_timeout_seconds=12.5
@@ -257,10 +347,10 @@ def test_build_passes_load_timeout_from_config():
 
 
 def test_build_reranker_defaults_to_cpu_not_embedding_device(monkeypatch):
-    """The per-facade reranker must NOT inherit a GPU embedder's device.
+    """The dedup reranker must NOT inherit a GPU embedder's device.
 
-    On CUDA every live or orphaned session stacks another cross-encoder onto the
-    card and flaps the embedding path; the reranker defaults to CPU independently.
+    It defaults to CPU independently of the embedder so the small cross-encoder
+    (run only on the <=5 BM25 candidates) leaves the card to the embedder.
     """
     monkeypatch.delenv("PARAZETTEL_DEDUP_RERANK_DEVICE", raising=False)
     cfg = ZettelkastenConfig(

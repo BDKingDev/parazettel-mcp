@@ -4,11 +4,13 @@ import datetime
 import logging
 import re
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from parazettel_mcp.config import config
+from parazettel_mcp.services.reranker import RerankerError, build_reranker
 from parazettel_mcp.models.schema import (
     Link,
     LinkType,
@@ -61,6 +63,16 @@ class ZettelService:
         # helper that also rewrites the parent) without self-deadlocking, and it
         # blocks (queues) rather than failing, so overlapping callers run in turn.
         self._write_lock = threading.RLock()
+        # The dedup cross-encoder lives HERE, in the data-owning service, not in
+        # every per-session facade. In daemon mode that means it is built once and
+        # the facade reaches it over RPC (:meth:`rerank`) instead of importing
+        # fastembed itself — a facade that imports fastembed's C-extensions on its
+        # worker thread deadlocks on the Windows loader lock. Built cheaply here
+        # (no model load); loaded eagerly on the main thread in :meth:`initialize`.
+        self._reranker = build_reranker(config)
+        # initialize() is idempotent: the daemon calls it AND SearchService.initialize
+        # forwards to the same shared instance, so the pre-warm must run once only.
+        self._initialized = False
 
     @contextmanager
     def _write_locked(self) -> Iterator[None]:
@@ -75,10 +87,68 @@ class ZettelService:
             yield
 
     def initialize(self) -> None:
-        """Initialize the service and dependencies."""
-        # Nothing to do here for synchronous implementation
-        # The repository is initialized in its constructor
-        pass
+        """Initialize the service and dependencies (idempotent).
+
+        The repository is initialized in its constructor; the only work here is
+        pre-warming the dedup reranker on THIS (startup) thread. Guarded so the
+        daemon's call and SearchService's forwarded call don't pre-warm twice.
+        """
+        if self._initialized:
+            return
+        self._initialized = True
+        self._prewarm_reranker()
+
+    def _prewarm_reranker(self) -> None:
+        """Load the dedup cross-encoder eagerly, on the startup/main thread.
+
+        Must run on the main thread, before the daemon spawns request-handler
+        threads (or, in direct mode, before the facade's asyncio loop starts):
+        fastembed's C-extension import deadlocks on the Windows loader lock when
+        it first runs on a worker thread of an already-multi-threaded process.
+        No-op when the reranker is disabled; never raises (a failed pre-warm logs
+        and leaves the lazy load as a fallback).
+        """
+        if self._reranker is None:
+            return
+        prewarm = getattr(self._reranker, "prewarm", None)
+        if prewarm is None:  # a provider without eager-load support
+            return
+        started = time.perf_counter()
+        logger.info("dedup reranker: pre-warming model on startup thread...")
+        # FastEmbedReranker.prewarm() already swallows its own errors, but an
+        # alternate RerankerProvider (or a test double) might not — and a raise
+        # here would abort daemon startup with _initialized already flipped, so
+        # honour the "never raises" contract for ANY provider.
+        try:
+            warmed = prewarm()
+        except BaseException as exc:  # noqa: BLE001 - startup must survive a bad pre-warm
+            logger.warning(
+                "dedup reranker: pre-warm raised (%s) — falling back to lazy load",
+                exc,
+            )
+            return
+        if warmed:
+            logger.info(
+                "dedup reranker: pre-warm complete in %.2fs",
+                time.perf_counter() - started,
+            )
+
+    def rerank(self, query: str, documents: List[str]) -> List[float]:
+        """Score each document against *query* with the dedup cross-encoder.
+
+        The reranker is owned by this service so the heavy model loads ONCE in
+        this process (pre-warmed on the main thread). In daemon mode the facade
+        invokes this over RPC instead of importing fastembed itself. Raises
+        :class:`RerankerError` when the reranker is not configured here, or when
+        the load/scoring fails — the caller surfaces that loudly rather than
+        silently degrading dedup.
+        """
+        if self._reranker is None:
+            raise RerankerError(
+                "dedup reranker is not configured on this server "
+                "(embeddings disabled or no PARAZETTEL_DEDUP_RERANK_MODEL set)"
+            )
+        return self._reranker.score(query, list(documents))
 
     @staticmethod
     def _normalize_tags(tags: Optional[List[str]]) -> List[Tag]:

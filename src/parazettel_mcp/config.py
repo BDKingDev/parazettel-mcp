@@ -43,6 +43,11 @@ DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
 DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
+# Max distinct terms kept in a text FTS query. A long query with many moderately
+# common terms makes Kuzu's FTS match most of the corpus and drop even the best
+# match; reducing to the K lowest-DF (most discriminative) terms bounds the match
+# set so the best lexical hit stays findable. Only long queries are reduced.
+DEFAULT_FTS_MAX_QUERY_TERMS = 12
 # Execution device for the dedup reranker. Defaults to CPU and is INTENTIONALLY
 # decoupled from embedding_device: the reranker is loaded per-session in each MCP
 # facade, so on CUDA every concurrent (and every orphaned) session stacks another
@@ -201,6 +206,17 @@ class ZettelkastenConfig(BaseModel):
     # (dedup falls back to the BM25 prefilter alone).
     dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
     dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
+    # Reduce a long text FTS query to its K most discriminative (lowest-DF) terms
+    # so it doesn't match most of the corpus and drop its best lexical hit. 0
+    # disables reduction. See DEFAULT_FTS_MAX_QUERY_TERMS.
+    fts_max_query_terms: int = Field(
+        default=int(
+            os.getenv(
+                "PARAZETTEL_FTS_MAX_QUERY_TERMS",
+                str(DEFAULT_FTS_MAX_QUERY_TERMS),
+            )
+        )
+    )
     # Timeout on the reranker's first-use model load (see
     # DEFAULT_DEDUP_RERANK_LOAD_TIMEOUT_SECONDS). On timeout the dedup probe raises
     # rather than hanging, so note creation fails loudly instead of silently.
@@ -213,9 +229,9 @@ class ZettelkastenConfig(BaseModel):
         )
     )
     # Reranker execution device (see DEFAULT_DEDUP_RERANK_DEVICE). Decoupled from
-    # embedding_device on purpose so the per-facade reranker doesn't pile onto the
-    # GPU. PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda' for a single
-    # always-on session).
+    # embedding_device so the dedup cross-encoder defaults to CPU and leaves the
+    # GPU to the embedder (the reranker is tiny — it runs only on the <=5 BM25
+    # candidates). PARAZETTEL_DEDUP_RERANK_DEVICE overrides it (e.g. 'cuda').
     dedup_rerank_device: str = Field(
         default_factory=lambda: os.getenv(
             "PARAZETTEL_DEDUP_RERANK_DEVICE", DEFAULT_DEDUP_RERANK_DEVICE

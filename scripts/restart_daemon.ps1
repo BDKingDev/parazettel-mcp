@@ -129,9 +129,10 @@ Set-DefaultEnv "PARAZETTEL_EMBEDDING_MODEL"    "mixedbread-ai/mxbai-embed-large-
 Set-DefaultEnv "PARAZETTEL_EMBEDDING_DIM"      "1024"
 Set-DefaultEnv "PARAZETTEL_EMBEDDING_METRIC"   "cosine"
 Set-DefaultEnv "PARAZETTEL_EMBEDDING_DEVICE"   "cuda"
-# Keep the per-facade dedup reranker on CPU so concurrent/orphaned sessions never
-# stack cross-encoders onto the GPU (the embedding-flap cause); the embedder above
-# keeps the card to itself. Override only for a single always-on session.
+# Keep the dedup reranker on CPU so the embedder keeps the GPU to itself. The
+# reranker now lives once in the daemon (not per-session), so this is no longer
+# about preventing GPU-flap from stacked sessions — but the cross-encoder is tiny
+# (runs only on the <=5 BM25 candidates), so CPU stays the sensible default.
 Set-DefaultEnv "PARAZETTEL_DEDUP_RERANK_DEVICE" "cpu"
 Set-DefaultEnv "FASTEMBED_CACHE_PATH"        (Join-Path $repo "data\fastembed_cache")
 

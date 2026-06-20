@@ -83,6 +83,7 @@ _EMBED_LOG_CHUNK = 200
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
 
+
 # Brute-force distance expressions (lower = closer) matching each HNSW metric, so
 # the fallback's ordering is consistent with the index instead of always cosine.
 _BRUTE_FORCE_DISTANCE = {
@@ -319,6 +320,13 @@ class NoteRepository(Repository[Note]):
         # (the default), in which case all embedding code paths are skipped and
         # behaviour is unchanged. Built from config once; the model loads lazily.
         self._embedding_provider = build_embedding_provider(config)
+        # Cache of FTS term -> document frequency, used to prune corpus-common
+        # (negative-IDF) terms from long text queries before they reach Kuzu's
+        # BM25 — otherwise a dense vault's common domain words sink the best
+        # match's net score to <=0 and Kuzu drops it. Invalidated on every
+        # create/update/delete and on rebuild (see _invalidate_fts_term_df_cache)
+        # so a term's DF is never stale across a corpus change.
+        self._fts_term_df_cache: Dict[str, int] = {}
         self._open_graph_db(allow_rebuild_if_needed=True)
 
     def close(self) -> None:
@@ -656,6 +664,8 @@ class NoteRepository(Repository[Note]):
         # Reset up front so a failure before parsing completes (e.g. during backup
         # creation), or a concurrent reader, never sees a previous rebuild's list.
         self.last_rebuild_skipped = []
+        # The corpus is changing, so cached term document frequencies are stale.
+        self._fts_term_df_cache.clear()
         backup_path = self._create_graph_backup()
 
         # Snapshot retrieval signals from the live graph: they exist only in the
@@ -2027,6 +2037,75 @@ class NoteRepository(Repository[Note]):
             )
         ]
 
+    def _term_document_frequency(self, conn: kuzu.Connection, term: str) -> int:
+        """Number of notes whose indexed text contains *term* (cached per term).
+
+        COUNTs the FTS matches rather than materializing the id list: a common
+        term (the exact case long-query pruning targets) matches thousands of
+        notes, and building/transferring that list per term per query is wasteful.
+        Cached and invalidated on writes, so the cost is paid at most once per
+        distinct term between corpus changes.
+        """
+        cached = self._fts_term_df_cache.get(term)
+        if cached is not None:
+            return cached
+        # Reduce to word tokens (FTS-parser safety) before counting; a single
+        # \w+ token is already safe but normalize for robustness.
+        normalized = " ".join(re.findall(r"\w+", term or ""))
+        df = 0
+        if normalized:
+            with conn.execute(
+                "CALL QUERY_FTS_INDEX('Note', 'note_text_fts', $q) RETURN count(*) AS df",
+                {"q": normalized},
+            ) as result:
+                if result.has_next():
+                    df = int(result.get_next()[0])
+        self._fts_term_df_cache[term] = df
+        return df
+
+    def _invalidate_fts_term_df_cache(self) -> None:
+        """Drop cached term document frequencies after a corpus change.
+
+        A note create/update/delete shifts DFs; without this a term cached as 0
+        (non-occurring) stays dropped from a long query's term budget after it
+        first appears, and a now-common term cached low escapes pruning — both
+        until the next rebuild. Cheap (the cache is small), so just clear it.
+        """
+        self._fts_term_df_cache.clear()
+
+    def _focus_query_terms(self, conn: kuzu.Connection, query: str) -> str:
+        """Reduce a long text FTS query to its most discriminative (lowest-DF) terms.
+
+        A long query with many moderately-common terms makes Kuzu's FTS match a
+        large fraction of the corpus and drop even the BEST match (empirically a
+        query of ~18+ distinct corpus terms in a dense vault drops the true near-
+        duplicate to a 0 score). Keeping only the ``fts_max_query_terms`` lowest-DF
+        (highest-IDF) terms bounds the match set so the best lexical hit stays
+        findable. Short/narrow queries are untouched and pay no DF cost; the vector
+        half of hybrid search still embeds the FULL query, so semantic recall is
+        unchanged.
+        """
+        max_terms = config.fts_max_query_terms
+        if max_terms <= 0:
+            return query
+        tokens = re.findall(r"\w+", query or "")
+        unique = list(dict.fromkeys(t.lower() for t in tokens))
+        if len(unique) <= max_terms:
+            return query  # already narrow enough — no DF lookups needed
+        df = {t: self._term_document_frequency(conn, t) for t in unique}
+        # Keep the most discriminative terms that actually occur (df >= 1): a df-0
+        # term matches nothing, so it can never help and must not consume budget.
+        occurring = sorted((t for t in unique if df[t] >= 1), key=lambda t: df[t])
+        keep = set(occurring[:max_terms])
+        if not keep:
+            return query  # nothing occurs in the corpus — leave the query as-is
+        logger.debug(
+            "FTS query focused to %d of %d distinct terms (lowest DF)",
+            len(keep),
+            len(unique),
+        )
+        return " ".join(t for t in tokens if t.lower() in keep)
+
     def text_fts_scores(self, text: str) -> Dict[str, float]:
         """Return {note_id: BM25 score} for *text* against the combined note index.
 
@@ -2081,8 +2160,12 @@ class NoteRepository(Repository[Note]):
 
         text_query = kwargs.get("text")
         if isinstance(text_query, str):
+            # Reduce a long query to its most discriminative terms so it doesn't
+            # match most of the corpus and drop its best lexical hit to a 0 score.
             ordered_scored.append(
-                self._query_fts_index_scored(conn, "note_text_fts", text_query)
+                self._query_fts_index_scored(
+                    conn, "note_text_fts", self._focus_query_terms(conn, text_query)
+                )
             )
 
         title_query = kwargs.get("title")
@@ -2112,6 +2195,7 @@ class NoteRepository(Repository[Note]):
     def create(self, note: Note) -> Note:
         """Create a new note."""
         self._assert_writable()
+        self._invalidate_fts_term_df_cache()
         if not note.id:
             from parazettel_mcp.models.schema import generate_id
 
@@ -2221,6 +2305,7 @@ class NoteRepository(Repository[Note]):
         existing_links_source: Optional[Note] = None,
     ) -> Note:
         """Internal update implementation."""
+        self._invalidate_fts_term_df_cache()
         if existing_note is None:
             existing_note = self.get(note.id)
         if not existing_note:
@@ -2261,6 +2346,7 @@ class NoteRepository(Repository[Note]):
         dangling reference remains.
         """
         self._assert_writable()
+        self._invalidate_fts_term_df_cache()
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             raise ValueError(f"Note with ID {id} does not exist")

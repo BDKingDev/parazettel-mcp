@@ -154,6 +154,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "find_similar_to_text",
         "suggest_tags",
         "suggest_areas",
+        "rerank",
         "record_retrieval",
         "get_retrieval_signals",
         "create_task",

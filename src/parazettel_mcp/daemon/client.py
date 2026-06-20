@@ -8,6 +8,7 @@ from urllib import error, request
 
 from parazettel_mcp.daemon.codec import decode_value, encode_value
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.services.reranker import RerankerError, RerankerLoadTimeoutError
 
 
 class DaemonUnavailableError(RuntimeError):
@@ -16,6 +17,11 @@ class DaemonUnavailableError(RuntimeError):
 
 ERROR_REGISTRY = {
     "GraphDatabaseReadOnlyError": GraphDatabaseReadOnlyError,
+    # The dedup reranker now runs in the daemon; relay its failures back to the
+    # facade as the SAME type so _rerank_confirm / ingest_batch can recognize and
+    # surface them (a wedged/failed rerank must fail loud, not silently degrade).
+    "RerankerError": RerankerError,
+    "RerankerLoadTimeoutError": RerankerLoadTimeoutError,
     "RuntimeError": RuntimeError,
     "ValueError": ValueError,
     "FileNotFoundError": FileNotFoundError,

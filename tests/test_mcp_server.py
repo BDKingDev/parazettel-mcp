@@ -37,6 +37,9 @@ class TestMcpServer:
         # Mock the ZettelService and SearchService
         self.mock_zettel_service = MagicMock()
         self.mock_search_service = MagicMock()
+        # Dedup now pulls semantic candidates too; default to none so the
+        # lexical-path tests below exercise only the BM25 candidate source.
+        self.mock_zettel_service.find_similar_to_text.return_value = []
 
         # Create patchers for FastMCP, ZettelService, and SearchService
         self.mcp_patcher = patch(
@@ -58,8 +61,10 @@ class TestMcpServer:
 
         # Create a server instance AFTER setting up the mocks
         self.server = ZettelkastenMcpServer()
-        # Default to BM25-only dedup; the rerank tests opt in with a fake reranker.
-        self.server._reranker = None
+        # Default to BM25-only dedup; the rerank tests opt in by enabling rerank
+        # and stubbing the backend's zettel_service.rerank (the facade no longer
+        # holds a reranker — it asks the data service to score).
+        self.server._rerank_enabled = False
 
     def teardown_method(self):
         """Clean up after each test."""
@@ -276,7 +281,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker says "not a duplicate" (below the default threshold of 3.0).
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: [0.5 for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: [0.5 for _ in docs]
 
         created = SimpleNamespace(id="new-rr-1")
         self.mock_zettel_service.create_note.return_value = created
@@ -311,7 +317,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker confirms the duplicate (above the default threshold of 3.0).
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: [9.0 for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: [9.0 for _ in docs]
 
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
@@ -341,7 +348,8 @@ class TestMcpServer:
         )
         self.mock_search_service.search_combined.return_value = [match]
         # Reranker returns a same-length list of non-numeric values.
-        self.server._reranker = SimpleNamespace(score=lambda _query, docs: ["bad" for _ in docs])
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: ["bad" for _ in docs]
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
         self.mock_zettel_service.get_note.return_value = mock_area
@@ -381,7 +389,8 @@ class TestMcpServer:
                 "fastembed/HuggingFace model-cache lock)."
             )
 
-        self.server._reranker = SimpleNamespace(score=_boom)
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = _boom
         mock_area = MagicMock()
         mock_area.note_type = NoteType.AREA
         self.mock_zettel_service.get_note.return_value = mock_area
@@ -398,6 +407,62 @@ class TestMcpServer:
         assert "reranker" in result.lower()
         assert "exceeded 45s" in result  # the specific, actionable timeout detail
         self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_create_note_semantic_candidate_blocks_when_bm25_misses(self):
+        """A near-duplicate BM25 misses is still caught via the semantic source.
+
+        Regression for dedup recall in a topically-dense vault: the dedup query's
+        common domain terms collapse BM25's IDF, so the lexical search returns the
+        true twin at score 0 (dropped). The vector search still surfaces it, the
+        reranker confirms it, and the note is NOT created.
+        """
+        existing = SimpleNamespace(
+            id="sem-dup-1",
+            title="The same idea, reworded",
+            content="The identical claim expressed in different words.",
+            tags=[],
+            note_type=NoteType.PERMANENT,
+        )
+        # BM25 finds nothing (negative-IDF collapse); semantic surfaces the twin.
+        self.mock_search_service.search_combined.return_value = []
+        self.mock_zettel_service.find_similar_to_text.return_value = [(existing, 0.73)]
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = lambda _query, docs: [9.0 for _ in docs]
+
+        mock_area = MagicMock()
+        mock_area.note_type = NoteType.AREA
+        self.mock_zettel_service.get_note.return_value = mock_area
+
+        create_note_func = self.registered_tools["pzk_create_note"]
+        result = create_note_func(
+            title="The same idea", content="The identical claim, my own words.",
+            note_type="permanent", source="transcript", area_id="area123",
+        )
+
+        assert "Not created" in result
+        assert "sem-dup-1" in result
+        self.mock_zettel_service.create_note.assert_not_called()
+
+    def test_dedup_merges_lexical_and_semantic_without_double_counting(self):
+        """A note surfaced by BOTH sources is reranked once, not twice."""
+        dup = SimpleNamespace(
+            id="both-1", title="Shared", content="Shared claim.",
+            tags=[], note_type=NoteType.PERMANENT,
+        )
+        lexical_hit = SimpleNamespace(
+            note=dup, score=8.0, matched_terms=set(), matched_context=""
+        )
+        self.mock_search_service.search_combined.return_value = [lexical_hit]
+        self.mock_zettel_service.find_similar_to_text.return_value = [(dup, 0.9)]
+        self.server._rerank_enabled = True
+        seen_doc_counts = []
+        self.mock_zettel_service.rerank = (
+            lambda _q, docs: seen_doc_counts.append(len(docs)) or [9.0 for _ in docs]
+        )
+
+        confirmed = self.server._find_duplicate_candidates("Shared", "Shared claim.")
+        assert seen_doc_counts == [1]  # the shared note reranked exactly once
+        assert [n.id for n, _ in confirmed] == ["both-1"]
 
     def test_ingest_batch_disables_dedup_but_still_creates_on_reranker_failure(self):
         """A wedged reranker must NOT abandon a batch — dedup is advisory there.
@@ -419,7 +484,8 @@ class TestMcpServer:
         def _boom(_query, _docs):
             raise RerankerLoadTimeoutError("dedup reranker model load exceeded 45s")
 
-        self.server._reranker = SimpleNamespace(score=_boom)
+        self.server._rerank_enabled = True
+        self.mock_zettel_service.rerank = _boom
         self.mock_zettel_service.create_note.side_effect = [
             SimpleNamespace(id="n1"),
             SimpleNamespace(id="n2"),
