@@ -18,8 +18,10 @@ def test_kuzu_buffer_pool_default_is_bounded():
     A long-lived daemon left at 0 balloons commit charge to tens of GB; guard the
     bound so an accidental revert to 0 is caught.
     """
-    assert DEFAULT_KUZU_BUFFER_POOL_BYTES == 8 * 1024**3  # 8 GiB
-    assert DEFAULT_KUZU_BUFFER_POOL_BYTES > 0
+    assert DEFAULT_KUZU_BUFFER_POOL_BYTES == 3 * 1024**3  # 3 GiB
+    # Bounded and positive — never 0 (Kuzu's ~80%-of-RAM default) and not so
+    # large it dominates commit charge on a long-lived daemon.
+    assert 0 < DEFAULT_KUZU_BUFFER_POOL_BYTES <= 4 * 1024**3
 
 
 def test_daemon_idle_timeout_field_uses_constant():

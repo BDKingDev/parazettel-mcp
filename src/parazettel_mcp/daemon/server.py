@@ -276,8 +276,11 @@ class ParazettelDaemonServer:
             )
 
     def _start_idle_monitor(self) -> None:
-        """Start background idle shutdown monitoring when configured."""
-        if self._idle_timeout_seconds <= 0 or self._idle_monitor_thread is not None:
+        """Start background idle-shutdown / memory-recycle monitoring when configured."""
+        memory_recycle_on = config.daemon_max_rss_bytes > 0
+        if (
+            self._idle_timeout_seconds <= 0 and not memory_recycle_on
+        ) or self._idle_monitor_thread is not None:
             return
 
         def monitor() -> None:
@@ -285,11 +288,17 @@ class ParazettelDaemonServer:
                 if self._httpd is None:
                     return
                 idle_for = time.monotonic() - self._last_activity
-                if idle_for >= self._idle_timeout_seconds:
+                if (
+                    self._idle_timeout_seconds > 0
+                    and idle_for >= self._idle_timeout_seconds
+                ):
                     logger.info(
                         "Shutting down Parazettel daemon after %.1fs of inactivity",
                         idle_for,
                     )
+                    self.shutdown()
+                    return
+                if self._should_recycle_for_memory(idle_for):
                     self.shutdown()
                     return
 
@@ -299,6 +308,33 @@ class ParazettelDaemonServer:
             daemon=True,
         )
         self._idle_monitor_thread.start()
+
+    def _should_recycle_for_memory(self, idle_for: float) -> bool:
+        """Whether to recycle now because the resident set is over the ceiling.
+
+        Bounds Kuzu 0.11.3's per-vector-query native leak — which no Python-side
+        cleanup reclaims and which has no upstream fix (Kuzu is archived). Only
+        fires after the idle grace window so an in-flight request is never cut
+        off; the next request auto-starts a fresh daemon.
+        """
+        cap = config.daemon_max_rss_bytes
+        if cap <= 0 or idle_for < config.daemon_memory_recycle_idle_grace_seconds:
+            return False
+        mem = _process_memory_mb()
+        if mem is None:
+            return False
+        working_set_bytes = mem[0] * 1024 * 1024
+        if working_set_bytes < cap:
+            return False
+        logger.warning(
+            "Recycling Parazettel daemon: working_set=%.0f MB is over the %.0f MB "
+            "ceiling after %.0fs idle (a fresh daemon auto-starts on the next "
+            "request). Bounds the Kuzu vector-query native leak.",
+            mem[0],
+            cap / (1024 * 1024),
+            idle_for,
+        )
+        return True
 
     def bind(self) -> None:
         """Bind the daemon's listening socket (idempotent, fail-fast).
