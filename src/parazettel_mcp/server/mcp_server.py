@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
 
 from mcp.server.fastmcp import FastMCP
 from parazettel_mcp.config import config
@@ -270,13 +270,23 @@ class ZettelkastenMcpServer:
     ) -> List[Tuple[Note, float]]:
         """Return existing notes that look like near-duplicates of (title, content).
 
-        Uses the same BM25 text search as pzk_search_notes. The title is the
-        strongest dedup signal, so it leads the query, with a little content
-        context appended. The BM25 SEARCH is best-effort (a search failure yields
-        no candidates so a flaky search never blocks creation); the cross-encoder
-        rerank confirm, however, surfaces its errors (see :meth:`_rerank_confirm`)
-        — a stuck/failed reranker fails the create loudly rather than silently
-        degrading dedup.
+        Candidates come from TWO sources, because neither alone is sufficient:
+
+        - LEXICAL (BM25 hybrid): strong when the wording overlaps. But in a
+          topically DENSE vault the dedup query's common domain terms earn
+          NEGATIVE BM25 IDF (a term in >half the corpus), which collapses the
+          true near-duplicate's net score to <=0 — so the FTS drops it from the
+          candidate pool entirely (it survives only as a score-0 vector hit,
+          which the lexical floor below discards). This silently worsens as a
+          topic cluster grows, exactly when dedup matters most.
+        - SEMANTIC (vector): immune to that collapse — it finds the near-duplicate
+          by meaning even when BM25 can't, so the true twin still reaches the
+          reranker.
+
+        The cross-encoder rerank then confirms precision across the merged set
+        (see :meth:`_rerank_confirm`); a stuck/failed reranker fails the create
+        loudly rather than silently degrading dedup. Both SEARCHES are best-effort
+        (a flaky search yields no candidates, never blocks creation).
         """
         query = title.strip()
         if content:
@@ -287,24 +297,29 @@ class ZettelkastenMcpServer:
                 query = f"{query} {content_lead}"
         if not query.strip():
             return []
+        candidates = self._merge_dup_candidates(
+            self._lexical_dup_candidates(query),
+            self._semantic_dup_candidates(query),
+        )
+        return self._rerank_confirm(title, content, candidates)
+
+    def _lexical_dup_candidates(self, query: str) -> List[Tuple[Note, float]]:
+        """BM25/hybrid duplicate candidates above the lexical floor (knowledge only)."""
         search_started = time.perf_counter()
         try:
             results = self.search_service.search_combined(text=query)
         except Exception as exc:  # pragma: no cover - dedup is advisory only
-            logger.warning("Duplicate check skipped (search failed): %s", exc)
+            logger.warning("Duplicate check skipped (lexical search failed): %s", exc)
             return []
         logger.debug(
             "dedup probe: BM25 search returned in %.2fs for query lead %r",
             time.perf_counter() - search_started,
             query[:80],
         )
-
         candidates: List[Tuple[Note, float]] = []
         for result in results:
             score = result.score
-            if not isinstance(score, (int, float)):
-                continue
-            if score < _DEDUP_MIN_SCORE:
+            if not isinstance(score, (int, float)) or score < _DEDUP_MIN_SCORE:
                 continue
             # Only knowledge notes are duplicate candidates — an unrelated task,
             # project, or area match must never block creating a knowledge note.
@@ -313,7 +328,53 @@ class ZettelkastenMcpServer:
             candidates.append((result.note, float(score)))
             if len(candidates) >= _DEDUP_MAX_CANDIDATES:
                 break
-        return self._rerank_confirm(title, content, candidates)
+        return candidates
+
+    def _semantic_dup_candidates(self, query: str) -> List[Tuple[Note, float]]:
+        """Top semantic (vector) neighbours of the draft above the moderate floor.
+
+        These rescue a near-duplicate that BM25's negative-IDF collapse dropped to
+        zero in a dense vault. Best-effort and empty when embeddings are off, so
+        the lexical candidates still stand. The reranker remains the precision gate.
+        """
+        try:
+            similar = self.zettel_service.find_similar_to_text(
+                query, _SIM_MODERATE, _DEDUP_MAX_CANDIDATES
+            )
+            candidates = [
+                (note, float(sim))
+                for note, sim in similar
+                if note.note_type in _DEDUP_NOTE_TYPES
+            ]
+        except Exception as exc:  # pragma: no cover - dedup is advisory only
+            logger.warning("Duplicate check skipped (semantic search failed): %s", exc)
+            return []
+        if candidates:
+            logger.debug(
+                "dedup probe: %d semantic candidate(s) >= %.2f cosine",
+                len(candidates),
+                _SIM_MODERATE,
+            )
+        return candidates
+
+    @staticmethod
+    def _merge_dup_candidates(
+        lexical: List[Tuple[Note, float]], semantic: List[Tuple[Note, float]]
+    ) -> List[Tuple[Note, float]]:
+        """Union the two candidate sources, de-duplicated by note id.
+
+        Lexical entries lead (their BM25 order is meaningful), then semantic-only
+        hits. The carried float is just source provenance for logging — the rerank
+        score, not this, drives the keep/drop decision in :meth:`_rerank_confirm`.
+        """
+        merged: List[Tuple[Note, float]] = []
+        seen: Set[str] = set()
+        for note, score in [*lexical, *semantic]:
+            if note.id in seen:
+                continue
+            seen.add(note.id)
+            merged.append((note, score))
+        return merged
 
     @staticmethod
     def _dedup_text(title: str, content: str) -> str:
@@ -326,20 +387,23 @@ class ZettelkastenMcpServer:
     def _rerank_confirm(
         self, title: str, content: str, candidates: List[Tuple[Note, float]]
     ) -> List[Tuple[Note, float]]:
-        """Keep only BM25 candidates a cross-encoder confirms as true duplicates.
+        """Keep only candidates a cross-encoder confirms as true duplicates.
 
-        BM25 over-flags on shared vocabulary; the reranker reads both notes
-        together and is far more precise, so it drops topically-adjacent-but-
-        distinct false positives.
+        Candidates arrive from the merged lexical + semantic search (see
+        :meth:`_find_duplicate_candidates`) — neither source's raw score (BM25 vs
+        cosine) is comparable, so the cross-encoder is the single precision gate:
+        it reads both notes together and drops topically-adjacent-but-distinct
+        false positives. Confirmed duplicates carry the RERANK score (not the
+        source score) so the warning shows one consistent, meaningful number.
 
         A reranker LOAD/SCORE failure (e.g. a wedged model-cache lock that hits
         the load timeout) is surfaced, NOT swallowed: we deliberately do not fall
-        back to BM25-only here. A silent fallback hides a broken dedup probe and
-        was indistinguishable from a hang during debugging; failing loudly makes
-        the problem visible and points at the fix (decision 2026-06-17). Only the
-        benign shape guards below (wrong score count / non-numeric score) keep the
-        BM25 candidates, since there the reranker ran but returned something
-        unusable — that is a quirk, not a stall.
+        back to the unconfirmed candidates here. A silent fallback hides a broken
+        dedup probe and was indistinguishable from a hang during debugging;
+        failing loudly makes the problem visible and points at the fix (decision
+        2026-06-17). Only the benign shape guards below (wrong score count /
+        non-numeric score) keep the unconfirmed candidates, since there the
+        reranker ran but returned something unusable — a quirk, not a stall.
         """
         if not candidates or not self._rerank_enabled:
             return candidates
@@ -348,7 +412,7 @@ class ZettelkastenMcpServer:
             self._dedup_text(note.title, note.content) for note, _ in candidates
         ]
         logger.debug(
-            "dedup rerank: confirming %d BM25 candidate(s) via the backend reranker",
+            "dedup rerank: confirming %d candidate(s) via the backend reranker",
             len(documents),
         )
         started = time.perf_counter()
@@ -381,17 +445,19 @@ class ZettelkastenMcpServer:
             return candidates
         threshold = config.dedup_rerank_min_score
         confirmed: List[Tuple[Note, float]] = []
-        for (note, bm25), rerank_score in zip(candidates, scores):
+        for (note, _source_score), rerank_score in zip(candidates, scores):
             if not isinstance(rerank_score, (int, float)) or not math.isfinite(
                 float(rerank_score)
             ):
                 # A non-numeric OR non-finite score makes the threshold compare
                 # unsafe (NaN >= x is always False, so it would silently drop a
-                # real duplicate); stay best-effort and fall back to BM25.
+                # real duplicate); stay best-effort and keep the unconfirmed set.
                 logger.warning("Dedup rerank skipped (invalid score %r)", rerank_score)
                 return candidates
             if rerank_score >= threshold:
-                confirmed.append((note, bm25))
+                # Carry the rerank score (the actual dedup confidence), not the
+                # BM25/cosine source score, so the warning shows one consistent number.
+                confirmed.append((note, float(rerank_score)))
         logger.debug(
             "dedup rerank: confirmed %d/%d candidate(s) as duplicates in %.2fs "
             "(threshold=%.1f)",
