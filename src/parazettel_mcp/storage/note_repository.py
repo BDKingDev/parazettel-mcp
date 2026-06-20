@@ -83,6 +83,7 @@ _EMBED_LOG_CHUNK = 200
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
 
+
 # Brute-force distance expressions (lower = closer) matching each HNSW metric, so
 # the fallback's ordering is consistent with the index instead of always cosine.
 _BRUTE_FORCE_DISTANCE = {
@@ -319,6 +320,13 @@ class NoteRepository(Repository[Note]):
         # (the default), in which case all embedding code paths are skipped and
         # behaviour is unchanged. Built from config once; the model loads lazily.
         self._embedding_provider = build_embedding_provider(config)
+        # Cache of FTS term -> document frequency, used to prune corpus-common
+        # (negative-IDF) terms from long text queries before they reach Kuzu's
+        # BM25 — otherwise a dense vault's common domain words sink the best
+        # match's net score to <=0 and Kuzu drops it. Cleared on rebuild; small
+        # DF drift between rebuilds never flips the "term is in most of the
+        # corpus?" decision, so staleness is harmless.
+        self._fts_term_df_cache: Dict[str, int] = {}
         self._open_graph_db(allow_rebuild_if_needed=True)
 
     def close(self) -> None:
@@ -656,6 +664,8 @@ class NoteRepository(Repository[Note]):
         # Reset up front so a failure before parsing completes (e.g. during backup
         # creation), or a concurrent reader, never sees a previous rebuild's list.
         self.last_rebuild_skipped = []
+        # The corpus is changing, so cached term document frequencies are stale.
+        self._fts_term_df_cache.clear()
         backup_path = self._create_graph_backup()
 
         # Snapshot retrieval signals from the live graph: they exist only in the
@@ -2027,6 +2037,54 @@ class NoteRepository(Repository[Note]):
             )
         ]
 
+    def _term_document_frequency(self, conn: kuzu.Connection, term: str) -> int:
+        """Number of notes whose indexed text contains *term* (cached per term).
+
+        A single-term FTS query returns exactly the notes containing it, so its
+        result count is the document frequency. Only computed for long queries
+        (see :meth:`_focus_query_terms`) and cached, so the per-term cost is paid
+        at most once per distinct term between rebuilds.
+        """
+        cached = self._fts_term_df_cache.get(term)
+        if cached is not None:
+            return cached
+        df = len(self._query_fts_index(conn, "note_text_fts", term))
+        self._fts_term_df_cache[term] = df
+        return df
+
+    def _focus_query_terms(self, conn: kuzu.Connection, query: str) -> str:
+        """Reduce a long text FTS query to its most discriminative (lowest-DF) terms.
+
+        A long query with many moderately-common terms makes Kuzu's FTS match a
+        large fraction of the corpus and drop even the BEST match (empirically a
+        query of ~18+ distinct corpus terms in a dense vault drops the true near-
+        duplicate to a 0 score). Keeping only the ``fts_max_query_terms`` lowest-DF
+        (highest-IDF) terms bounds the match set so the best lexical hit stays
+        findable. Short/narrow queries are untouched and pay no DF cost; the vector
+        half of hybrid search still embeds the FULL query, so semantic recall is
+        unchanged.
+        """
+        max_terms = config.fts_max_query_terms
+        if max_terms <= 0:
+            return query
+        tokens = re.findall(r"\w+", query or "")
+        unique = list(dict.fromkeys(t.lower() for t in tokens))
+        if len(unique) <= max_terms:
+            return query  # already narrow enough — no DF lookups needed
+        df = {t: self._term_document_frequency(conn, t) for t in unique}
+        # Keep the most discriminative terms that actually occur (df >= 1): a df-0
+        # term matches nothing, so it can never help and must not consume budget.
+        occurring = sorted((t for t in unique if df[t] >= 1), key=lambda t: df[t])
+        keep = set(occurring[:max_terms])
+        if not keep:
+            return query  # nothing occurs in the corpus — leave the query as-is
+        logger.debug(
+            "FTS query focused to %d of %d distinct terms (lowest DF)",
+            len(keep),
+            len(unique),
+        )
+        return " ".join(t for t in tokens if t.lower() in keep)
+
     def text_fts_scores(self, text: str) -> Dict[str, float]:
         """Return {note_id: BM25 score} for *text* against the combined note index.
 
@@ -2081,8 +2139,12 @@ class NoteRepository(Repository[Note]):
 
         text_query = kwargs.get("text")
         if isinstance(text_query, str):
+            # Reduce a long query to its most discriminative terms so it doesn't
+            # match most of the corpus and drop its best lexical hit to a 0 score.
             ordered_scored.append(
-                self._query_fts_index_scored(conn, "note_text_fts", text_query)
+                self._query_fts_index_scored(
+                    conn, "note_text_fts", self._focus_query_terms(conn, text_query)
+                )
             )
 
         title_query = kwargs.get("title")
