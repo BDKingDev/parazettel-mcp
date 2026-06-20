@@ -121,7 +121,7 @@ class ZettelService:
         # honour the "never raises" contract for ANY provider.
         try:
             warmed = prewarm()
-        except Exception as exc:  # noqa: BLE001 - startup must survive a bad pre-warm
+        except BaseException as exc:  # noqa: BLE001 - startup must survive a bad pre-warm
             logger.warning(
                 "dedup reranker: pre-warm raised (%s) — falling back to lazy load",
                 exc,
