@@ -33,12 +33,13 @@ if _REPO_ENV_PATH.exists():
 # it (PARAZETTEL_KUZU_BUFFER_POOL_BYTES) for a very large vault that thrashes.
 DEFAULT_KUZU_BUFFER_POOL_BYTES = 3 * 1024**3  # 3 GiB
 # Working-set ceiling that triggers a daemon RECYCLE: when the resident set grows
-# past this AND the daemon is briefly idle, it shuts down (a fresh one is
-# auto-started on the next request). This bounds Kuzu 0.11.3's per-vector-query
-# native leak (which no Python-side cleanup reclaims, and which has no upstream
-# fix — Kuzu is archived). 0 disables. Set comfortably above the steady-state
-# (base + buffer pool + HNSW index) so only a genuine leak trips it.
-DEFAULT_DAEMON_MAX_RSS_BYTES = 4 * 1024**3  # 4 GiB
+# past this AND the daemon is idle with no request in flight, it shuts down (a
+# fresh one is auto-started on the next request). This bounds Kuzu 0.11.3's
+# per-vector-query native leak (which no Python-side cleanup reclaims, and which
+# has no upstream fix — Kuzu is archived). 0 disables. Set above the legitimate
+# peak (a full rebuild transiently holds the live + temp DB at ~4 GiB) so only a
+# genuine leak trips it — the monitor also never recycles while a request runs.
+DEFAULT_DAEMON_MAX_RSS_BYTES = 6 * 1024**3  # 6 GiB
 # Seconds of inactivity after which the daemon shuts itself down (a fresh one is
 # auto-started on the next request). A non-zero default means a daemon left
 # behind when an MCP client exits without reaping it reaps itself instead of

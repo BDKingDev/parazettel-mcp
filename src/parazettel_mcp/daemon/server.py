@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from typing import Any, Dict, Optional, Set
@@ -220,6 +221,12 @@ class ParazettelDaemonServer:
         self._maintenance_reason: Optional[str] = None
         self._request_count = 0
         self._request_count_lock = threading.Lock()
+        # In-flight RPC count, so the idle/recycle monitor never shuts the daemon
+        # down mid-call. A long request (e.g. a multi-minute rebuild) updates
+        # _last_activity only at completion, so without this it looked idle and
+        # got recycled out from under itself.
+        self._active_requests = 0
+        self._active_requests_lock = threading.Lock()
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -243,6 +250,25 @@ class ParazettelDaemonServer:
     def _mark_activity(self) -> None:
         """Record the latest daemon activity time."""
         self._last_activity = time.monotonic()
+
+    @contextmanager
+    def _serving_request(self):
+        """Mark an RPC as in flight (the idle/recycle monitor must never cut it)
+        and reset the idle timer when it finishes, so a long request like a
+        rebuild is neither recycled mid-run nor immediately after it completes."""
+        with self._active_requests_lock:
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._active_requests_lock:
+                self._active_requests -= 1
+            self._mark_activity()
+
+    def _has_in_flight_request(self) -> bool:
+        """True while any RPC is being served (so idle/recycle must hold off)."""
+        with self._active_requests_lock:
+            return self._active_requests > 0
 
     def _record_request_memory(self) -> None:
         """Count an RPC request; every N, log this process's memory.
@@ -287,6 +313,12 @@ class ParazettelDaemonServer:
             while not self._shutdown_event.wait(_IDLE_POLL_INTERVAL_SECONDS):
                 if self._httpd is None:
                     return
+                # Never shut down or recycle while an RPC is in flight: a long
+                # request (e.g. a multi-minute rebuild) only updates _last_activity
+                # at completion, so it would otherwise look idle and be cut off
+                # mid-run, failing the caller with "daemon unavailable".
+                if self._has_in_flight_request():
+                    continue
                 idle_for = time.monotonic() - self._last_activity
                 if (
                     self._idle_timeout_seconds > 0
@@ -313,9 +345,10 @@ class ParazettelDaemonServer:
         """Whether to recycle now because the resident set is over the ceiling.
 
         Bounds Kuzu 0.11.3's per-vector-query native leak — which no Python-side
-        cleanup reclaims and which has no upstream fix (Kuzu is archived). Only
-        fires after the idle grace window so an in-flight request is never cut
-        off; the next request auto-starts a fresh daemon.
+        cleanup reclaims and which has no upstream fix (Kuzu is archived). The
+        caller (the monitor) only asks once no request is in flight, and this
+        additionally requires the idle grace window, so a fresh request right
+        before a poll isn't cut off; the next request auto-starts a fresh daemon.
         """
         cap = config.daemon_max_rss_bytes
         if cap <= 0 or idle_for < config.daemon_memory_recycle_idle_grace_seconds:
@@ -479,25 +512,28 @@ class ParazettelDaemonServer:
                     )
                     return
 
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                    args = decode_value(payload.get("args", []))
-                    kwargs = decode_value(payload.get("kwargs", {}))
-                    result = daemon._invoke(service_name, method_name, args, kwargs)
-                except ValueError as exc:
-                    self._send_error_json(400, exc)
-                    return
-                except DaemonBusyError as exc:
-                    self._send_error_json(503, exc)
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    status = 400 if exc.__class__.__name__.endswith("Error") else 500
-                    self._send_error_json(status, exc)
-                    return
+                # Count this as in flight so the idle/recycle monitor never shuts
+                # the daemon down mid-call (and reset the idle timer when it ends).
+                with daemon._serving_request():
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                        args = decode_value(payload.get("args", []))
+                        kwargs = decode_value(payload.get("kwargs", {}))
+                        result = daemon._invoke(service_name, method_name, args, kwargs)
+                    except ValueError as exc:
+                        self._send_error_json(400, exc)
+                        return
+                    except DaemonBusyError as exc:
+                        self._send_error_json(503, exc)
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status = 400 if exc.__class__.__name__.endswith("Error") else 500
+                        self._send_error_json(status, exc)
+                        return
 
-                self._send_json(200, {"ok": True, "result": encode_value(result)})
-                daemon._record_request_memory()
+                    self._send_json(200, {"ok": True, "result": encode_value(result)})
+                    daemon._record_request_memory()
 
             def log_message(self, format: str, *args: Any) -> None:
                 logger.debug("Parazettel daemon HTTP: " + format, *args)

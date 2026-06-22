@@ -148,3 +148,47 @@ def test_monitor_thread_recycles_when_over_memory_even_without_idle_timeout(monk
         daemon._shutdown_event.set()
         if daemon._idle_monitor_thread is not None:
             daemon._idle_monitor_thread.join(timeout=2)
+
+
+def test_serving_request_tracks_in_flight_and_resets_activity():
+    """_serving_request marks a request in flight and bumps last_activity at exit."""
+    daemon = _make_daemon()
+    assert daemon._has_in_flight_request() is False
+    before = daemon._last_activity
+    with daemon._serving_request():
+        assert daemon._has_in_flight_request() is True
+    assert daemon._has_in_flight_request() is False
+    assert daemon._last_activity >= before  # idle timer reset on completion
+
+
+def test_monitor_never_recycles_while_a_request_is_in_flight(monkeypatch):
+    """A long in-flight request (e.g. a rebuild) must NOT be cut off, even when the
+    daemon looks idle and is over the memory ceiling."""
+    from parazettel_mcp.config import config
+
+    monkeypatch.setattr(config, "daemon_max_rss_bytes", 100 * 1024 * 1024)
+    monkeypatch.setattr(config, "daemon_memory_recycle_idle_grace_seconds", 0.0)
+    monkeypatch.setattr(daemon_server, "_process_memory_mb", lambda: (9999.0, 9999.0))
+    monkeypatch.setattr(daemon_server, "_IDLE_POLL_INTERVAL_SECONDS", 0.02)
+
+    daemon = _make_daemon()
+    daemon._idle_timeout_seconds = 0
+    daemon._httpd = MagicMock()
+    daemon._last_activity = time.monotonic() - 100  # looks idle for 100s
+    calls = {"n": 0}
+    monkeypatch.setattr(daemon, "shutdown", lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    daemon._start_idle_monitor()
+    try:
+        with daemon._serving_request():  # request in flight
+            time.sleep(0.2)  # several poll intervals
+            assert calls["n"] == 0  # monitor held off — request not cut
+        # Once it completes, the daemon may recycle (reclaiming the leaked memory).
+        deadline = time.time() + 2
+        while calls["n"] == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert calls["n"] >= 1
+    finally:
+        daemon._shutdown_event.set()
+        if daemon._idle_monitor_thread is not None:
+            daemon._idle_monitor_thread.join(timeout=2)
