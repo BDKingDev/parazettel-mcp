@@ -337,10 +337,17 @@ def test_daemon_client_can_rebuild_index(daemon_server):
         },
     )
 
-    backup_path = client.call("zettel_service", "rebuild_index")
-    fetched = client.call("zettel_service", "get_note", args=[created.id])
+    # The rebuild is async: the trigger returns immediately, the work runs on a
+    # background worker, and we wait for maintenance to clear before reading back.
+    start = client.call("zettel_service", "rebuild_index")
+    assert start == {"status": "started"}
+    assert _wait_for(
+        lambda: client.health()["maintenance_reason"] is None, timeout=30.0
+    )
+    status = client.call("zettel_service", "rebuild_status")
+    assert status["status"] == "success"
 
-    assert backup_path is not None
+    fetched = client.call("zettel_service", "get_note", args=[created.id])
     assert fetched is not None
     assert fetched.id == created.id
 
@@ -409,13 +416,23 @@ def test_daemon_link_queries_reflect_live_note_links(daemon_server):
     assert all(found.id != target.id for found in orphaned_after)
 
 
-def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
-    """Maintenance-mode rebuilds should reject concurrent RPC calls cleanly."""
+def _wait_for(predicate, timeout=5.0, interval=0.02):
+    """Poll predicate() until truthy or timeout; return its last value."""
+    deadline = time.time() + timeout
+    value = predicate()
+    while not value and time.time() < deadline:
+        time.sleep(interval)
+        value = predicate()
+    return value
+
+
+def test_rebuild_index_runs_async_and_rejects_concurrent_calls(daemon_server, monkeypatch):
+    """The rebuild trigger returns immediately (async) while the work runs on a
+    background worker; concurrent calls are rejected cleanly until it finishes."""
     rebuild_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=5.0)
     other_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=1.0)
     started = threading.Event()
     release = threading.Event()
-    result_holder = {}
 
     def slow_rebuild():
         started.set()
@@ -424,30 +441,56 @@ def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
 
     monkeypatch.setattr(daemon_server.zettel_service, "rebuild_index", slow_rebuild)
 
-    thread = threading.Thread(
-        target=lambda: result_holder.setdefault(
-            "result", rebuild_client.call("zettel_service", "rebuild_index")
-        ),
-        daemon=True,
-    )
-    thread.start()
-    assert started.wait(timeout=5.0)
+    # The trigger returns immediately with a "started" status — it does NOT block
+    # for the duration of the rebuild (that was the timeout that read as a crash).
+    start = rebuild_client.call("zettel_service", "rebuild_index")
+    assert start == {"status": "started"}
+    assert started.wait(timeout=5.0)  # the background worker actually began
 
     health = rebuild_client.health()
     assert health["maintenance_reason"] == "rebuild_index"
+    assert rebuild_client.call("zettel_service", "rebuild_status")["status"] == "running"
 
-    # The rejection comes back as a DaemonBusyError (not a bare RuntimeError that
-    # reads like a crash), and the message names the maintenance in human terms
-    # while still carrying the raw reason token.
+    # A second trigger does not start a duplicate — it reports the running status.
+    second = rebuild_client.call("zettel_service", "rebuild_index")
+    assert second.get("already_running") is True
+    assert second.get("status") == "running"
+
+    # Other calls are rejected with a DaemonBusyError (not a bare RuntimeError that
+    # reads like a crash); the message names the maintenance in human terms while
+    # still carrying the raw reason token.
     with pytest.raises(DaemonBusyError) as excinfo:
         other_client.call("zettel_service", "get_all_tags")
     message = str(excinfo.value)
     assert "rebuilding the search index" in message
     assert "rebuild_index" in message
 
+    # Let the worker finish; maintenance clears and status flips to success.
     release.set()
-    thread.join(timeout=5.0)
-    assert result_holder["result"] is None
+    assert _wait_for(lambda: rebuild_client.health()["maintenance_reason"] is None)
+    final = rebuild_client.call("zettel_service", "rebuild_status")
+    assert final["status"] == "success"
+    assert final["error"] is None
+
+
+def test_rebuild_status_reports_worker_failure(daemon_server, monkeypatch):
+    """A rebuild that raises is captured into status (not crashed) and maintenance
+    is cleared so the daemon keeps serving."""
+    client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=5.0)
+
+    def boom():
+        raise RuntimeError("kaboom during rebuild")
+
+    monkeypatch.setattr(daemon_server.zettel_service, "rebuild_index", boom)
+
+    assert client.call("zettel_service", "rebuild_index") == {"status": "started"}
+    assert _wait_for(lambda: client.health()["maintenance_reason"] is None)
+
+    status = client.call("zettel_service", "rebuild_status")
+    assert status["status"] == "error"
+    assert "kaboom during rebuild" in status["error"]
+    # Daemon still serves normal calls after a failed rebuild.
+    assert isinstance(client.call("zettel_service", "get_all_tags"), list)
 
 
 def test_maintenance_busy_message_falls_back_to_raw_reason():

@@ -192,3 +192,38 @@ def test_monitor_never_recycles_while_a_request_is_in_flight(monkeypatch):
         daemon._shutdown_event.set()
         if daemon._idle_monitor_thread is not None:
             daemon._idle_monitor_thread.join(timeout=2)
+
+
+def test_monitor_never_recycles_while_maintenance_in_progress(monkeypatch):
+    """An async rebuild runs on a detached worker (no in-flight request), so the
+    monitor must consult maintenance state too or it would recycle mid-rebuild."""
+    from parazettel_mcp.config import config
+
+    monkeypatch.setattr(config, "daemon_max_rss_bytes", 100 * 1024 * 1024)
+    monkeypatch.setattr(config, "daemon_memory_recycle_idle_grace_seconds", 0.0)
+    monkeypatch.setattr(daemon_server, "_process_memory_mb", lambda: (9999.0, 9999.0))
+    monkeypatch.setattr(daemon_server, "_IDLE_POLL_INTERVAL_SECONDS", 0.02)
+
+    daemon = _make_daemon()
+    daemon._idle_timeout_seconds = 0
+    daemon._httpd = MagicMock()
+    daemon._last_activity = time.monotonic() - 100  # looks idle for 100s
+    calls = {"n": 0}
+    monkeypatch.setattr(daemon, "shutdown", lambda: calls.__setitem__("n", calls["n"] + 1))
+
+    # No request in flight — only the maintenance flag holds the daemon.
+    daemon._maintenance_reason = "rebuild_index"
+    daemon._start_idle_monitor()
+    try:
+        time.sleep(0.2)  # several poll intervals
+        assert calls["n"] == 0  # monitor held off purely on the maintenance flag
+        # Rebuild completes -> maintenance clears -> the daemon may now recycle.
+        daemon._maintenance_reason = None
+        deadline = time.time() + 2
+        while calls["n"] == 0 and time.time() < deadline:
+            time.sleep(0.02)
+        assert calls["n"] >= 1
+    finally:
+        daemon._shutdown_event.set()
+        if daemon._idle_monitor_thread is not None:
+            daemon._idle_monitor_thread.join(timeout=2)

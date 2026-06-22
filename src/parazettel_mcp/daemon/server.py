@@ -172,6 +172,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "remove_link",
         "get_linked_notes",
         "rebuild_index",
+        "rebuild_status",
         "check_consistency",
         "export_note",
         "find_similar_notes",
@@ -250,6 +251,14 @@ class ParazettelDaemonServer:
         # got recycled out from under itself.
         self._active_requests = 0
         self._active_requests_lock = threading.Lock()
+        # Async index rebuild. A rebuild takes minutes on a large vault — longer
+        # than the facade's RPC timeout AND the MCP client's tool-call timeout — so
+        # running it inline timed the trigger call out even though the rebuild
+        # finished cleanly. Instead the trigger launches it on a detached worker and
+        # returns immediately; in-progress/last state is read via rebuild_status and
+        # the health endpoint's maintenance_reason. Guarded by _maintenance_state_lock.
+        self._rebuild_thread: Optional[threading.Thread] = None
+        self._rebuild_state: Dict[str, Any] = {"status": "idle"}
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -292,6 +301,15 @@ class ParazettelDaemonServer:
         """True while any RPC is being served (so idle/recycle must hold off)."""
         with self._active_requests_lock:
             return self._active_requests > 0
+
+    def _maintenance_in_progress(self) -> bool:
+        """True while a background maintenance op (async rebuild) holds the daemon.
+
+        Such work runs on a detached worker thread, not a request, so the idle/
+        recycle monitor must consult this in addition to the in-flight count.
+        """
+        with self._maintenance_state_lock:
+            return self._maintenance_reason is not None
 
     def _record_request_memory(self) -> None:
         """Count an RPC request; every N, log this process's memory.
@@ -336,11 +354,12 @@ class ParazettelDaemonServer:
             while not self._shutdown_event.wait(_IDLE_POLL_INTERVAL_SECONDS):
                 if self._httpd is None:
                     return
-                # Never shut down or recycle while an RPC is in flight: a long
-                # request (e.g. a multi-minute rebuild) only updates _last_activity
-                # at completion, so it would otherwise look idle and be cut off
-                # mid-run, failing the caller with "daemon unavailable".
-                if self._has_in_flight_request():
+                # Never shut down or recycle while an RPC is in flight, or while a
+                # background maintenance op (an async index rebuild) is running. The
+                # rebuild worker is detached from any request, so it would otherwise
+                # look idle and be cut off mid-run — corrupting the rebuild and
+                # failing the caller with "daemon unavailable".
+                if self._has_in_flight_request() or self._maintenance_in_progress():
                     continue
                 idle_for = time.monotonic() - self._last_activity
                 if (
@@ -591,11 +610,13 @@ class ParazettelDaemonServer:
         args: list[Any],
         kwargs: Dict[str, Any],
     ) -> Any:
+        # Rebuilds run on a detached worker and return a status immediately; the
+        # status snapshot is daemon-level state, so both are handled here rather
+        # than dispatched to a service.
         if method_name == "rebuild_index":
-            return self._invoke_with_maintenance_mode(
-                "rebuild_index",
-                lambda: self.zettel_service.rebuild_index(*args, **kwargs),
-            )
+            return self._start_async_rebuild(args, kwargs)
+        if method_name == "rebuild_status":
+            return self._rebuild_status_snapshot()
         if self._maintenance_reason is not None:
             raise DaemonBusyError(_maintenance_busy_message(self._maintenance_reason))
         service = {
@@ -605,17 +626,71 @@ class ParazettelDaemonServer:
         method = getattr(service, method_name)
         return method(*args, **kwargs)
 
-    def _invoke_with_maintenance_mode(
-        self, reason: str, callback: Any
-    ) -> Any:
+    def _start_async_rebuild(
+        self, args: list[Any], kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Launch ``rebuild_index`` on a background thread; return immediately.
+
+        Setting maintenance mode here (under the lock, before the worker starts)
+        means any call that races in behind us gets a clean DaemonBusyError, and a
+        second rebuild trigger reports the running status instead of starting a
+        duplicate. Progress/result is read with :meth:`_rebuild_status_snapshot`.
+        """
         with self._maintenance_state_lock:
             if self._maintenance_reason is not None:
-                raise DaemonBusyError(
-                    _maintenance_busy_message(self._maintenance_reason)
-                )
-            self._maintenance_reason = reason
+                # Already rebuilding — report status, don't start a second pass.
+                snapshot = dict(self._rebuild_state)
+                snapshot["already_running"] = True
+                return snapshot
+            self._maintenance_reason = "rebuild_index"
+            self._rebuild_state = {
+                "status": "running",
+                "started_monotonic": time.monotonic(),
+                "error": None,
+                "backup_path": None,
+                "skipped": [],
+            }
+            thread = threading.Thread(
+                target=self._run_rebuild,
+                args=(args, kwargs),
+                name="parazettel-daemon-rebuild",
+                daemon=True,
+            )
+            self._rebuild_thread = thread
+        thread.start()
+        return {"status": "started"}
+
+    def _run_rebuild(self, args: list[Any], kwargs: Dict[str, Any]) -> None:
+        """Background worker: run the rebuild, then record success/failure.
+
+        Never raises — a failure is captured into the rebuild state (and logged)
+        so the worker thread can't take the daemon down, and maintenance mode is
+        always cleared so the daemon resumes serving.
+        """
+        error: Optional[BaseException] = None
+        backup_path: Any = None
         try:
-            return callback()
-        finally:
-            with self._maintenance_state_lock:
-                self._maintenance_reason = None
+            backup_path = self.zettel_service.rebuild_index(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - record, never crash the worker
+            error = exc
+            logger.error("Background rebuild_index failed: %s", exc, exc_info=True)
+        repository = getattr(self.zettel_service, "repository", None)
+        skipped = getattr(repository, "last_rebuild_skipped", [])
+        if not isinstance(skipped, (list, tuple)):
+            skipped = []
+        with self._maintenance_state_lock:
+            self._maintenance_reason = None
+            self._rebuild_state = {
+                "status": "error" if error is not None else "success",
+                "error": str(error) if error is not None else None,
+                "backup_path": str(backup_path) if backup_path else None,
+                "skipped": list(skipped),
+            }
+        # Reset the idle timer so the just-finished rebuild isn't treated as a long
+        # idle stretch on the very next monitor poll.
+        self._mark_activity()
+
+    def _rebuild_status_snapshot(self) -> Dict[str, Any]:
+        """Return a copy of the latest rebuild state (idle/running/success/error)."""
+        with self._maintenance_state_lock:
+            return dict(self._rebuild_state)
