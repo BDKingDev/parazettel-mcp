@@ -8,11 +8,13 @@ import os
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from typing import Any, Dict, Optional, Set
 
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.client import DaemonBusyError
 from parazettel_mcp.daemon.codec import decode_value, encode_value
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
@@ -127,8 +129,30 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-class DaemonBusyError(RuntimeError):
-    """Raised when the daemon is in maintenance mode and cannot serve a request."""
+# Human-readable phrasing for each maintenance reason, so a busy rejection names
+# *what* the daemon is doing instead of leaking an internal method token. Unknown
+# reasons fall back to the raw token (still informative, never a bare "busy").
+_MAINTENANCE_DESCRIPTIONS: Dict[str, str] = {
+    "rebuild_index": "rebuilding the search index",
+}
+
+
+def _maintenance_busy_message(reason: str) -> str:
+    """Build the client-facing message for a busy/maintenance rejection."""
+    description = _MAINTENANCE_DESCRIPTIONS.get(reason)
+    if description is None:
+        # Unknown reason: still name the raw token so it's never a bare "busy",
+        # but skip the rebuild-specific reassurance (it may not apply).
+        return (
+            f"Parazettel is busy with maintenance ({reason}) and can't serve this "
+            "request yet. Try the request again once maintenance completes."
+        )
+    return (
+        f"Parazettel is busy {description} ({reason}) and can't serve this request "
+        "yet. Your on-disk notes are unaffected — the index is rebuilt into a "
+        "temporary database and swapped in atomically, so this is safe to wait out. "
+        "Try the request again once maintenance completes."
+    )
 
 
 ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
@@ -148,6 +172,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "remove_link",
         "get_linked_notes",
         "rebuild_index",
+        "rebuild_status",
         "check_consistency",
         "export_note",
         "find_similar_notes",
@@ -220,6 +245,20 @@ class ParazettelDaemonServer:
         self._maintenance_reason: Optional[str] = None
         self._request_count = 0
         self._request_count_lock = threading.Lock()
+        # In-flight RPC count, so the idle/recycle monitor never shuts the daemon
+        # down mid-call. A long request (e.g. a multi-minute rebuild) updates
+        # _last_activity only at completion, so without this it looked idle and
+        # got recycled out from under itself.
+        self._active_requests = 0
+        self._active_requests_lock = threading.Lock()
+        # Async index rebuild. A rebuild takes minutes on a large vault — longer
+        # than the facade's RPC timeout AND the MCP client's tool-call timeout — so
+        # running it inline timed the trigger call out even though the rebuild
+        # finished cleanly. Instead the trigger launches it on a detached worker and
+        # returns immediately; in-progress/last state is read via rebuild_status and
+        # the health endpoint's maintenance_reason. Guarded by _maintenance_state_lock.
+        self._rebuild_thread: Optional[threading.Thread] = None
+        self._rebuild_state: Dict[str, Any] = {"status": "idle"}
 
     @property
     def server_address(self) -> tuple[str, int]:
@@ -243,6 +282,34 @@ class ParazettelDaemonServer:
     def _mark_activity(self) -> None:
         """Record the latest daemon activity time."""
         self._last_activity = time.monotonic()
+
+    @contextmanager
+    def _serving_request(self):
+        """Mark an RPC as in flight (the idle/recycle monitor must never cut it)
+        and reset the idle timer when it finishes, so a long request like a
+        rebuild is neither recycled mid-run nor immediately after it completes."""
+        with self._active_requests_lock:
+            self._active_requests += 1
+        try:
+            yield
+        finally:
+            with self._active_requests_lock:
+                self._active_requests -= 1
+            self._mark_activity()
+
+    def _has_in_flight_request(self) -> bool:
+        """True while any RPC is being served (so idle/recycle must hold off)."""
+        with self._active_requests_lock:
+            return self._active_requests > 0
+
+    def _maintenance_in_progress(self) -> bool:
+        """True while a background maintenance op (async rebuild) holds the daemon.
+
+        Such work runs on a detached worker thread, not a request, so the idle/
+        recycle monitor must consult this in addition to the in-flight count.
+        """
+        with self._maintenance_state_lock:
+            return self._maintenance_reason is not None
 
     def _record_request_memory(self) -> None:
         """Count an RPC request; every N, log this process's memory.
@@ -276,20 +343,36 @@ class ParazettelDaemonServer:
             )
 
     def _start_idle_monitor(self) -> None:
-        """Start background idle shutdown monitoring when configured."""
-        if self._idle_timeout_seconds <= 0 or self._idle_monitor_thread is not None:
+        """Start background idle-shutdown / memory-recycle monitoring when configured."""
+        memory_recycle_on = config.daemon_max_rss_bytes > 0
+        if (
+            self._idle_timeout_seconds <= 0 and not memory_recycle_on
+        ) or self._idle_monitor_thread is not None:
             return
 
         def monitor() -> None:
             while not self._shutdown_event.wait(_IDLE_POLL_INTERVAL_SECONDS):
                 if self._httpd is None:
                     return
+                # Never shut down or recycle while an RPC is in flight, or while a
+                # background maintenance op (an async index rebuild) is running. The
+                # rebuild worker is detached from any request, so it would otherwise
+                # look idle and be cut off mid-run — corrupting the rebuild and
+                # failing the caller with "daemon unavailable".
+                if self._has_in_flight_request() or self._maintenance_in_progress():
+                    continue
                 idle_for = time.monotonic() - self._last_activity
-                if idle_for >= self._idle_timeout_seconds:
+                if (
+                    self._idle_timeout_seconds > 0
+                    and idle_for >= self._idle_timeout_seconds
+                ):
                     logger.info(
                         "Shutting down Parazettel daemon after %.1fs of inactivity",
                         idle_for,
                     )
+                    self.shutdown()
+                    return
+                if self._should_recycle_for_memory(idle_for):
                     self.shutdown()
                     return
 
@@ -299,6 +382,34 @@ class ParazettelDaemonServer:
             daemon=True,
         )
         self._idle_monitor_thread.start()
+
+    def _should_recycle_for_memory(self, idle_for: float) -> bool:
+        """Whether to recycle now because the resident set is over the ceiling.
+
+        Bounds Kuzu 0.11.3's per-vector-query native leak — which no Python-side
+        cleanup reclaims and which has no upstream fix (Kuzu is archived). The
+        caller (the monitor) only asks once no request is in flight, and this
+        additionally requires the idle grace window, so a fresh request right
+        before a poll isn't cut off; the next request auto-starts a fresh daemon.
+        """
+        cap = config.daemon_max_rss_bytes
+        if cap <= 0 or idle_for < config.daemon_memory_recycle_idle_grace_seconds:
+            return False
+        mem = _process_memory_mb()
+        if mem is None:
+            return False
+        working_set_bytes = mem[0] * 1024 * 1024
+        if working_set_bytes < cap:
+            return False
+        logger.warning(
+            "Recycling Parazettel daemon: working_set=%.0f MB is over the %.0f MB "
+            "ceiling after %.0fs idle (a fresh daemon auto-starts on the next "
+            "request). Bounds the Kuzu vector-query native leak.",
+            mem[0],
+            cap / (1024 * 1024),
+            idle_for,
+        )
+        return True
 
     def bind(self) -> None:
         """Bind the daemon's listening socket (idempotent, fail-fast).
@@ -443,25 +554,28 @@ class ParazettelDaemonServer:
                     )
                     return
 
-                try:
-                    length = int(self.headers.get("Content-Length", "0"))
-                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
-                    args = decode_value(payload.get("args", []))
-                    kwargs = decode_value(payload.get("kwargs", {}))
-                    result = daemon._invoke(service_name, method_name, args, kwargs)
-                except ValueError as exc:
-                    self._send_error_json(400, exc)
-                    return
-                except DaemonBusyError as exc:
-                    self._send_error_json(503, exc)
-                    return
-                except Exception as exc:  # noqa: BLE001
-                    status = 400 if exc.__class__.__name__.endswith("Error") else 500
-                    self._send_error_json(status, exc)
-                    return
+                # Count this as in flight so the idle/recycle monitor never shuts
+                # the daemon down mid-call (and reset the idle timer when it ends).
+                with daemon._serving_request():
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                        args = decode_value(payload.get("args", []))
+                        kwargs = decode_value(payload.get("kwargs", {}))
+                        result = daemon._invoke(service_name, method_name, args, kwargs)
+                    except ValueError as exc:
+                        self._send_error_json(400, exc)
+                        return
+                    except DaemonBusyError as exc:
+                        self._send_error_json(503, exc)
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        status = 400 if exc.__class__.__name__.endswith("Error") else 500
+                        self._send_error_json(status, exc)
+                        return
 
-                self._send_json(200, {"ok": True, "result": encode_value(result)})
-                daemon._record_request_memory()
+                    self._send_json(200, {"ok": True, "result": encode_value(result)})
+                    daemon._record_request_memory()
 
             def log_message(self, format: str, *args: Any) -> None:
                 logger.debug("Parazettel daemon HTTP: " + format, *args)
@@ -496,16 +610,15 @@ class ParazettelDaemonServer:
         args: list[Any],
         kwargs: Dict[str, Any],
     ) -> Any:
+        # Rebuilds run on a detached worker and return a status immediately; the
+        # status snapshot is daemon-level state, so both are handled here rather
+        # than dispatched to a service.
         if method_name == "rebuild_index":
-            return self._invoke_with_maintenance_mode(
-                "rebuild_index",
-                lambda: self.zettel_service.rebuild_index(*args, **kwargs),
-            )
+            return self._start_async_rebuild(args, kwargs)
+        if method_name == "rebuild_status":
+            return self._rebuild_status_snapshot()
         if self._maintenance_reason is not None:
-            raise DaemonBusyError(
-                f"Parazettel daemon is busy with {self._maintenance_reason}. "
-                "Try again after maintenance completes."
-            )
+            raise DaemonBusyError(_maintenance_busy_message(self._maintenance_reason))
         service = {
             "zettel_service": self.zettel_service,
             "search_service": self.search_service,
@@ -513,18 +626,71 @@ class ParazettelDaemonServer:
         method = getattr(service, method_name)
         return method(*args, **kwargs)
 
-    def _invoke_with_maintenance_mode(
-        self, reason: str, callback: Any
-    ) -> Any:
+    def _start_async_rebuild(
+        self, args: list[Any], kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Launch ``rebuild_index`` on a background thread; return immediately.
+
+        Setting maintenance mode here (under the lock, before the worker starts)
+        means any call that races in behind us gets a clean DaemonBusyError, and a
+        second rebuild trigger reports the running status instead of starting a
+        duplicate. Progress/result is read with :meth:`_rebuild_status_snapshot`.
+        """
         with self._maintenance_state_lock:
             if self._maintenance_reason is not None:
-                raise DaemonBusyError(
-                    f"Parazettel daemon is busy with {self._maintenance_reason}. "
-                    "Try again after maintenance completes."
-                )
-            self._maintenance_reason = reason
+                # Already rebuilding — report status, don't start a second pass.
+                snapshot = dict(self._rebuild_state)
+                snapshot["already_running"] = True
+                return snapshot
+            self._maintenance_reason = "rebuild_index"
+            self._rebuild_state = {
+                "status": "running",
+                "started_monotonic": time.monotonic(),
+                "error": None,
+                "backup_path": None,
+                "skipped": [],
+            }
+            thread = threading.Thread(
+                target=self._run_rebuild,
+                args=(args, kwargs),
+                name="parazettel-daemon-rebuild",
+                daemon=True,
+            )
+            self._rebuild_thread = thread
+        thread.start()
+        return {"status": "started"}
+
+    def _run_rebuild(self, args: list[Any], kwargs: Dict[str, Any]) -> None:
+        """Background worker: run the rebuild, then record success/failure.
+
+        Never raises — a failure is captured into the rebuild state (and logged)
+        so the worker thread can't take the daemon down, and maintenance mode is
+        always cleared so the daemon resumes serving.
+        """
+        error: Optional[BaseException] = None
+        backup_path: Any = None
         try:
-            return callback()
-        finally:
-            with self._maintenance_state_lock:
-                self._maintenance_reason = None
+            backup_path = self.zettel_service.rebuild_index(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001 - record, never crash the worker
+            error = exc
+            logger.error("Background rebuild_index failed: %s", exc, exc_info=True)
+        repository = getattr(self.zettel_service, "repository", None)
+        skipped = getattr(repository, "last_rebuild_skipped", [])
+        if not isinstance(skipped, (list, tuple)):
+            skipped = []
+        with self._maintenance_state_lock:
+            self._maintenance_reason = None
+            self._rebuild_state = {
+                "status": "error" if error is not None else "success",
+                "error": str(error) if error is not None else None,
+                "backup_path": str(backup_path) if backup_path else None,
+                "skipped": list(skipped),
+            }
+        # Reset the idle timer so the just-finished rebuild isn't treated as a long
+        # idle stretch on the very next monitor poll.
+        self._mark_activity()
+
+    def _rebuild_status_snapshot(self) -> Dict[str, Any]:
+        """Return a copy of the latest rebuild state (idle/running/success/error)."""
+        with self._maintenance_state_lock:
+            return dict(self._rebuild_state)
