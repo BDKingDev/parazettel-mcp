@@ -14,6 +14,7 @@ from ipaddress import ip_address
 from typing import Any, Dict, Optional, Set
 
 from parazettel_mcp.config import config
+from parazettel_mcp.daemon.client import DaemonBusyError
 from parazettel_mcp.daemon.codec import decode_value, encode_value
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
@@ -128,8 +129,30 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-class DaemonBusyError(RuntimeError):
-    """Raised when the daemon is in maintenance mode and cannot serve a request."""
+# Human-readable phrasing for each maintenance reason, so a busy rejection names
+# *what* the daemon is doing instead of leaking an internal method token. Unknown
+# reasons fall back to the raw token (still informative, never a bare "busy").
+_MAINTENANCE_DESCRIPTIONS: Dict[str, str] = {
+    "rebuild_index": "rebuilding the search index",
+}
+
+
+def _maintenance_busy_message(reason: str) -> str:
+    """Build the client-facing message for a busy/maintenance rejection."""
+    description = _MAINTENANCE_DESCRIPTIONS.get(reason)
+    if description is None:
+        # Unknown reason: still name the raw token so it's never a bare "busy",
+        # but skip the rebuild-specific reassurance (it may not apply).
+        return (
+            f"Parazettel is busy with maintenance ({reason}) and can't serve this "
+            "request yet. Try the request again once maintenance completes."
+        )
+    return (
+        f"Parazettel is busy {description} ({reason}) and can't serve this request "
+        "yet. Your on-disk notes are unaffected — the index is rebuilt into a "
+        "temporary database and swapped in atomically, so this is safe to wait out. "
+        "Try the request again once maintenance completes."
+    )
 
 
 ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
@@ -574,10 +597,7 @@ class ParazettelDaemonServer:
                 lambda: self.zettel_service.rebuild_index(*args, **kwargs),
             )
         if self._maintenance_reason is not None:
-            raise DaemonBusyError(
-                f"Parazettel daemon is busy with {self._maintenance_reason}. "
-                "Try again after maintenance completes."
-            )
+            raise DaemonBusyError(_maintenance_busy_message(self._maintenance_reason))
         service = {
             "zettel_service": self.zettel_service,
             "search_service": self.search_service,
@@ -591,8 +611,7 @@ class ParazettelDaemonServer:
         with self._maintenance_state_lock:
             if self._maintenance_reason is not None:
                 raise DaemonBusyError(
-                    f"Parazettel daemon is busy with {self._maintenance_reason}. "
-                    "Try again after maintenance completes."
+                    _maintenance_busy_message(self._maintenance_reason)
                 )
             self._maintenance_reason = reason
         try:

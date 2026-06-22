@@ -15,8 +15,22 @@ class DaemonUnavailableError(RuntimeError):
     """Raised when the configured daemon cannot be reached."""
 
 
+class DaemonBusyError(RuntimeError):
+    """Raised when the daemon is in maintenance mode and cannot serve a request.
+
+    Defined here (rather than in the daemon server) so the facade-side client can
+    reconstruct it from a remote 503 response and callers can distinguish a
+    transient "vault is rebuilding" condition from a real crash. The daemon server
+    imports this same class so both sides agree on the type name.
+    """
+
+
 ERROR_REGISTRY = {
     "GraphDatabaseReadOnlyError": GraphDatabaseReadOnlyError,
+    # A maintenance-mode rejection (e.g. mid index rebuild). Reconstructed as its
+    # own type so the facade surfaces "try again shortly", not a crash-looking
+    # generic RuntimeError.
+    "DaemonBusyError": DaemonBusyError,
     # The dedup reranker now runs in the daemon; relay its failures back to the
     # facade as the SAME type so _rerank_confirm / ingest_batch can recognize and
     # surface them (a wedged/failed rerank must fail loud, not silently degrade).

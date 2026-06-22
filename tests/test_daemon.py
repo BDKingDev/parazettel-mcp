@@ -10,6 +10,7 @@ import pytest
 
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import (
+    DaemonBusyError,
     DaemonRpcClient,
     DaemonUnavailableError,
     RemoteServiceProxy,
@@ -435,12 +436,38 @@ def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
     health = rebuild_client.health()
     assert health["maintenance_reason"] == "rebuild_index"
 
-    with pytest.raises(RuntimeError, match="busy with rebuild_index"):
+    # The rejection comes back as a DaemonBusyError (not a bare RuntimeError that
+    # reads like a crash), and the message names the maintenance in human terms
+    # while still carrying the raw reason token.
+    with pytest.raises(DaemonBusyError) as excinfo:
         other_client.call("zettel_service", "get_all_tags")
+    message = str(excinfo.value)
+    assert "rebuilding the search index" in message
+    assert "rebuild_index" in message
 
     release.set()
     thread.join(timeout=5.0)
     assert result_holder["result"] is None
+
+
+def test_maintenance_busy_message_falls_back_to_raw_reason():
+    """An unknown maintenance reason is still named (raw token), never bare 'busy'."""
+    from parazettel_mcp.daemon.server import _maintenance_busy_message
+
+    known = _maintenance_busy_message("rebuild_index")
+    assert "rebuilding the search index" in known
+    assert "rebuild_index" in known
+
+    unknown = _maintenance_busy_message("compacting_store")
+    assert "compacting_store" in unknown
+    assert "Try the request again" in unknown
+
+
+def test_daemon_busy_error_is_registered_for_client_decode():
+    """The client can reconstruct a remote DaemonBusyError as its own type."""
+    from parazettel_mcp.daemon.client import ERROR_REGISTRY
+
+    assert ERROR_REGISTRY["DaemonBusyError"] is DaemonBusyError
 
 
 def test_two_clients_share_one_daemon_without_db_lock(daemon_server):
