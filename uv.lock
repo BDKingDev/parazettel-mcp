@@ -1580,7 +1580,6 @@ name = "parazettel-mcp"
 version = "0.5.1.1"
 source = { editable = "." }
 dependencies = [
-    { name = "kuzu" },
     { name = "markdown" },
     { name = "mcp", extra = ["cli"] },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1627,7 +1626,6 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'embeddings-lite'", specifier = ">=0.4.0" },
     { name = "fastembed-gpu", marker = "extra == 'embeddings-lite-gpu'", specifier = ">=0.4.0" },
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.12.0" },
-    { name = "kuzu", specifier = ">=0.11.3,<0.12" },
     { name = "kuzu", marker = "extra == 'legacy-kuzu'", specifier = ">=0.11.3,<0.12" },
     { name = "markdown", specifier = ">=3.4.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.2.0" },

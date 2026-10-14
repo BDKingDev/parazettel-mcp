@@ -19,9 +19,6 @@ if _REPO_ENV_PATH.exists():
 
 
 # --- Resource-tuning defaults ---
-# Buffer-pool cap for opening the legacy Kuzu database (models/graph_db.py and
-# the one-time Kuzu -> SQLite migration only; the SQLite index needs none).
-DEFAULT_KUZU_BUFFER_POOL_BYTES = 8 * 1024**3  # 8 GiB
 # File name of the SQLite index when its location is derived from a legacy
 # ``*.kuzu`` path. Deliberately not ``parazettel.db``, the pre-Kuzu SQLAlchemy
 # database that may still sit (with its backups) in the same directory.
