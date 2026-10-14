@@ -3,18 +3,20 @@
 Dual-storage architecture
 -------------------------
 * Markdown files on disk – **source of truth** for note content and frontmatter.
-* Kuzu embedded graph database – **index** for fast querying and graph traversal.
+* SQLite index database – **index** for fast querying, full-text and vector
+  search, and link traversal (see :mod:`parazettel_mcp.storage.index_db`).
 
-The file system is always authoritative; the graph database can be rebuilt from
-the markdown files at any time via :meth:`NoteRepository.rebuild_index`.
+The file system is always authoritative; the index can be rebuilt from the
+markdown files at any time via :meth:`NoteRepository.rebuild_index`.
 """
 
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
-import shutil
+import sqlite3
 import threading
 import time
 import uuid
@@ -24,22 +26,29 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import frontmatter
-import kuzu
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models.graph_db import (
-    NOTE_TITLE_VECTOR_INDEX,
-    NOTE_VECTOR_INDEX,
-    GraphDatabaseReadOnlyError,
-    close_graph_db,
-    create_note_vector_index,
-    ensure_embedding_schema,
-    force_close_graph_db,
-    graph_db_companions,
-    init_graph_db,
-    note_vector_index_exists,
-    swap_graph_db_file,
+from parazettel_mcp.storage.index_db import (
+    EMBEDDING_GENERATION_KEY,
+    FTS_WEIGHTS,
+    backup_to,
+    bump_counter,
+    connect,
+    ensure_schema,
+    fts_index_text,
+    fts_match_expression,
+    fts_terms,
+    get_counter,
+    probe_capabilities,
+    prune_backups,
+    transaction,
+    ts_in,
+    ts_out,
+    vector_to_blob,
+    blob_to_vector,
 )
+from parazettel_mcp.storage.file_lock import file_lock
+from parazettel_mcp.storage.vector_index import VectorIndex
 from parazettel_mcp.models.schema import (
     Link,
     LinkType,
@@ -54,12 +63,6 @@ from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
-_GRAPH_LOCK_ERROR_MARKERS = (
-    "could not set lock on file",
-    "lock on file",
-    "resource temporarily unavailable",
-)
-
 # ---------------------------------------------------------------------------
 # Module-level LRU cache  {(path_str, mtime_ns): Note}
 # ---------------------------------------------------------------------------
@@ -69,43 +72,48 @@ _NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
-# Snapshotting the just-closed graph DB file can briefly race the OS releasing
-# Kuzu's memory-map: WinError 32 (file in use) and 33 (locked region) both clear
-# within a few milliseconds, so the backup copy retries on them.
-_GRAPH_BACKUP_COPY_ATTEMPTS = 8
-_GRAPH_BACKUP_BACKOFF_SECONDS = 0.05
-_RETRYABLE_GRAPH_COPY_WINERRORS = {5, 32, 33}
-_GRAPH_BATCH_SIZE = 100
 # Notes per progress-logged chunk during the bulk embed (within each chunk the
 # provider further batches at embedding_batch_size). Purely for log granularity.
 _EMBED_LOG_CHUNK = 200
 # Cap how many skipped filenames are inlined into the rebuild warning log so a
 # mass parse failure can't emit one enormous log line.
 _REBUILD_SKIPPED_LOG_LIMIT = 10
+# How long opening the repository waits for another process's write before the
+# startup reconcile (a full rebuild can hold the lock for minutes on CPU).
+_STARTUP_LOCK_TIMEOUT_SECONDS = 600.0
 
-
-# Brute-force distance expressions (lower = closer) matching each HNSW metric, so
-# the fallback's ordering is consistent with the index instead of always cosine.
-_BRUTE_FORCE_DISTANCE = {
-    "cosine": "1.0 - array_cosine_similarity(p.embedding, $q)",
-    "l2": "array_distance(p.embedding, $q)",
-    "dotproduct": "-array_dot_product(p.embedding, $q)",
-}
-# Same distances over the dirty-set's *title* vector (dual-vector recall).
-_BRUTE_FORCE_DISTANCE_TITLE = {
-    "cosine": "1.0 - array_cosine_similarity(p.title_embedding, $q)",
-    "l2": "array_distance(p.title_embedding, $q)",
-    "dotproduct": "-array_dot_product(p.title_embedding, $q)",
-}
-
-_NOTE_SELECT = (
-    "n.id AS id, n.title AS title, n.content AS content, n.note_type AS note_type, "
-    "n.status AS status, n.source AS source, n.due_date AS due_date, "
-    "n.priority AS priority, n.recurrence_rule AS recurrence_rule, "
-    "n.estimated_minutes AS estimated_minutes, n.remind_at AS remind_at, "
-    "n.project_id AS project_id, n.area_id AS area_id, "
-    "n.origin AS origin, n.last_verified AS last_verified, "
-    "n.metadata_json AS metadata_json, n.created_at AS created_at, n.updated_at AS updated_at"
+# Columns of the ``notes`` table written on every upsert (``pk`` is implicit).
+_NOTE_COLUMNS = (
+    "id",
+    "title",
+    "content",
+    "note_type",
+    "status",
+    "source",
+    "due_date",
+    "priority",
+    "recurrence_rule",
+    "estimated_minutes",
+    "remind_at",
+    "project_id",
+    "area_id",
+    "origin",
+    "last_verified",
+    "metadata_json",
+    "created_at",
+    "updated_at",
+)
+_NOTE_SELECT = ", ".join(f"n.{column}" for column in _NOTE_COLUMNS)
+_NOTE_UPSERT_SQL = (
+    f"INSERT INTO notes ({', '.join(_NOTE_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _NOTE_COLUMNS)}) "
+    "ON CONFLICT(id) DO UPDATE SET "
+    # created_at is immutable once indexed.
+    + ", ".join(
+        f"{column} = excluded.{column}"
+        for column in _NOTE_COLUMNS
+        if column not in ("id", "created_at")
+    )
 )
 
 # Matches one Obsidian wiki link and captures its target (id, optionally with a
@@ -211,51 +219,24 @@ def _is_retryable_atomic_write_error(exc: OSError) -> bool:
     return getattr(exc, "winerror", None) in _RETRYABLE_ATOMIC_WRITE_WINERRORS
 
 
-def _is_retryable_graph_copy_error(exc: OSError) -> bool:
-    """Return True when copying the graph DB file hit a transient lock."""
-    return getattr(exc, "winerror", None) in _RETRYABLE_GRAPH_COPY_WINERRORS
+def _first_column(rows: Iterable[sqlite3.Row]) -> List[Any]:
+    """Return the first column of every row as a list."""
+    return [row[0] for row in rows]
 
 
-def _copy_file_with_retry(src: Path, dst: Path) -> None:
-    """Copy *src* to *dst*, retrying transient Windows file locks with backoff."""
-    last_error: Optional[OSError] = None
-    for attempt in range(_GRAPH_BACKUP_COPY_ATTEMPTS):
-        try:
-            shutil.copy2(src, dst)
-            return
-        except OSError as exc:
-            last_error = exc
-            if (
-                attempt == _GRAPH_BACKUP_COPY_ATTEMPTS - 1
-                or not _is_retryable_graph_copy_error(exc)
-            ):
-                break
-            time.sleep(_GRAPH_BACKUP_BACKOFF_SECONDS * (2**attempt))
-    assert last_error is not None
-    raise last_error
+def _json_ids(ids: Iterable[str]) -> str:
+    """Encode ids as a JSON array for ``IN (SELECT value FROM json_each(?))``.
 
-
-def _result_to_records(result: Any) -> List[Dict[str, Any]]:
-    """Convert a Kuzu QueryResult to a list of dicts."""
-    cols = result.get_column_names()
-    records: List[Dict[str, Any]] = []
-    while result.has_next():
-        records.append(dict(zip(cols, result.get_next())))
-    return records
-
-
-def _result_first_column(result: Any) -> List[Any]:
-    """Return the first column of every row in a Kuzu QueryResult as a list."""
-    values: List[Any] = []
-    while result.has_next():
-        values.append(result.get_next()[0])
-    return values
+    One bound parameter regardless of list length, so large id sets never hit
+    SQLite's host-parameter limit.
+    """
+    return json.dumps(list(ids))
 
 
 def _db_dict_to_note(
     nd: Dict[str, Any], tags: List[Tag], links: List[Link]
 ) -> Note:
-    """Reconstruct a Note from a graph DB row dict and pre-fetched relations."""
+    """Reconstruct a Note from an index row and pre-fetched relations."""
     metadata = json.loads(nd["metadata_json"]) if nd.get("metadata_json") else {}
     return Note(
         id=nd["id"],
@@ -264,8 +245,8 @@ def _db_dict_to_note(
         note_type=NoteType(nd["note_type"]),
         tags=tags,
         links=links,
-        created_at=nd["created_at"],
-        updated_at=nd["updated_at"],
+        created_at=ts_out(nd["created_at"]),
+        updated_at=ts_out(nd["updated_at"]),
         metadata=metadata,
         status=NoteStatus(nd["status"]) if nd.get("status") else None,
         source=NoteSource(nd["source"]) if nd.get("source") else NoteSource.MANUAL,
@@ -296,11 +277,18 @@ class NoteRepository(Repository[Note]):
 
     Implements dual storage:
     1. Markdown files on disk – human-readable, editable, and the source of truth.
-    2. Kuzu embedded graph database – fast index for queries and graph traversal.
+    2. SQLite index database – fast index for queries, search and link traversal.
     """
 
-    def __init__(self, notes_dir: Optional[Path] = None):
-        """Initialise the repository."""
+    def __init__(self, notes_dir: Optional[Path] = None, *, reconcile: bool = True):
+        """Initialise the repository.
+
+        Args:
+            notes_dir: Notes directory (default: config).
+            reconcile: Rebuild the index at startup if its notes differ from the
+                files. Read-only callers on a deadline (the session hooks) pass
+                False so they never wait on another process's write lock.
+        """
         self.notes_dir = (
             config.get_absolute_path(notes_dir)
             if notes_dir
@@ -308,11 +296,24 @@ class NoteRepository(Repository[Note]):
         )
         self.notes_dir.mkdir(parents=True, exist_ok=True)
 
-        self.graph_db_path = config.get_graph_db_path()
+        self.index_db_path = config.get_index_db_path()
+        # Deprecated alias kept for callers that still read the old name.
+        self.graph_db_path = self.index_db_path
+        # Cross-process lock file serializing writers (see ZettelService's write
+        # lock, which takes it around every mutation).
+        self.write_lock_path = self.index_db_path.with_name(
+            f"{self.index_db_path.name}.write.lock"
+        )
         self.file_lock = threading.RLock()
+        # Every process can write under WAL, so the index is never read-only.
+        # Kept for callers (e.g. /health) that still read the flag.
         self.read_only = False
-        self.db: Optional[kuzu.Database] = None
         self._closed = True
+        # One connection per thread: a sqlite3 connection must not be used by two
+        # threads at once (the daemon serves requests on a thread pool).
+        self._local = threading.local()
+        self._connections: List[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
         # Names of markdown files that failed to parse on the most recent rebuild.
         # Surfaced to callers so a shrinking corpus is visible instead of silent.
         self.last_rebuild_skipped: List[str] = []
@@ -320,87 +321,95 @@ class NoteRepository(Repository[Note]):
         # (the default), in which case all embedding code paths are skipped and
         # behaviour is unchanged. Built from config once; the model loads lazily.
         self._embedding_provider = build_embedding_provider(config)
-        # Cache of FTS term -> document frequency, used to prune corpus-common
-        # (negative-IDF) terms from long text queries before they reach Kuzu's
-        # BM25 — otherwise a dense vault's common domain words sink the best
-        # match's net score to <=0 and Kuzu drops it. Invalidated on every
-        # create/update/delete and on rebuild (see _invalidate_fts_term_df_cache)
-        # so a term's DF is never stale across a corpus change.
+        self._vectors = VectorIndex(config.embedding_metric)
+        # Cache of FTS term -> document frequency, used to focus long text queries
+        # on their most discriminative terms (see _focus_query_terms). Invalidated
+        # on every create/update/delete and on rebuild (see
+        # _invalidate_fts_term_df_cache) so a term's DF is never stale across a
+        # corpus change.
         self._fts_term_df_cache: Dict[str, int] = {}
-        self._open_graph_db(allow_rebuild_if_needed=True)
+        self._open_index(allow_rebuild_if_needed=reconcile)
 
     def close(self) -> None:
         """Release resources held by this repository."""
         if self._closed:
             return
-        close_graph_db(self.graph_db_path, read_only=self.read_only)
-        self.db = None
         self._closed = True
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - best effort
+                pass
+        self._local = threading.local()
 
-    def _open_graph_db(self, *, allow_rebuild_if_needed: bool) -> None:
-        """Open the configured graph DB, optionally running startup rebuild checks."""
-        self.read_only = False
-        bufpool = config.kuzu_buffer_pool_bytes
-        try:
-            self.db = init_graph_db(self.graph_db_path, buffer_pool_size=bufpool)
-        except Exception as exc:
-            if not self._is_graph_lock_error(exc):
-                raise
-            logger.warning(
-                "Graph DB at %s is already open elsewhere; falling back to read-only mode.",
-                self.graph_db_path,
-            )
-            self.db = init_graph_db(
-                self.graph_db_path, read_only=True, buffer_pool_size=bufpool
-            )
-            self.read_only = True
+    def _open_index(self, *, allow_rebuild_if_needed: bool) -> None:
+        """Open the index, create its schema, and optionally reconcile with files."""
         self._closed = False
-
-        if self._embedding_provider is not None and not self.read_only:
-            self._ensure_embedding_schema()
-
-        if allow_rebuild_if_needed and not self.read_only:
-            self.rebuild_index_if_needed()
-
-    def _reopen_graph_db(self, *, allow_rebuild_if_needed: bool = False) -> None:
-        """Close and reopen the graph DB handle in-place."""
-        self.close()
-        self._open_graph_db(allow_rebuild_if_needed=allow_rebuild_if_needed)
-
-    @staticmethod
-    def _is_graph_lock_error(exc: Exception) -> bool:
-        """Return True when an exception looks like a cross-process graph lock."""
-        message = str(exc).lower()
-        return any(marker in message for marker in _GRAPH_LOCK_ERROR_MARKERS)
+        conn = self._get_conn()
+        probe_capabilities(conn)
+        ensure_schema(conn)
+        if allow_rebuild_if_needed:
+            # Under the writers' lock, so a startup reconcile can't commit an
+            # index snapshot that predates another process's in-flight write.
+            with file_lock(self.write_lock_path, timeout=_STARTUP_LOCK_TIMEOUT_SECONDS):
+                self.rebuild_index_if_needed()
 
     def _assert_writable(self) -> None:
-        """Fail fast when a mutating operation is attempted in read-only mode."""
-        if self.read_only:
-            raise GraphDatabaseReadOnlyError(
-                "Parazettel is running in read-only graph mode because the database "
-                "is already open in another MCP session. Open only one write-enabled "
-                "chat at a time to create, update, delete, or rebuild notes."
-            )
+        """No-op: every process may write under WAL. Kept for older callers."""
 
-    def _get_conn(self) -> kuzu.Connection:
-        """Create a low-level Kuzu connection.
+    def index_status(self) -> Dict[str, Any]:
+        """Report index and embedding health (for /health and diagnostics).
 
-        Kuzu connections are not thread-safe, so one connection is created per
-        repository operation. Callers are responsible for closing the returned
-        connection. Internal repository methods should prefer ``_connection()``.
+        ``embeddings.vectors_stored`` counts vectors for the *active* model, so
+        a provider that silently failed (e.g. a missing model file) shows up as
+        enabled with far fewer vectors than notes.
         """
-        if self._closed or self.db is None:
+        provider = self._embedding_provider
+        with self._connection() as conn:
+            notes = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+            journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+            vectors = (
+                conn.execute(
+                    "SELECT count(*) FROM embeddings WHERE model = ?",
+                    (provider.model_id,),
+                ).fetchone()[0]
+                if provider is not None
+                else 0
+            )
+            generation = get_counter(conn, EMBEDDING_GENERATION_KEY)
+        return {
+            "index": {
+                "backend": "sqlite",
+                "path": str(self.index_db_path),
+                "notes": notes,
+                "journal_mode": journal_mode,
+            },
+            "embeddings": {
+                "enabled": provider is not None,
+                "model_id": provider.model_id if provider is not None else None,
+                "vectors_stored": vectors,
+                "generation": generation,
+            },
+        }
+
+    def _get_conn(self) -> sqlite3.Connection:
+        """Return this thread's connection to the index, opening it on first use."""
+        if self._closed:
             raise RuntimeError("NoteRepository is closed")
-        return kuzu.Connection(self.db)
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = connect(self.index_db_path, config.sqlite_busy_timeout_ms)
+            self._local.conn = conn
+            with self._connections_lock:
+                self._connections.append(conn)
+        return conn
 
     @contextmanager
-    def _connection(self) -> Iterator[kuzu.Connection]:
-        """Yield a Kuzu connection and always close it afterwards."""
-        conn = self._get_conn()
-        try:
-            yield conn
-        finally:
-            conn.close()
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Yield this thread's index connection (kept open for reuse)."""
+        yield self._get_conn()
 
     def _build_tmp_path(self, file_path: Path) -> Path:
         suffix = f".{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
@@ -477,19 +486,18 @@ class NoteRepository(Repository[Note]):
                 pass
 
     def rebuild_index_if_needed(self) -> None:
-        """Rebuild the graph index from files when the ID sets diverge."""
+        """Rebuild the index from files when the ID sets diverge."""
         with self._connection() as conn:
-            id_result = conn.execute("MATCH (n:Note) RETURN n.id")
-            db_ids = set(_result_first_column(id_result))
+            db_ids = set(_first_column(conn.execute("SELECT id FROM notes")))
         file_stems = {p.stem for p in self.notes_dir.glob("*.md")}
         if db_ids != file_stems:
             self.rebuild_index()
 
     def check_consistency(self) -> Dict[str, Any]:
-        """Compare the markdown files (source of truth) against the graph index.
+        """Compare the markdown files (source of truth) against the index.
 
         Read-only: this never modifies either store. It surfaces the three ways
-        the file system and the Kuzu index can silently disagree:
+        the file system and the index can silently disagree:
 
         * ``missing_from_index`` — a ``{id}.md`` file exists on disk but no Note
           node is indexed for it (e.g. a note added/restored outside the server).
@@ -505,20 +513,12 @@ class NoteRepository(Repository[Note]):
         """
         file_stems = {p.stem for p in self.notes_dir.glob("*.md")}
         with self._connection() as conn:
-            db_ids = set(
-                _result_first_column(conn.execute("MATCH (n:Note) RETURN n.id"))
-            )
-            common = file_stems & db_ids
-            stored_content: Dict[str, str] = {}
-            if common:
-                result = conn.execute(
-                    "MATCH (n:Note) WHERE n.id IN $ids "
-                    "RETURN n.id AS id, n.content AS content",
-                    {"ids": list(common)},
-                )
-                while result.has_next():
-                    row = result.get_next()
-                    stored_content[row[0]] = row[1]
+            stored_content: Dict[str, str] = {
+                row["id"]: row["content"]
+                for row in conn.execute("SELECT id, content FROM notes")
+            }
+        db_ids = set(stored_content)
+        common = file_stems & db_ids
 
         missing_from_index = sorted(file_stems - db_ids)
         missing_from_files = sorted(db_ids - file_stems)
@@ -539,7 +539,7 @@ class NoteRepository(Repository[Note]):
             except Exception:
                 unreadable_files.append(note_id)
                 continue
-            # Compare the on-disk note body to exactly what the graph stored.
+            # Compare the on-disk note body to exactly what the index stored.
             # create()/update() index the parsed-markdown body verbatim
             # (frontmatter.loads(markdown).content), so the file body and the
             # stored content are byte-identical when in sync. NOTE: do not compare
@@ -584,52 +584,33 @@ class NoteRepository(Repository[Note]):
             ),
         }
 
-    def _build_graph_backup_path(self) -> Path:
-        """Return a timestamped backup path for the graph DB snapshot."""
+    def _build_index_backup_path(self) -> Path:
+        """Return a timestamped backup path for the index snapshot."""
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-        backup_path = self.graph_db_path.with_name(
-            f"{self.graph_db_path.name}.{timestamp}.bak"
+        backup_path = self.index_db_path.with_name(
+            f"{self.index_db_path.name}.{timestamp}.bak"
         )
         counter = 1
         while backup_path.exists():
-            backup_path = self.graph_db_path.with_name(
-                f"{self.graph_db_path.name}.{timestamp}.{counter}.bak"
+            backup_path = self.index_db_path.with_name(
+                f"{self.index_db_path.name}.{timestamp}.{counter}.bak"
             )
             counter += 1
         return backup_path
 
-    def _create_graph_backup(self) -> Optional[Path]:
-        """Create a file snapshot backup of the current graph before rebuild."""
-        graph_db_path = self.graph_db_path
-        if not graph_db_path.exists():
-            return None
+    def _create_index_backup(self) -> Optional[Path]:
+        """Snapshot the current index before a rebuild.
 
-        backup_path = self._build_graph_backup_path()
-
-        # Kuzu keeps the DB file memory-mapped while open, so copying it while a
-        # handle is live raises WinError 33 on Windows. The handle is refcounted,
-        # so a plain close() can be a silent no-op when another reference is
-        # outstanding; force_close_graph_db guarantees the file is released for
-        # the brief stop-the-world snapshot, then we reopen.
-        with self.file_lock:
-            force_close_graph_db(graph_db_path)
-            self.db = None
-            self._closed = True
-            try:
-                if graph_db_path.is_dir():
-                    shutil.copytree(graph_db_path, backup_path)
-                else:
-                    _copy_file_with_retry(graph_db_path, backup_path)
-                    for companion_path in graph_db_companions(graph_db_path):
-                        suffix = companion_path.name[len(graph_db_path.name):]
-                        _copy_file_with_retry(
-                            companion_path,
-                            backup_path.with_name(f"{backup_path.name}{suffix}"),
-                        )
-            finally:
-                self._open_graph_db(allow_rebuild_if_needed=False)
-
-        logger.info("Created graph database backup before reindex: %s", backup_path)
+        Uses SQLite's online backup API, so other connections (in this or any
+        other process) keep working while it runs. Older backups beyond
+        ``config.index_backup_keep`` are pruned.
+        """
+        with self._connection() as conn:
+            if conn.execute("SELECT count(*) FROM notes").fetchone()[0] == 0:
+                return None  # nothing worth backing up
+            backup_path = backup_to(conn, self._build_index_backup_path())
+        prune_backups(self.index_db_path, config.index_backup_keep)
+        logger.info("Created index backup before reindex: %s", backup_path)
         return backup_path
 
     def _parse_rebuild_note(self, file_path: Path) -> Optional[Note]:
@@ -643,38 +624,27 @@ class NoteRepository(Repository[Note]):
             return None
 
     def rebuild_index(self) -> Optional[Path]:
-        """Rebuild the graph index from all markdown files.
+        """Rebuild the index from all markdown files.
 
-        The rebuild is the only path that fully reconciles the graph with the
+        The rebuild is the only path that fully reconciles the index with the
         files, so it must reflect *every* on-disk edit — including tags or links
-        removed by hand. Rather than clearing the live database in place (a bulk
-        ``DETACH DELETE`` on a large graph segfaults Kuzu 0.11.3 on Windows, and
-        an in-place clear can also strand Tag nodes that lost their last note),
-        the new graph is built into a fresh temporary database and then
-        atomically swapped in. Building from empty means only tags/links present
-        in the files survive, so removals are picked up and orphan Tag nodes
-        disappear for free.
+        removed by hand. Every derived table is cleared and refilled from the
+        parsed files inside ONE write transaction: readers (in any process) keep
+        seeing the previous index until the commit, and a failure part-way rolls
+        back to it untouched. ``retrieval_signals`` is not cleared — it exists
+        only in the index, never in the files.
 
-        Within the fresh build a two-pass strategy is used:
-        * Pass 1 – create all Note nodes and Tag nodes.
-        * Pass 2 – create all LINKS_TO / HAS_TAG relationships, so edges are
-          created even when a link's target note appears later in file order.
+        Notes are embedded *before* the transaction opens (it is the slow step),
+        reusing each stored vector whose model and source text are unchanged.
+        Rows are written notes-first, then links, so a link is indexed even when
+        its target appears later in file order.
         """
-        self._assert_writable()
         # Reset up front so a failure before parsing completes (e.g. during backup
         # creation), or a concurrent reader, never sees a previous rebuild's list.
         self.last_rebuild_skipped = []
         # The corpus is changing, so cached term document frequencies are stale.
         self._fts_term_df_cache.clear()
-        backup_path = self._create_graph_backup()
-
-        # Snapshot retrieval signals from the live graph: they exist only in the
-        # index (never in markdown), so a fresh build would otherwise wipe them.
-        try:
-            retrieval_signals = self._fetch_retrieval_signals()
-        except Exception as exc:  # best-effort: signals must never block rebuild
-            logger.warning("Could not snapshot retrieval signals: %s", exc)
-            retrieval_signals = []
+        backup_path = self._create_index_backup()
 
         note_files = list(self.notes_dir.glob("*.md"))
         notes: List[Note] = []
@@ -702,227 +672,82 @@ class NoteRepository(Repository[Note]):
                 preview,
             )
 
-        # Build into an isolated subdirectory so the temp DB and its sidecars can
-        # never collide with (or be mistaken for a companion of) the live DB file
-        # in the same directory.
-        tmp_dir = self.graph_db_path.with_name(
-            f".rebuild.{os.getpid()}.{uuid.uuid4().hex}"
-        )
-        tmp_db_path = tmp_dir / self.graph_db_path.name
-        try:
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            self._build_graph_into(
-                tmp_db_path, notes, retrieval_signals=retrieval_signals
-            )
-
-            # Close every handle to the live DB so the file can be replaced,
-            # then atomically swap the freshly built DB into place and reopen.
-            with self.file_lock:
-                force_close_graph_db(self.graph_db_path)
-                self.db = None
-                self._closed = True
-                swap_graph_db_file(tmp_db_path, self.graph_db_path)
-                self._open_graph_db(allow_rebuild_if_needed=False)
-        finally:
-            self._cleanup_rebuild_artifacts(tmp_dir)
+        embeddings = self._compute_embeddings(notes)
+        with self._connection() as conn:
+            with transaction(conn):
+                # Children first; FTS rows are keyed by notes.pk, not cascaded.
+                for table in ("note_fts", "embeddings", "links", "note_tags", "notes"):
+                    conn.execute(f"DELETE FROM {table}")
+                for note in notes:
+                    self._write_note_rows(conn, note, note.content)
+                self._write_links(conn, notes)
+                self._write_embeddings(conn, embeddings)
+                # Drop signals for notes that no longer exist on disk.
+                conn.execute(
+                    "DELETE FROM retrieval_signals "
+                    "WHERE note_id NOT IN (SELECT id FROM notes)"
+                )
+            conn.execute("INSERT INTO note_fts(note_fts) VALUES ('optimize')")
+            conn.execute("PRAGMA optimize")
 
         return backup_path
 
-    def _build_graph_into(
-        self,
-        db_path: Path,
-        notes: List[Note],
-        retrieval_signals: Optional[List[Dict[str, Any]]] = None,
-    ) -> None:
-        """Build a complete graph for *notes* in a fresh database at *db_path*.
+    # --- index row writers (call inside a transaction) -----------------------
 
-        The database starts empty, so every node is new and no deletes are
-        issued. ``init_graph_db`` creates the schema (and FTS indexes), and the
-        handle is fully released afterwards so the file can be swapped in.
-        ``retrieval_signals`` (snapshotted from the previous graph) are restored
-        onto the new Note nodes so graph-only operational data survives.
+    def _write_note_rows(
+        self, conn: sqlite3.Connection, note: Note, content_for_db: str
+    ) -> None:
+        """Upsert a note's row, full-text entry and tags (not its links).
+
+        ``ON CONFLICT DO UPDATE`` keeps the row (and its ``pk``) in place —
+        ``INSERT OR REPLACE`` would delete it, and the cascade would wipe every
+        other note's links *to* this one.
         """
-        db = init_graph_db(
-            db_path, buffer_pool_size=config.kuzu_buffer_pool_bytes
-        )
-        try:
-            conn = kuzu.Connection(db)
-            try:
-                if self._embedding_provider is not None:
-                    ensure_embedding_schema(conn, config.embedding_dim)
-                self._ensure_tag_nodes(
-                    conn, (tag.name for note in notes for tag in note.tags)
-                )
-                # Pass 1: all Note nodes (empty DB, so every note is new).
-                for note in notes:
-                    self._index_note_nodes_only(
-                        note, conn, assume_missing=True, ensure_tags=False
-                    )
-                # Pass 2: all relationships in chunked batches.
-                for i in range(0, len(notes), _GRAPH_BATCH_SIZE):
-                    self._index_note_relations_batch(
-                        notes[i : i + _GRAPH_BATCH_SIZE],
-                        conn,
-                        clear_existing=False,
-                    )
-                # Restore retrieval signals before any vector index is built.
-                # MATCH drops signals for notes that no longer exist on disk.
-                if retrieval_signals:
-                    conn.execute(
-                        "UNWIND $rows AS row MATCH (n:Note {id: row.id}) "
-                        "SET n.last_retrieved_at = row.last_retrieved_at, "
-                        "n.hit_count = row.hit_count",
-                        {"rows": retrieval_signals},
-                    )
-                # Pass 3: embed all notes and build the HNSW index (no-op when
-                # embeddings are disabled).
-                self._build_embeddings(conn, notes)
-            finally:
-                conn.close()
-        finally:
-            force_close_graph_db(db_path)
-
-    def _cleanup_rebuild_artifacts(self, tmp_dir: Path) -> None:
-        """Remove the temporary rebuild directory, if any of it remains."""
-        if tmp_dir.exists():
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except OSError as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("Could not remove rebuild artifact %s: %s", tmp_dir, exc)
-
-    def _index_note_nodes_only(
-        self,
-        note: Note,
-        conn: kuzu.Connection,
-        *,
-        assume_missing: bool = False,
-        ensure_tags: bool = True,
-    ) -> None:
-        """Create or update only the Note node and Tag nodes (no edges)."""
-        params = self._note_params(note, note.content)
-
-        if not assume_missing:
-            exists_result = conn.execute(
-                "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
-            )
-        else:
-            exists_result = None
-
-        if exists_result is not None and exists_result.get_num_tuples() > 0:
-            update_params = {k: v for k, v in params.items() if k != "created_at"}
-            conn.execute(
-                """
-                MATCH (n:Note {id: $id})
-                SET n.title = $title,
-                    n.content = $content,
-                    n.note_type = $note_type,
-                    n.status = $status,
-                    n.source = $source,
-                    n.due_date = $due_date,
-                    n.priority = $priority,
-                    n.recurrence_rule = $recurrence_rule,
-                    n.estimated_minutes = $estimated_minutes,
-                    n.remind_at = $remind_at,
-                    n.project_id = $project_id,
-                    n.area_id = $area_id,
-                    n.origin = $origin,
-                    n.last_verified = $last_verified,
-                    n.metadata_json = $metadata_json,
-                    n.updated_at = $updated_at
-                """,
-                update_params,
-            )
-        else:
-            conn.execute(
-                """
-                CREATE (:Note {
-                    id: $id,
-                    title: $title,
-                    content: $content,
-                    note_type: $note_type,
-                    status: $status,
-                    source: $source,
-                    due_date: $due_date,
-                    priority: $priority,
-                    recurrence_rule: $recurrence_rule,
-                    estimated_minutes: $estimated_minutes,
-                    remind_at: $remind_at,
-                    project_id: $project_id,
-                    area_id: $area_id,
-                    origin: $origin,
-                    last_verified: $last_verified,
-                    metadata_json: $metadata_json,
-                    created_at: $created_at,
-                    updated_at: $updated_at
-                })
-                """,
-                params,
-            )
-
-        if ensure_tags:
-            self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
-
-    def _ensure_tag_nodes(
-        self, conn: kuzu.Connection, tag_names: Iterable[str]
-    ) -> None:
-        """Create tag nodes in one batched query, de-duping names first."""
-        unique_tag_names = list(dict.fromkeys(tag_names))
-        if not unique_tag_names:
-            return
+        params = self._note_params(note, content_for_db)
+        conn.execute(_NOTE_UPSERT_SQL, tuple(params[c] for c in _NOTE_COLUMNS))
+        pk = conn.execute("SELECT pk FROM notes WHERE id = ?", (note.id,)).fetchone()[0]
+        conn.execute("DELETE FROM note_fts WHERE rowid = ?", (pk,))
         conn.execute(
-            "UNWIND $tag_names AS tag_name MERGE (:Tag {name: tag_name})",
-            {"tag_names": unique_tag_names},
+            "INSERT INTO note_fts(rowid, title, content, body) VALUES (?, ?, ?, ?)",
+            (
+                pk,
+                fts_index_text(note.title),
+                fts_index_text(content_for_db),
+                fts_index_text(f"{note.title or ''}\n{content_for_db or ''}"),
+            ),
+        )
+        conn.execute("DELETE FROM note_tags WHERE note_id = ?", (note.id,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO note_tags(note_id, tag) VALUES (?, ?)",
+            [(note.id, tag.name) for tag in note.tags],
         )
 
-    def _index_note_relations(
-        self,
-        note: Note,
-        conn: kuzu.Connection,
-        *,
-        clear_existing: bool = True,
-    ) -> None:
-        """Create HAS_TAG and LINKS_TO relationships for a note."""
-        if clear_existing:
-            conn.execute(
-                "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r", {"id": note.id}
-            )
-            conn.execute(
-                "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r", {"id": note.id}
-            )
+    def _write_links(self, conn: sqlite3.Connection, notes: List[Note]) -> None:
+        """Replace the outgoing links of *notes*.
 
-        if note.tags:
-            conn.execute(
-                """
-                UNWIND $tag_names AS tag_name
-                MATCH (n:Note {id: $note_id}), (t:Tag {name: tag_name})
-                CREATE (n)-[:HAS_TAG]->(t)
-                """,
-                {
-                    "note_id": note.id,
-                    "tag_names": [tag.name for tag in note.tags],
-                },
-            )
-
-        link_rows = self._link_rows_for_note(note)
-        if link_rows:
-            conn.execute(
-                """
-                UNWIND $links AS link
-                MATCH (s:Note {id: $source_id}), (t:Note {id: link.target_id})
-                CREATE (s)-[:LINKS_TO {
-                    link_type: link.link_type,
-                    description: link.description,
-                    created_at: link.created_at
-                }]->(t)
-                """,
-                {
-                    "source_id": note.id,
-                    "links": [
-                        {k: v for k, v in row.items() if k != "source_id"}
-                        for row in link_rows
-                    ],
-                },
-            )
+        A link whose target note isn't indexed is skipped (not an error), as the
+        graph index always did — the ``## Links`` line stays in the markdown and
+        is picked up by a later rebuild once the target exists.
+        """
+        conn.executemany(
+            "DELETE FROM links WHERE source_id = ?", [(note.id,) for note in notes]
+        )
+        conn.executemany(
+            "INSERT INTO links(source_id, target_id, link_type, description, created_at) "
+            "SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM notes WHERE id = ?)",
+            [
+                (
+                    row["source_id"],
+                    row["target_id"],
+                    row["link_type"],
+                    row["description"],
+                    ts_in(row["created_at"]),
+                    row["target_id"],
+                )
+                for note in notes
+                for row in self._link_rows_for_note(note)
+            ],
+        )
 
     @staticmethod
     def _link_rows_for_note(note: Note) -> List[Dict[str, Any]]:
@@ -960,68 +785,6 @@ class NoteRepository(Repository[Note]):
                 }
             )
         return rows
-
-    def _index_note_relations_batch(
-        self,
-        notes: List[Note],
-        conn: kuzu.Connection,
-        *,
-        clear_existing: bool = True,
-    ) -> None:
-        """Create HAS_TAG and LINKS_TO relationships for many notes at once."""
-        if not notes:
-            return
-
-        if clear_existing:
-            note_ids = [note.id for note in notes]
-            conn.execute(
-                """
-                UNWIND $note_ids AS note_id
-                MATCH (n:Note {id: note_id})-[r:HAS_TAG]->()
-                DELETE r
-                """,
-                {"note_ids": note_ids},
-            )
-            conn.execute(
-                """
-                UNWIND $note_ids AS note_id
-                MATCH (n:Note {id: note_id})-[r:LINKS_TO]->()
-                DELETE r
-                """,
-                {"note_ids": note_ids},
-            )
-
-        tag_rows = [
-            {"note_id": note.id, "tag_name": tag.name}
-            for note in notes
-            for tag in note.tags
-        ]
-        if tag_rows:
-            conn.execute(
-                """
-                UNWIND $rows AS row
-                MATCH (n:Note {id: row.note_id}), (t:Tag {name: row.tag_name})
-                CREATE (n)-[:HAS_TAG]->(t)
-                """,
-                {"rows": tag_rows},
-            )
-
-        link_rows = [
-            row for note in notes for row in self._link_rows_for_note(note)
-        ]
-        if link_rows:
-            conn.execute(
-                """
-                UNWIND $rows AS row
-                MATCH (s:Note {id: row.source_id}), (t:Note {id: row.target_id})
-                CREATE (s)-[:LINKS_TO {
-                    link_type: row.link_type,
-                    description: row.description,
-                    created_at: row.created_at
-                }]->(t)
-                """,
-                {"rows": link_rows},
-            )
 
     def _parse_note_from_markdown(self, content: str) -> Note:
         """Parse a note from markdown content."""
@@ -1355,20 +1118,20 @@ class NoteRepository(Repository[Note]):
     def _get_link_title_map(
         self, note: Note, links: List[Link]
     ) -> Dict[str, str]:
-        """Resolve link target titles in one graph query for markdown serialisation."""
+        """Resolve link target titles in one index query for markdown serialisation."""
         target_ids = {link.target_id for link in links}
         if not target_ids:
             return {}
 
         with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note) WHERE n.id IN $ids RETURN n.id AS id, n.title AS title",
-                {"ids": list(target_ids)},
-            )
-            title_map: Dict[str, str] = {}
-            while result.has_next():
-                row = result.get_next()
-                title_map[row[0]] = row[1]
+            title_map: Dict[str, str] = {
+                row["id"]: row["title"]
+                for row in conn.execute(
+                    "SELECT id, title FROM notes "
+                    "WHERE id IN (SELECT value FROM json_each(?))",
+                    (_json_ids(target_ids),),
+                )
+            }
         if note.id in target_ids:
             title_map[note.id] = note.title
         return title_map
@@ -1386,7 +1149,7 @@ class NoteRepository(Repository[Note]):
         return f"{target_id}|{alias}"
 
     def _note_params(self, note: Note, content_for_db: str) -> Dict[str, Any]:
-        """Build the Kuzu parameter dict for a Note upsert."""
+        """Build the column values for a ``notes`` row upsert."""
         return {
             "id": note.id,
             "title": note.title,
@@ -1412,8 +1175,8 @@ class NoteRepository(Repository[Note]):
                 if note.metadata
                 else None
             ),
-            "created_at": note.created_at,
-            "updated_at": note.updated_at,
+            "created_at": ts_in(note.created_at),
+            "updated_at": ts_in(note.updated_at),
         }
 
     # --- Semantic embeddings (only active when a provider is configured) ------
@@ -1436,241 +1199,166 @@ class NoteRepository(Repository[Note]):
         """Return the note's title — embedded as a second 'atomic claim' vector."""
         return (note.title or "").strip()
 
-    def _ensure_embedding_schema(self) -> None:
-        """Idempotently add the embedding columns to the live graph DB."""
-        try:
-            with self._connection() as conn:
-                ensure_embedding_schema(conn, config.embedding_dim)
-        except Exception as exc:  # never block opening the DB on this
-            logger.warning("Could not ensure embedding schema: %s", exc)
+    def _embedding_text_hash(self, note: Note) -> str:
+        """Fingerprint of exactly the text embedded for a note (doc + title).
 
-    def _store_embeddings(
-        self,
-        conn: kuzu.Connection,
-        notes: List[Note],
-        vectors: List[List[float]],
-        title_vectors: List[List[float]],
-    ) -> None:
-        """Write precomputed doc + title vectors onto their Note nodes.
-
-        Runs during the fresh rebuild *before* the HNSW indexes are created, so the
-        columns are still writable; these vectors are then folded into the indexes.
+        A stored vector whose hash and model still match is reused on rebuild
+        instead of re-embedding — the embed is by far the slowest rebuild step.
         """
-        if len(vectors) != len(notes) or len(title_vectors) != len(notes):
-            # A provider returning the wrong count would silently leave some
-            # notes unembedded (or drop vectors); skip rather than build the
-            # index over a partially-populated column.
-            logger.warning(
-                "Embedding provider returned %d doc / %d title vectors for %d "
-                "notes; skipping embedding storage for this rebuild.",
-                len(vectors),
-                len(title_vectors),
-                len(notes),
-            )
-            return
-        model_id = self._embedding_provider.model_id  # type: ignore[union-attr]
-        now = datetime.datetime.now()
-        for note, vector, title_vector in zip(notes, vectors, title_vectors):
-            conn.execute(
-                "MATCH (n:Note {id: $id}) "
-                "SET n.embedding = $embedding, n.title_embedding = $title_embedding, "
-                "n.embedded_at = $embedded_at, n.embedding_model = $model",
-                {
-                    "id": note.id,
-                    "embedding": vector,
-                    "title_embedding": title_vector,
-                    "embedded_at": now,
-                    "model": model_id,
-                },
-            )
+        digest = hashlib.sha256()
+        digest.update(self._embedding_text(note).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self._title_text(note).encode("utf-8"))
+        return digest.hexdigest()
 
-    def _build_embeddings(self, conn: kuzu.Connection, notes: List[Note]) -> None:
-        """Embed every note and build the HNSW index, inside a fresh rebuild DB.
+    def _compute_embeddings(
+        self, notes: List[Note]
+    ) -> Dict[str, Tuple[List[float], List[float], str]]:
+        """Return ``{note_id: (doc_vector, title_vector, text_hash)}`` for *notes*.
 
-        Best-effort: if embedding fails (e.g. the model dependency is missing),
-        the rebuild still completes without vectors rather than failing — search
-        falls back to BM25. Runs during the exclusive rebuild, so the embedding
-        cost is paid once per rebuild rather than on the hot write path.
+        Reuses each stored vector whose model and source text are unchanged and
+        embeds only the rest. Runs outside any write transaction. Best-effort: if
+        embedding fails (e.g. the model dependency is missing) the notes it
+        couldn't embed are left out — the rebuild still completes, and search
+        falls back to BM25 for them.
         """
         provider = self._embedding_provider
         if provider is None or not notes:
-            return
-        total = len(notes)
+            return {}
+        model_id = provider.model_id
+        hashes = {note.id: self._embedding_text_hash(note) for note in notes}
+        result: Dict[str, Tuple[List[float], List[float], str]] = {}
+        with self._connection() as conn:
+            for row in conn.execute(
+                "SELECT note_id, doc_vec, title_vec, text_hash FROM embeddings "
+                "WHERE model = ?",
+                (model_id,),
+            ):
+                note_id = row["note_id"]
+                expected = hashes.get(note_id)
+                # A NULL stored hash (e.g. a vector imported from Kuzu) never
+                # matches, so such vectors are re-embedded on the next rebuild.
+                if expected is not None and expected == row["text_hash"] and row["title_vec"]:
+                    result[note_id] = (
+                        blob_to_vector(row["doc_vec"]).tolist(),
+                        blob_to_vector(row["title_vec"]).tolist(),
+                        row["text_hash"],
+                    )
+        todo = [note for note in notes if note.id not in result]
+        if not todo:
+            return result
+        logger.info(
+            "Embedding %d notes (%d reused unchanged; provider=%s, batch=%d)...",
+            len(todo),
+            len(result),
+            model_id,
+            # Log the configured batch size (clamped like the providers do)
+            # rather than reaching into a provider-private attribute.
+            max(1, int(getattr(config, "embedding_batch_size", 16))),
+        )
         try:
-            logger.info(
-                "Embedding %d notes (provider=%s, batch=%d)...",
-                total,
-                provider.model_id,
-                # Log the configured batch size (clamped like the providers do)
-                # rather than reaching into a provider-private attribute.
-                max(1, int(getattr(config, "embedding_batch_size", 16))),
-            )
             # Chunk the bulk embed so progress is visible during the (slow) embed
-            # phase — a single embed_documents call over the whole vault is opaque
-            # and can run for many minutes on CPU. Each chunk embeds its doc texts
-            # then its title texts in one provider round-trip, then splits the
-            # result (halves remote calls/latency vs. embedding them separately).
-            for start in range(0, total, _EMBED_LOG_CHUNK):
-                chunk = notes[start : start + _EMBED_LOG_CHUNK]
+            # phase. Each chunk embeds its doc texts then its title texts in one
+            # provider round-trip, then splits the result.
+            for start in range(0, len(todo), _EMBED_LOG_CHUNK):
+                chunk = todo[start : start + _EMBED_LOG_CHUNK]
                 doc_texts = [self._embedding_text(note) for note in chunk]
                 title_texts = [self._title_text(note) for note in chunk]
                 all_vectors = provider.embed_documents(doc_texts + title_texts)
                 if len(all_vectors) != 2 * len(chunk):
-                    # A wrong count would split into mismatched halves, leave the
-                    # embedding columns unpopulated (_store_embeddings bails), and
-                    # then the indexes below would still be built over NULLs. Abort
-                    # the whole build instead (caught below → no index created,
-                    # search falls back to BM25 — never an index over incomplete
-                    # embeddings).
+                    # A wrong count would pair vectors with the wrong notes.
                     raise RuntimeError(
                         f"Embedding provider returned {len(all_vectors)} vectors "
-                        f"for {2 * len(chunk)} expected (doc+title); aborting "
-                        "embedding build."
+                        f"for {2 * len(chunk)} expected (doc+title)."
                     )
-                vectors = all_vectors[: len(chunk)]
-                title_vectors = all_vectors[len(chunk):]
-                self._store_embeddings(conn, chunk, vectors, title_vectors)
+                for i, note in enumerate(chunk):
+                    result[note.id] = (
+                        all_vectors[i],
+                        all_vectors[len(chunk) + i],
+                        hashes[note.id],
+                    )
                 logger.info(
-                    "  embedded %d/%d notes", min(start + len(chunk), total), total
+                    "  embedded %d/%d notes", min(start + len(chunk), len(todo)), len(todo)
                 )
-            create_note_vector_index(conn, config.embedding_metric)
-            create_note_vector_index(
-                conn,
-                config.embedding_metric,
-                index_name=NOTE_TITLE_VECTOR_INDEX,
-                column="title_embedding",
-            )
-            logger.info(
-                "Built HNSW vector index over %d notes (metric=%s)",
-                total,
-                config.embedding_metric,
-            )
         except Exception as exc:
             logger.warning(
-                "Embedding build failed; rebuilt index without vectors "
-                "(search will use BM25): %s",
+                "Embedding failed for some notes; they are indexed without "
+                "vectors (search falls back to BM25 for them): %s",
                 exc,
             )
+        return result
 
-    def _set_note_embedding(self, conn: kuzu.Connection, note: Note) -> None:
-        """Embed a single note on create/update into the dirty pending table.
+    def _embed_note(self, note: Note) -> Optional[Tuple[List[float], List[float], str]]:
+        """Embed one note for create/update, or None when unavailable.
 
-        The vector goes to the un-indexed ``PendingEmbedding`` table — once the
-        HNSW index exists, ``Note.embedding`` is locked against ``SET``, so per-note
-        writes must land here. The brute-force fallback reads it until the next
-        rebuild folds the note into the index. Best-effort: a failure (e.g. a
-        missing model) is logged and never blocks note creation. (The embedding is
-        computed here under the global write lock; moving the compute outside the
-        lock is a planned optimization.)
+        Called *before* the write transaction opens, so a slow model never
+        holds the database write lock. Best-effort: a failure (e.g. a missing
+        model) is logged and never blocks the write.
         """
         provider = self._embedding_provider
         if provider is None:
-            return
+            return None
         try:
             vector, title_vector = provider.embed_documents(
                 [self._embedding_text(note), self._title_text(note)]
             )
-            conn.execute(
-                "MERGE (p:PendingEmbedding {id: $id}) "
-                "SET p.embedding = $embedding, p.title_embedding = $title_embedding, "
-                "p.embedded_at = $embedded_at, p.embedding_model = $model",
-                {
-                    "id": note.id,
-                    "embedding": vector,
-                    "title_embedding": title_vector,
-                    "embedded_at": datetime.datetime.now(),
-                    "model": provider.model_id,
-                },
-            )
         except Exception as exc:
             logger.warning("Could not embed note %s: %s", note.id, exc)
+            return None
+        return vector, title_vector, self._embedding_text_hash(note)
+
+    def _write_embeddings(
+        self,
+        conn: sqlite3.Connection,
+        embeddings: Dict[str, Tuple[List[float], List[float], str]],
+    ) -> None:
+        """Upsert vectors and bump the generation so every process reloads them."""
+        if not embeddings or self._embedding_provider is None:
+            return
+        model_id = self._embedding_provider.model_id
+        now = ts_in(datetime.datetime.now())
+        conn.executemany(
+            "INSERT INTO embeddings"
+            "(note_id, model, dim, doc_vec, title_vec, text_hash, embedded_at) "
+            "SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM notes WHERE id = ?) "
+            "ON CONFLICT(note_id) DO UPDATE SET model = excluded.model, "
+            "dim = excluded.dim, doc_vec = excluded.doc_vec, "
+            "title_vec = excluded.title_vec, text_hash = excluded.text_hash, "
+            "embedded_at = excluded.embedded_at",
+            [
+                (
+                    note_id,
+                    model_id,
+                    len(doc),
+                    vector_to_blob(doc),
+                    vector_to_blob(title),
+                    text_hash,
+                    now,
+                    note_id,
+                )
+                for note_id, (doc, title, text_hash) in embeddings.items()
+            ],
+        )
+        bump_counter(conn, EMBEDDING_GENERATION_KEY)
 
     def _search_by_vector(
         self, query_vector: List[float], limit: int
     ) -> Dict[str, float]:
         """Return {note_id: distance} (lower = closer) for a precomputed vector.
 
-        Combines the HNSW index (only when it was built with the *current* model;
-        a stale-model index is skipped) with a brute-force pass over the dirty
-        ``PendingEmbedding`` set — its join to ``Note`` drops deleted notes, and
-        its distance matches the configured metric. Dirty vectors override stale
-        index entries for the same id.
+        An exact scan over every current-model vector (doc and title; the closer
+        of the two counts), so there is no approximate index to go stale.
         """
         if self._embedding_provider is None:
             return {}
-        model_id = self._embedding_provider.model_id
-        metric = (config.embedding_metric or "cosine").strip().lower()
-        doc_expr = _BRUTE_FORCE_DISTANCE.get(metric, _BRUTE_FORCE_DISTANCE["cosine"])
-        title_expr = _BRUTE_FORCE_DISTANCE_TITLE.get(
-            metric, _BRUTE_FORCE_DISTANCE_TITLE["cosine"]
-        )
-
-        def merge_min(target: Dict[str, float], note_id: str, dist: float) -> None:
-            if note_id not in target or dist < target[note_id]:
-                target[note_id] = dist
-
-        # Over-fetch per source: the doc- and title-index top-k can overlap, and
-        # HNSW recall is approximate, so taking only `limit` from each can yield
-        # fewer than `limit` distinct notes (or miss a true match). Fetch a wider
-        # band from each source; the caller re-sorts the merged map by distance
-        # and truncates to `limit`.
-        fetch_k = max(1, limit) * 2
-
-        index_dist: Dict[str, float] = {}
-        pending_dist: Dict[str, float] = {}
         try:
             with self._connection() as conn:
-                # Query the doc index and the title index; keep the closer of the
-                # two per note (a note surfaces if its body OR its title matches).
-                if self._indexed_embedding_model(conn) == model_id:
-                    for index_name in (NOTE_VECTOR_INDEX, NOTE_TITLE_VECTOR_INDEX):
-                        if not note_vector_index_exists(conn, index_name):
-                            continue
-                        try:
-                            # Close the QueryResult (context manager) so Kuzu frees
-                            # its native result buffer immediately. Leaving it to GC
-                            # leaks per query, and vector search runs on every
-                            # find-similar / suggested-links call — the dominant
-                            # source of the daemon's RSS climb under query load.
-                            with conn.execute(
-                                "CALL QUERY_VECTOR_INDEX("
-                                f"'Note', '{index_name}', $q, $k"
-                                ") RETURN node.id AS id, distance ORDER BY distance",
-                                {"q": query_vector, "k": fetch_k},
-                            ) as hnsw:
-                                while hnsw.has_next():
-                                    row = hnsw.get_next()
-                                    merge_min(index_dist, row[0], float(row[1]))
-                        except Exception as exc:
-                            logger.warning(
-                                "HNSW vector query (%s) failed: %s", index_name, exc
-                            )
-                # Brute-force the dirty set over both doc and title vectors.
-                for column, expr in (("embedding", doc_expr),
-                                     ("title_embedding", title_expr)):
-                    try:
-                        with conn.execute(
-                            "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
-                            f"WHERE p.{column} IS NOT NULL "
-                            "AND p.embedding_model = $model "
-                            f"RETURN p.id AS id, {expr} AS dist "
-                            "ORDER BY dist LIMIT $k",
-                            {"q": query_vector, "model": model_id, "k": fetch_k},
-                        ) as brute:
-                            while brute.has_next():
-                                row = brute.get_next()
-                                merge_min(pending_dist, row[0], float(row[1]))
-                    except Exception as exc:
-                        logger.warning(
-                            "Brute-force vector fallback (%s) failed: %s", column, exc
-                        )
+                return self._vectors.search(
+                    conn, query_vector, self._embedding_provider.model_id, max(1, limit)
+                )
         except Exception as exc:
             logger.warning("Vector search failed: %s", exc)
             return {}
-        # Dirty (pending) vectors override stale index entries for the same id.
-        distance_by_id = dict(index_dist)
-        distance_by_id.update(pending_dist)
-        return distance_by_id
 
     def vector_search(self, text: str, limit: int = 50) -> List[Tuple[str, float]]:
         """Nearest notes to *text* as (note_id, distance) pairs, closest first.
@@ -1772,35 +1460,25 @@ class NoteRepository(Repository[Note]):
         return {n: cache[n] for n in wanted if n in cache}
 
     def get_note_embedding(self, note_id: str) -> Optional[List[float]]:
-        """Return a note's stored *current-model* document embedding, freshest first.
+        """Return a note's stored *current-model* document embedding.
 
-        Prefers the dirty ``PendingEmbedding`` over the indexed ``Note.embedding``,
-        and only returns a vector produced by the active model — a stale vector
-        from a previous model would be incompatible with ``_search_by_vector``
-        (which searches current-model vectors). Returns ``None`` when embeddings
-        are disabled or no current-model vector is stored yet.
+        Only returns a vector produced by the active model — a stale vector from
+        a previous model would be incompatible with ``_search_by_vector`` (which
+        searches current-model vectors). Returns ``None`` when embeddings are
+        disabled or no current-model vector is stored yet.
         """
         if self._embedding_provider is None:
             return None
-        model_id = self._embedding_provider.model_id
         try:
             with self._connection() as conn:
-                for query in (
-                    "MATCH (p:PendingEmbedding {id: $id}) "
-                    "WHERE p.embedding IS NOT NULL AND p.embedding_model = $model "
-                    "RETURN p.embedding",
-                    "MATCH (n:Note {id: $id}) "
-                    "WHERE n.embedding IS NOT NULL AND n.embedding_model = $model "
-                    "RETURN n.embedding",
-                ):
-                    result = conn.execute(query, {"id": note_id, "model": model_id})
-                    if result.has_next():
-                        vector = result.get_next()[0]
-                        if vector is not None:
-                            return [float(x) for x in vector]
+                row = conn.execute(
+                    "SELECT doc_vec FROM embeddings WHERE note_id = ? AND model = ?",
+                    (note_id, self._embedding_provider.model_id),
+                ).fetchone()
         except Exception as exc:
             logger.warning("Could not read embedding for %s: %s", note_id, exc)
-        return None
+            return None
+        return blob_to_vector(row["doc_vec"]).tolist() if row else None
 
     def incoming_knowledge_link_ids(
         self,
@@ -1817,149 +1495,77 @@ class NoteRepository(Repository[Note]):
         (which every child links to) would count all its children as structurally
         similar, the scaffolding-dominates-the-graph problem.
         """
-        where = ["NOT r.link_type IN $routing"]
-        params: Dict[str, Any] = {
-            "id": note_id,
-            "routing": list(routing_link_values),
-        }
-        if exclude_reference:
-            where.append("r.link_type <> $reference")
-            params["reference"] = LinkType.REFERENCE.value
-        query = (
-            "MATCH (s:Note)-[r:LINKS_TO]->(n:Note {id: $id}) "
-            "WHERE " + " AND ".join(where) + " RETURN DISTINCT s.id AS id"
+        sql = (
+            "SELECT DISTINCT source_id FROM links WHERE target_id = ? "
+            "AND link_type NOT IN (SELECT value FROM json_each(?))"
         )
+        params: List[Any] = [note_id, _json_ids(routing_link_values)]
+        if exclude_reference:
+            sql += " AND link_type <> ?"
+            params.append(LinkType.REFERENCE.value)
         with self._connection() as conn:
-            return set(_result_first_column(conn.execute(query, params)))
-
-    def _indexed_embedding_model(self, conn: kuzu.Connection) -> Optional[str]:
-        """Return the model id of the embeddings folded into the HNSW index."""
-        try:
-            result = conn.execute(
-                "MATCH (n:Note) WHERE n.embedding_model IS NOT NULL "
-                "RETURN n.embedding_model LIMIT 1"
-            )
-            if result.has_next():
-                return result.get_next()[0]
-        except Exception:  # pragma: no cover - best-effort
-            return None
-        return None
+            return set(_first_column(conn.execute(sql, params)))
 
     def _index_note(
         self, note: Note, rendered_content: Optional[str] = None
     ) -> None:
-        """Upsert a note and its tags/links into the graph database."""
+        """Upsert a note, its tags, links and embedding into the index.
+
+        One write transaction, so other processes see the whole change or none
+        of it. The embedding is computed first, outside the transaction.
+        """
         content_for_db = (
             rendered_content if rendered_content is not None else note.content
         )
-        params = self._note_params(note, content_for_db)
-
+        # Embed the body as written to the file — the same text a rebuild parses
+        # back — so a note's vector doesn't change (and can be reused) on rebuild.
+        embedding = self._embed_note(
+            note
+            if rendered_content is None
+            else note.model_copy(update={"content": rendered_content})
+        )
         with self._connection() as conn:
-            exists_result = conn.execute(
-                "MATCH (n:Note {id: $id}) RETURN n.id", {"id": note.id}
-            )
-            node_exists = exists_result.get_num_tuples() > 0
-
-            if node_exists:
-                update_params = {k: v for k, v in params.items() if k != "created_at"}
-                conn.execute(
-                    """
-                    MATCH (n:Note {id: $id})
-                    SET n.title = $title,
-                        n.content = $content,
-                        n.note_type = $note_type,
-                        n.status = $status,
-                        n.source = $source,
-                        n.due_date = $due_date,
-                        n.priority = $priority,
-                        n.recurrence_rule = $recurrence_rule,
-                        n.estimated_minutes = $estimated_minutes,
-                        n.remind_at = $remind_at,
-                        n.project_id = $project_id,
-                        n.area_id = $area_id,
-                        n.origin = $origin,
-                        n.last_verified = $last_verified,
-                        n.metadata_json = $metadata_json,
-                        n.updated_at = $updated_at
-                    """,
-                    update_params,
-                )
-                conn.execute(
-                    "MATCH (n:Note {id: $id})-[r:HAS_TAG]->() DELETE r",
-                    {"id": note.id},
-                )
-                conn.execute(
-                    "MATCH (n:Note {id: $id})-[r:LINKS_TO]->() DELETE r",
-                    {"id": note.id},
-                )
-            else:
-                conn.execute(
-                    """
-                    CREATE (:Note {
-                        id: $id,
-                        title: $title,
-                        content: $content,
-                        note_type: $note_type,
-                        status: $status,
-                        source: $source,
-                        due_date: $due_date,
-                        priority: $priority,
-                        recurrence_rule: $recurrence_rule,
-                        estimated_minutes: $estimated_minutes,
-                        remind_at: $remind_at,
-                        project_id: $project_id,
-                        area_id: $area_id,
-                        origin: $origin,
-                        last_verified: $last_verified,
-                        metadata_json: $metadata_json,
-                        created_at: $created_at,
-                        updated_at: $updated_at
-                    })
-                    """,
-                    params,
-                )
-
-            self._ensure_tag_nodes(conn, (tag.name for tag in note.tags))
-            self._index_note_relations(note, conn, clear_existing=node_exists)
-            if self._embedding_provider is not None:
-                self._set_note_embedding(conn, note)
+            with transaction(conn):
+                self._write_note_rows(conn, note, content_for_db)
+                self._write_links(conn, [note])
+                if embedding is not None:
+                    self._write_embeddings(conn, {note.id: embedding})
 
     def _fetch_notes_by_ids(
-        self, conn: kuzu.Connection, ids: List[str]
+        self, conn: sqlite3.Connection, ids: List[str]
     ) -> List[Note]:
-        """Reconstruct full Note objects for the given IDs from the graph DB."""
+        """Reconstruct full Note objects for the given IDs from the index."""
         if not ids:
             return []
+        ids_json = _json_ids(ids)
 
-        note_result = conn.execute(
-            f"MATCH (n:Note) WHERE n.id IN $ids RETURN {_NOTE_SELECT}",
-            {"ids": ids},
-        )
-        notes_data = _result_to_records(note_result)
+        notes_data = [
+            dict(row)
+            for row in conn.execute(
+                f"SELECT {_NOTE_SELECT} FROM notes n "
+                "WHERE n.id IN (SELECT value FROM json_each(?))",
+                (ids_json,),
+            )
+        ]
         if not notes_data:
             return []
 
-        tag_result = conn.execute(
-            "MATCH (n:Note)-[:HAS_TAG]->(t:Tag) WHERE n.id IN $ids "
-            "RETURN n.id AS note_id, t.name AS tag_name",
-            {"ids": ids},
-        )
         tags_by_note: Dict[str, List[str]] = defaultdict(list)
-        while tag_result.has_next():
-            row = tag_result.get_next()
-            tags_by_note[row[0]].append(row[1])
+        for row in conn.execute(
+            "SELECT note_id, tag FROM note_tags "
+            "WHERE note_id IN (SELECT value FROM json_each(?))",
+            (ids_json,),
+        ):
+            tags_by_note[row["note_id"]].append(row["tag"])
 
-        link_result = conn.execute(
-            "MATCH (n:Note)-[r:LINKS_TO]->(m:Note) WHERE n.id IN $ids "
-            "RETURN n.id AS source_id, m.id AS target_id, "
-            "r.link_type AS link_type, r.description AS description, "
-            "r.created_at AS created_at",
-            {"ids": ids},
-        )
-        links_by_note: Dict[str, List[Any]] = defaultdict(list)
-        while link_result.has_next():
-            row = link_result.get_next()
-            links_by_note[row[0]].append(row[1:])
+        links_by_note: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+        for row in conn.execute(
+            "SELECT source_id, target_id, link_type, description, created_at "
+            "FROM links WHERE source_id IN (SELECT value FROM json_each(?)) "
+            "ORDER BY pk",
+            (ids_json,),
+        ):
+            links_by_note[row["source_id"]].append(row)
 
         note_map: Dict[str, Note] = {}
         for nd in notes_data:
@@ -1968,10 +1574,10 @@ class NoteRepository(Repository[Note]):
             links = [
                 Link(
                     source_id=note_id,
-                    target_id=row[0],
-                    link_type=LinkType(row[1]),
-                    description=row[2],
-                    created_at=row[3],
+                    target_id=row["target_id"],
+                    link_type=LinkType(row["link_type"]),
+                    description=row["description"],
+                    created_at=ts_out(row["created_at"]) or datetime.datetime.now(),
                 )
                 for row in links_by_note.get(note_id, [])
             ]
@@ -1988,48 +1594,37 @@ class NoteRepository(Repository[Note]):
 
     def _query_fts_index_scored(
         self,
-        conn: kuzu.Connection,
-        index_name: str,
+        conn: sqlite3.Connection,
+        column: str,
         query: str,
         *,
         conjunctive: bool = False,
     ) -> List[Tuple[str, float]]:
-        """Return (note_id, BM25 score) pairs from a full-text query, ranked by score."""
-        # Kuzu's FTS query parser crashes the whole process (Windows access
-        # violation / heap corruption 0xC0000374) on structural characters in the
-        # query string — markdown '#'/'**', newlines, brackets. A dedup probe
-        # built from raw note content, or a user pasting markdown into search,
-        # readily contains these, and a native crash cannot be caught with
-        # try/except — it takes the daemon down silently, leaving every client
-        # hanging. So reduce the query to plain word tokens before it reaches
-        # Kuzu. The FTS engine tokenizes on word boundaries anyway, so this does
-        # not change recall; \w keeps Unicode letters/digits for non-ASCII terms.
-        normalized_query = " ".join(re.findall(r"\w+", query or ""))
-        if not normalized_query:
+        """Return (note_id, BM25 score) pairs from a full-text query, best first.
+
+        *column* is ``"body"`` (title + content), ``"title"`` or ``"content"``.
+        Scores are FTS5's ``bm25()`` negated, so higher is better and every match
+        scores > 0. The query is reduced to plain word tokens (stopwords removed)
+        and each is quoted, so no user input can inject FTS5 query syntax.
+        """
+        expression = fts_match_expression(
+            fts_terms(query), column, conjunctive=conjunctive
+        )
+        if expression is None:
             return []
-
-        query_sql = (
-            "CALL QUERY_FTS_INDEX("
-            f"'Note', '{index_name}', $query"
+        weights = ", ".join(str(w) for w in FTS_WEIGHTS[column])
+        rows = conn.execute(
+            f"SELECT n.id, -bm25(note_fts, {weights}) AS score "
+            "FROM note_fts JOIN notes n ON n.pk = note_fts.rowid "
+            "WHERE note_fts MATCH ? ORDER BY score DESC, n.id",
+            (expression,),
         )
-        if conjunctive:
-            query_sql += ", conjunctive := true"
-        query_sql += ") RETURN node.id AS id, score ORDER BY score DESC"
-
-        result = conn.execute(
-            query_sql,
-            {"query": normalized_query},
-        )
-        pairs: List[Tuple[str, float]] = []
-        while result.has_next():
-            row = result.get_next()
-            pairs.append((row[0], float(row[1])))
-        return pairs
+        return [(row[0], float(row[1])) for row in rows]
 
     def _query_fts_index(
         self,
-        conn: kuzu.Connection,
-        index_name: str,
+        conn: sqlite3.Connection,
+        column: str,
         query: str,
         *,
         conjunctive: bool = False,
@@ -2038,33 +1633,29 @@ class NoteRepository(Repository[Note]):
         return [
             note_id
             for note_id, _score in self._query_fts_index_scored(
-                conn, index_name, query, conjunctive=conjunctive
+                conn, column, query, conjunctive=conjunctive
             )
         ]
 
-    def _term_document_frequency(self, conn: kuzu.Connection, term: str) -> int:
+    def _term_document_frequency(self, conn: sqlite3.Connection, term: str) -> int:
         """Number of notes whose indexed text contains *term* (cached per term).
 
-        COUNTs the FTS matches rather than materializing the id list: a common
-        term (the exact case long-query pruning targets) matches thousands of
-        notes, and building/transferring that list per term per query is wasteful.
-        Cached and invalidated on writes, so the cost is paid at most once per
-        distinct term between corpus changes.
+        Counted through the FTS index itself, so the term is stemmed exactly as
+        at index time. Cached and invalidated on writes, so the cost is paid at
+        most once per distinct term between corpus changes.
         """
         cached = self._fts_term_df_cache.get(term)
         if cached is not None:
             return cached
-        # Reduce to word tokens (FTS-parser safety) before counting; a single
-        # \w+ token is already safe but normalize for robustness.
-        normalized = " ".join(re.findall(r"\w+", term or ""))
         df = 0
-        if normalized:
-            with conn.execute(
-                "CALL QUERY_FTS_INDEX('Note', 'note_text_fts', $q) RETURN count(*) AS df",
-                {"q": normalized},
-            ) as result:
-                if result.has_next():
-                    df = int(result.get_next()[0])
+        expression = fts_match_expression(fts_terms(term), "body", conjunctive=True)
+        if expression is not None:
+            df = int(
+                conn.execute(
+                    "SELECT count(*) FROM note_fts WHERE note_fts MATCH ?",
+                    (expression,),
+                ).fetchone()[0]
+            )
         self._fts_term_df_cache[term] = df
         return df
 
@@ -2078,23 +1669,22 @@ class NoteRepository(Repository[Note]):
         """
         self._fts_term_df_cache.clear()
 
-    def _focus_query_terms(self, conn: kuzu.Connection, query: str) -> str:
+    def _focus_query_terms(self, conn: sqlite3.Connection, query: str) -> str:
         """Reduce a long text FTS query to its most discriminative (lowest-DF) terms.
 
-        A long query with many moderately-common terms makes Kuzu's FTS match a
-        large fraction of the corpus and drop even the BEST match (empirically a
-        query of ~18+ distinct corpus terms in a dense vault drops the true near-
-        duplicate to a 0 score). Keeping only the ``fts_max_query_terms`` lowest-DF
-        (highest-IDF) terms bounds the match set so the best lexical hit stays
-        findable. Short/narrow queries are untouched and pay no DF cost; the vector
-        half of hybrid search still embeds the FULL query, so semantic recall is
-        unchanged.
+        A long query with many moderately-common terms matches a large fraction
+        of the corpus, burying the best match among weak ones (Kuzu's FTS went
+        further and dropped it outright, because common terms scored negative).
+        Keeping only the ``fts_max_query_terms`` lowest-DF (highest-IDF) terms
+        bounds the match set so the best lexical hit stays findable. Short/narrow
+        queries are untouched and pay no DF cost; the vector half of hybrid search
+        still embeds the FULL query, so semantic recall is unchanged.
         """
         max_terms = config.fts_max_query_terms
         if max_terms <= 0:
             return query
         tokens = re.findall(r"\w+", query or "")
-        unique = list(dict.fromkeys(t.lower() for t in tokens))
+        unique = fts_terms(query)
         if len(unique) <= max_terms:
             return query  # already narrow enough — no DF lookups needed
         df = {t: self._term_document_frequency(conn, t) for t in unique}
@@ -2114,8 +1704,8 @@ class NoteRepository(Repository[Note]):
     def text_fts_scores(self, text: str) -> Dict[str, float]:
         """Return {note_id: BM25 score} for *text* against the combined note index.
 
-        Exposes the relevance scores Kuzu already computes for the full-text query
-        so callers can rank by BM25 instead of re-deriving order with lexical
+        Exposes the relevance scores the full-text index already computes so
+        callers can rank by BM25 instead of re-deriving order with lexical
         substring heuristics.
         """
         normalized = text.strip() if isinstance(text, str) else ""
@@ -2125,7 +1715,7 @@ class NoteRepository(Repository[Note]):
             return {
                 note_id: score
                 for note_id, score in self._query_fts_index_scored(
-                    conn, "note_text_fts", normalized
+                    conn, "body", normalized
                 )
             }
 
@@ -2147,7 +1737,7 @@ class NoteRepository(Repository[Note]):
         return ordered_common_ids
 
     def _candidate_ids_and_scores(
-        self, conn: kuzu.Connection, kwargs: Dict[str, Any]
+        self, conn: sqlite3.Connection, kwargs: Dict[str, Any]
     ) -> Tuple[Optional[List[str]], Dict[str, float]]:
         """Return (FTS candidate IDs, BM25 score map) for text filters in *kwargs*.
 
@@ -2166,10 +1756,10 @@ class NoteRepository(Repository[Note]):
         text_query = kwargs.get("text")
         if isinstance(text_query, str):
             # Reduce a long query to its most discriminative terms so it doesn't
-            # match most of the corpus and drop its best lexical hit to a 0 score.
+            # match most of the corpus and bury its best lexical hit.
             ordered_scored.append(
                 self._query_fts_index_scored(
-                    conn, "note_text_fts", self._focus_query_terms(conn, text_query)
+                    conn, "body", self._focus_query_terms(conn, text_query)
                 )
             )
 
@@ -2177,7 +1767,7 @@ class NoteRepository(Repository[Note]):
         if isinstance(title_query, str):
             ordered_scored.append(
                 self._query_fts_index_scored(
-                    conn, "note_title_fts", title_query, conjunctive=True
+                    conn, "title", title_query, conjunctive=True
                 )
             )
 
@@ -2185,7 +1775,7 @@ class NoteRepository(Repository[Note]):
         if isinstance(content_query, str):
             ordered_scored.append(
                 self._query_fts_index_scored(
-                    conn, "note_content_fts", content_query, conjunctive=True
+                    conn, "content", content_query, conjunctive=True
                 )
             )
 
@@ -2237,21 +1827,19 @@ class NoteRepository(Repository[Note]):
             raise IOError(f"Failed to read note {id}: {e}") from e
 
     def get_by_title(self, title: str) -> Optional[Note]:
-        """Get a note by exact title (graph-indexed lookup)."""
+        """Get a note by exact title (indexed lookup)."""
         with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note {title: $title}) RETURN n.id AS id", {"title": title}
-            )
-            if result.get_num_tuples() == 0:
-                return None
-            note_id = result.get_next()[0]
-        return self.get(note_id)
+            row = conn.execute(
+                "SELECT id FROM notes WHERE title = ? ORDER BY pk LIMIT 1", (title,)
+            ).fetchone()
+        if row is None:
+            return None
+        return self.get(row[0])
 
     def get_all(self) -> List[Note]:
-        """Return all notes, reconstructed from the graph index."""
+        """Return all notes, reconstructed from the index."""
         with self._connection() as conn:
-            id_result = conn.execute("MATCH (n:Note) RETURN n.id AS id")
-            ids = _result_first_column(id_result)
+            ids = _first_column(conn.execute("SELECT id FROM notes ORDER BY pk"))
             return self._fetch_notes_by_ids(conn, ids)
 
     def update(self, note: Note) -> Note:
@@ -2336,7 +1924,7 @@ class NoteRepository(Repository[Note]):
         try:
             self._index_note(note, rendered_content=rendered_body)
         except Exception as e:
-            logger.error("Failed to update note in graph database: %s", e)
+            logger.error("Failed to update note in the index: %s", e)
             raise
 
         return note
@@ -2416,7 +2004,16 @@ class NoteRepository(Repository[Note]):
             )
 
         with self._connection() as conn:
-            conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": id})
+            with transaction(conn):
+                conn.execute(
+                    "DELETE FROM note_fts WHERE rowid = "
+                    "(SELECT pk FROM notes WHERE id = ?)",
+                    (id,),
+                )
+                # Cascades to its tags, embedding, and links in both directions.
+                conn.execute("DELETE FROM notes WHERE id = ?", (id,))
+                conn.execute("DELETE FROM retrieval_signals WHERE note_id = ?", (id,))
+                bump_counter(conn, EMBEDDING_GENERATION_KEY)
 
     def search(self, **kwargs: Any) -> List[Note]:
         """Search for notes based on criteria.
@@ -2449,80 +2046,88 @@ class NoteRepository(Repository[Note]):
             if candidate_ids == []:
                 return [], {}
 
-            match_clauses = ["MATCH (n:Note)"]
+            # Every clause below is a fixed string; all values are bound params.
             where_parts: List[str] = []
-            params: Dict[str, Any] = {}
+            params: List[Any] = []
 
             if "tag" in kwargs:
-                match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag {name: $tag})")
-                params["tag"] = kwargs["tag"]
+                where_parts.append(
+                    "EXISTS (SELECT 1 FROM note_tags t WHERE t.note_id = n.id AND t.tag = ?)"
+                )
+                params.append(kwargs["tag"])
             elif "tags" in kwargs:
                 tag_names = kwargs["tags"]
                 if isinstance(tag_names, list):
-                    match_clauses.append("MATCH (n)-[:HAS_TAG]->(zt:Tag)")
-                    where_parts.append("zt.name IN $tags")
-                    params["tags"] = tag_names
+                    where_parts.append(
+                        "EXISTS (SELECT 1 FROM note_tags t WHERE t.note_id = n.id "
+                        "AND t.tag IN (SELECT value FROM json_each(?)))"
+                    )
+                    params.append(_json_ids(tag_names))
 
             if "linked_to" in kwargs:
-                match_clauses.append(
-                    "MATCH (n)-[:LINKS_TO]->(lt_target:Note {id: $linked_to})"
+                where_parts.append(
+                    "EXISTS (SELECT 1 FROM links l WHERE l.source_id = n.id "
+                    "AND l.target_id = ?)"
                 )
-                params["linked_to"] = kwargs["linked_to"]
+                params.append(kwargs["linked_to"])
 
             if "linked_from" in kwargs:
-                match_clauses.append(
-                    "MATCH (lf_source:Note {id: $linked_from})-[:LINKS_TO]->(n)"
+                where_parts.append(
+                    "EXISTS (SELECT 1 FROM links l WHERE l.target_id = n.id "
+                    "AND l.source_id = ?)"
                 )
-                params["linked_from"] = kwargs["linked_from"]
+                params.append(kwargs["linked_from"])
 
             if candidate_ids is not None:
-                where_parts.append("n.id IN $candidate_ids")
-                params["candidate_ids"] = candidate_ids
+                where_parts.append("n.id IN (SELECT value FROM json_each(?))")
+                params.append(_json_ids(candidate_ids))
 
             _scalar: Dict[str, str] = {
-                "note_type": "n.note_type = $note_type",
-                "status": "n.status = $status",
-                "source": "n.source = $source",
-                "priority": "n.priority = $priority",
-                "project_id": "n.project_id = $project_id",
-                "area_id": "n.area_id = $area_id",
+                "note_type": "n.note_type = ?",
+                "status": "n.status = ?",
+                "source": "n.source = ?",
+                "priority": "n.priority = ?",
+                "project_id": "n.project_id = ?",
+                "area_id": "n.area_id = ?",
             }
             for kwarg, clause in _scalar.items():
                 if kwarg in kwargs:
                     where_parts.append(clause)
                     v = kwargs[kwarg]
-                    params[kwarg] = v.value if hasattr(v, "value") else v
+                    params.append(v.value if hasattr(v, "value") else v)
 
             _ts: Dict[str, str] = {
-                "created_after": "n.created_at >= $created_after",
-                "created_before": "n.created_at <= $created_before",
-                "updated_after": "n.updated_at >= $updated_after",
-                "updated_before": "n.updated_at <= $updated_before",
+                "created_after": "n.created_at >= ?",
+                "created_before": "n.created_at <= ?",
+                "updated_after": "n.updated_at >= ?",
+                "updated_before": "n.updated_at <= ?",
             }
             for kwarg, clause in _ts.items():
                 if kwarg in kwargs:
                     where_parts.append(clause)
-                    params[kwarg] = kwargs[kwarg]
+                    v = kwargs[kwarg]
+                    params.append(
+                        ts_in(v) if isinstance(v, (datetime.date, datetime.datetime)) else v
+                    )
 
             _date: Dict[str, str] = {
-                "due_date_before": "n.due_date <= $due_date_before",
-                "due_date_after": "n.due_date >= $due_date_after",
-                "remind_at_before": "n.remind_at <= $remind_at_before",
-                "remind_at_after": "n.remind_at >= $remind_at_after",
+                "due_date_before": "n.due_date <= ?",
+                "due_date_after": "n.due_date >= ?",
+                "remind_at_before": "n.remind_at <= ?",
+                "remind_at_after": "n.remind_at >= ?",
             }
             for kwarg, clause in _date.items():
                 if kwarg in kwargs:
                     where_parts.append(clause)
                     v = kwargs[kwarg]
-                    params[kwarg] = v.isoformat() if hasattr(v, "isoformat") else v
+                    params.append(v.isoformat() if hasattr(v, "isoformat") else v)
 
-            query_parts = ["\n".join(match_clauses)]
+            sql = "SELECT n.id FROM notes n"
             if where_parts:
-                query_parts.append("WHERE " + " AND ".join(where_parts))
-            query_parts.append("RETURN DISTINCT n.id AS id")
+                sql += " WHERE " + " AND ".join(where_parts)
+            sql += " ORDER BY n.pk"
 
-            result = conn.execute("\n".join(query_parts), params)
-            ids = _result_first_column(result)
+            ids = _first_column(conn.execute(sql, params))
             if candidate_ids is not None:
                 id_set = set(ids)
                 ids = [note_id for note_id in candidate_ids if note_id in id_set]
@@ -2538,34 +2143,24 @@ class NoteRepository(Repository[Note]):
         self, note_id: str, direction: str = "outgoing"
     ) -> List[Note]:
         """Find notes linked to/from the given note."""
+        outgoing_sql = (
+            "SELECT target_id FROM links WHERE source_id = ? "
+            "GROUP BY target_id ORDER BY min(pk)"
+        )
+        incoming_sql = (
+            "SELECT source_id FROM links WHERE target_id = ? "
+            "GROUP BY source_id ORDER BY min(pk)"
+        )
         with self._connection() as conn:
             if direction == "outgoing":
-                result = conn.execute(
-                    "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
-                    "RETURN DISTINCT t.id AS id",
-                    {"id": note_id},
-                )
-                ids = _result_first_column(result)
+                ids = _first_column(conn.execute(outgoing_sql, (note_id,)))
             elif direction == "incoming":
-                result = conn.execute(
-                    "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
-                    "RETURN DISTINCT s.id AS id",
-                    {"id": note_id},
-                )
-                ids = _result_first_column(result)
+                ids = _first_column(conn.execute(incoming_sql, (note_id,)))
             elif direction == "both":
-                out_result = conn.execute(
-                    "MATCH (s:Note {id: $id})-[:LINKS_TO]->(t:Note) "
-                    "RETURN DISTINCT t.id AS id",
-                    {"id": note_id},
+                ids_set: Set[str] = set(
+                    _first_column(conn.execute(outgoing_sql, (note_id,)))
                 )
-                in_result = conn.execute(
-                    "MATCH (s:Note)-[:LINKS_TO]->(t:Note {id: $id}) "
-                    "RETURN DISTINCT s.id AS id",
-                    {"id": note_id},
-                )
-                ids_set: Set[str] = set(_result_first_column(out_result))
-                ids_set.update(_result_first_column(in_result))
+                ids_set.update(_first_column(conn.execute(incoming_sql, (note_id,))))
                 ids_set.discard(note_id)
                 ids = list(ids_set)
             else:
@@ -2579,56 +2174,54 @@ class NoteRepository(Repository[Note]):
     def get_all_tags(self) -> List[Tag]:
         """Return every tag currently applied to at least one note.
 
-        Derived from HAS_TAG edges rather than Tag-node existence so the result
-        reflects tags actually in use. A Tag node only exists to classify notes,
-        so a node with no incoming HAS_TAG edge is orphaned cruft (left behind
-        when a tag is removed from its last note) and is intentionally excluded.
+        Derived from note membership, so a tag removed from its last note simply
+        disappears.
         """
         with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (:Note)-[:HAS_TAG]->(t:Tag) "
-                "RETURN DISTINCT t.name AS name"
+            names = _first_column(
+                conn.execute("SELECT DISTINCT tag FROM note_tags ORDER BY tag")
             )
-            return [Tag(name=name) for name in _result_first_column(result)]
+        return [Tag(name=name) for name in names]
 
     def get_link(
         self, source_id: str, target_id: str, link_type: str
     ) -> Optional[Dict[str, Any]]:
         """Return the stored properties of a specific directed link, or None."""
         with self._connection() as conn:
-            result = conn.execute(
-                """
-                MATCH (s:Note {id: $source_id})
-                      -[r:LINKS_TO {link_type: $link_type}]->
-                      (t:Note {id: $target_id})
-                RETURN r.created_at AS created_at
-                """,
-                {
-                    "source_id": source_id,
-                    "target_id": target_id,
-                    "link_type": link_type,
-                },
-            )
-            if result.get_num_tuples() == 0:
-                return None
-            return {"created_at": result.get_next()[0]}
+            row = conn.execute(
+                "SELECT created_at FROM links "
+                "WHERE source_id = ? AND target_id = ? AND link_type = ? "
+                "ORDER BY pk LIMIT 1",
+                (source_id, target_id, link_type),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"created_at": ts_out(row["created_at"])}
 
     def record_retrieval(self, note_ids: List[str]) -> None:
         """Bump retrieval signals (last_retrieved_at, hit_count) for *note_ids*.
 
-        Graph-only operational data: deliberately NOT written to markdown, so
-        reading a note never rewrites its file. Signals survive rebuilds via the
-        explicit carry-over in :meth:`rebuild_index`. No-op in read-only mode.
+        Index-only operational data: deliberately NOT written to markdown, so
+        reading a note never rewrites its file; the table is never cleared by a
+        rebuild. Best-effort — a read must never fail because a hit counter
+        couldn't be written (e.g. another process held the write lock too long).
         """
-        if not note_ids or self.read_only:
+        if not note_ids:
             return
-        with self._connection() as conn:
-            conn.execute(
-                "UNWIND $ids AS nid MATCH (n:Note {id: nid}) "
-                "SET n.last_retrieved_at = $now, "
-                "n.hit_count = coalesce(n.hit_count, 0) + 1",
-                {"ids": list(note_ids), "now": datetime.datetime.now()},
-            )
+        now = ts_in(datetime.datetime.now())
+        try:
+            with self._connection() as conn:
+                with transaction(conn):
+                    conn.executemany(
+                        "INSERT INTO retrieval_signals(note_id, hit_count, last_retrieved_at) "
+                        "SELECT ?, 1, ? WHERE EXISTS (SELECT 1 FROM notes WHERE id = ?) "
+                        "ON CONFLICT(note_id) DO UPDATE SET "
+                        "hit_count = hit_count + 1, "
+                        "last_retrieved_at = excluded.last_retrieved_at",
+                        [(note_id, now, note_id) for note_id in dict.fromkeys(note_ids)],
+                    )
+        except sqlite3.OperationalError as exc:
+            logger.warning("Could not record retrieval signals: %s", exc)
 
     def get_retrieval_signals(
         self, note_ids: List[str]
@@ -2637,74 +2230,47 @@ class NoteRepository(Repository[Note]):
         if not note_ids:
             return {}
         with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note) WHERE n.id IN $ids AND n.hit_count IS NOT NULL "
-                "RETURN n.id AS id, n.last_retrieved_at AS last_retrieved_at, "
-                "n.hit_count AS hit_count",
-                {"ids": list(note_ids)},
-            )
-            signals: Dict[str, Dict[str, Any]] = {}
-            while result.has_next():
-                row = result.get_next()
-                signals[row[0]] = {
-                    "last_retrieved_at": row[1],
-                    "hit_count": row[2],
-                }
-            return signals
-
-    def _fetch_retrieval_signals(self) -> List[Dict[str, Any]]:
-        """Snapshot all retrieval signals for carry-over into a rebuilt graph."""
-        with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note) WHERE n.hit_count IS NOT NULL "
-                "RETURN n.id AS id, n.last_retrieved_at AS last_retrieved_at, "
-                "n.hit_count AS hit_count"
-            )
-            rows: List[Dict[str, Any]] = []
-            while result.has_next():
-                row = result.get_next()
-                rows.append(
-                    {
-                        "id": row[0],
-                        "last_retrieved_at": row[1],
-                        "hit_count": row[2],
-                    }
-                )
-            return rows
+            rows = conn.execute(
+                "SELECT note_id, last_retrieved_at, hit_count FROM retrieval_signals "
+                "WHERE note_id IN (SELECT value FROM json_each(?))",
+                (_json_ids(note_ids),),
+            ).fetchall()
+        return {
+            row["note_id"]: {
+                "last_retrieved_at": ts_out(row["last_retrieved_at"]),
+                "hit_count": row["hit_count"],
+            }
+            for row in rows
+        }
 
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""
         with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note) "
-                "OPTIONAL MATCH (n)-[:LINKS_TO]->(out:Note) "
-                "WITH n, count(DISTINCT out) AS outgoing "
-                "OPTIONAL MATCH (incoming:Note)-[:LINKS_TO]->(n) "
-                "WITH n, outgoing, count(DISTINCT incoming) AS incoming "
-                "WHERE outgoing = 0 AND incoming = 0 "
-                "RETURN n.id AS id"
+            return _first_column(
+                conn.execute(
+                    "SELECT n.id FROM notes n "
+                    "WHERE NOT EXISTS (SELECT 1 FROM links WHERE source_id = n.id) "
+                    "AND NOT EXISTS (SELECT 1 FROM links WHERE target_id = n.id) "
+                    "ORDER BY n.pk"
+                )
             )
-            return _result_first_column(result)
 
     def get_connection_counts(self, limit: int = 10) -> List[Tuple[str, int]]:
-        """Return (note_id, connection_count) for the most-connected notes."""
-        with self._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note) "
-                "OPTIONAL MATCH (n)-[:LINKS_TO]->(out:Note) "
-                "WITH n, count(DISTINCT out) AS outgoing "
-                "OPTIONAL MATCH (incoming:Note)-[:LINKS_TO]->(n) "
-                "WITH n, outgoing, count(DISTINCT incoming) AS incoming "
-                "WITH n.id AS id, outgoing + incoming AS cnt "
-                "WHERE cnt > 0 "
-                "RETURN id, cnt "
-                "ORDER BY cnt DESC, id ASC "
-                "LIMIT $limit",
-                {"limit": limit},
-            )
+        """Return (note_id, connection_count) for the most-connected notes.
 
-            ranked: List[Tuple[str, int]] = []
-            while result.has_next():
-                row = result.get_next()
-                ranked.append((row[0], row[1]))
-            return ranked
+        A note's count is its distinct outgoing targets plus distinct incoming
+        sources (a note linked both ways with another counts it twice, once per
+        direction), as the Kuzu index counted it.
+        """
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT id, cnt FROM ("
+                "  SELECT n.id AS id,"
+                "    (SELECT count(DISTINCT target_id) FROM links WHERE source_id = n.id)"
+                "    + (SELECT count(DISTINCT source_id) FROM links WHERE target_id = n.id)"
+                "    AS cnt"
+                "  FROM notes n"
+                ") WHERE cnt > 0 ORDER BY cnt DESC, id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [(row["id"], row["cnt"]) for row in rows]

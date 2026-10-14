@@ -1,10 +1,10 @@
 # Installation Guide
 
-Step-by-step installation for Parazettel MCP, including both direct single-chat usage and the shared daemon setup recommended for multi-chat use.
+Step-by-step installation for Parazettel MCP, including both direct usage and the shared daemon setup (which keeps the embedding model warm across chats).
 
 ## Prerequisites
 
-- Python 3.13+
+- Python 3.13+ whose bundled SQLite includes FTS5 (true of uv-managed and most standard builds)
 - [uv](https://github.com/astral-sh/uv) recommended
 - Claude Code or another MCP client
 - Git
@@ -29,8 +29,8 @@ Windows PowerShell uses:
 
 Parazettel now has two runtime modes:
 
-- `direct`: the MCP process opens the graph DB itself. Fine for tests and single-chat use.
-- `daemon`: one long-lived local daemon owns the graph DB, and MCP clients proxy through it. This is the recommended mode for multiple chat windows.
+- `direct`: the MCP process opens the SQLite index itself. Safe for multiple chat windows: every process can read and write, and a cross-process write lock (`<index>.write.lock`) serializes writes.
+- `daemon`: one long-lived local daemon serves the index, and MCP clients proxy through it. Not required for correctness, but it keeps the embedding model and reranker warm, so it is the recommended mode when embeddings are enabled.
 
 ## Step 3: Set Environment Variables
 
@@ -38,7 +38,7 @@ At minimum, configure:
 
 ```bash
 export PARAZETTEL_NOTES_DIR="/absolute/path/to/notes"
-export PARAZETTEL_GRAPH_DB_PATH="/absolute/path/to/data/db/graph.kuzu"
+export PARAZETTEL_INDEX_DB_PATH="/absolute/path/to/data/db/index.sqlite3"
 export PARAZETTEL_LOG_LEVEL="INFO"
 ```
 
@@ -53,10 +53,17 @@ export PARAZETTEL_DAEMON_PORT="8766"
 The daemon auto-shuts down after an idle period (default 3600s); override it with
 `--daemon-idle-timeout <seconds>` at startup (`0` keeps it always-on).
 
+Optional tuning:
+
+- `PARAZETTEL_INDEX_BACKUP_KEEP`: timestamped pre-rebuild index backups to keep (default 5)
+- `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS`: how long to wait on a locked index (default 10000)
+- `PARAZETTEL_DEDUP_MIN_BM25`: lexical dedup-on-create floor (default 1.5)
+
 Legacy compatibility:
 
-- `PARAZETTEL_DATABASE_PATH` is still accepted for older launchers.
-- If it points to `something.db`, Parazettel maps it to a sibling `graph.kuzu` path.
+- `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path` are deprecated but still honoured. When no index path is set, a `*.kuzu` value places the index at a sibling `index.sqlite3` (never the Kuzu file itself); any other value is used as-is.
+- `PARAZETTEL_DATABASE_PATH` is still accepted for older launchers. If it points to `something.db`, Parazettel maps it to a sibling `graph.kuzu` path, which in turn places the index at a sibling `index.sqlite3`.
+- `PARAZETTEL_KUZU_BUFFER_POOL_BYTES` is no longer used; it is ignored with a warning.
 
 ## Step 4: Create the Notes Directory
 
@@ -68,13 +75,13 @@ mkdir -p /absolute/path/to/data/db
 Parazettel stores:
 
 - Markdown note files in `PARAZETTEL_NOTES_DIR`
-- Kuzu graph index at `PARAZETTEL_GRAPH_DB_PATH`
+- SQLite index at `PARAZETTEL_INDEX_DB_PATH` (default `data/db/index.sqlite3`), rebuildable from the markdown files at any time
 
 ## Step 5: Register the MCP Server
 
 ### Direct mode
 
-Use this for a single chat window or simple local development:
+Use this for simple local setups (multiple chat windows are fine):
 
 ```json
 {
@@ -84,7 +91,7 @@ Use this for a single chat window or simple local development:
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/notes",
-        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/data/db/graph.kuzu",
+        "PARAZETTEL_INDEX_DB_PATH": "/absolute/path/to/data/db/index.sqlite3",
         "PARAZETTEL_LOG_LEVEL": "INFO"
       }
     }
@@ -102,7 +109,7 @@ By default, daemon-backed MCP launches now auto-start the local daemon if it is 
 python -m parazettel_mcp.main \
   --run-daemon \
   --notes-dir /absolute/path/to/notes \
-  --graph-db-path /absolute/path/to/data/db/graph.kuzu \
+  --index-db-path /absolute/path/to/data/db/index.sqlite3 \
   --daemon-host 127.0.0.1 \
   --daemon-port 8766
 ```
@@ -117,7 +124,7 @@ python -m parazettel_mcp.main \
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/notes",
-        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/data/db/graph.kuzu",
+        "PARAZETTEL_INDEX_DB_PATH": "/absolute/path/to/data/db/index.sqlite3",
         "PARAZETTEL_BACKEND_MODE": "daemon",
         "PARAZETTEL_DAEMON_HOST": "127.0.0.1",
         "PARAZETTEL_DAEMON_PORT": "8766",
@@ -128,7 +135,7 @@ python -m parazettel_mcp.main \
 }
 ```
 
-This is the recommended setup when you want multiple chat windows to use Parazettel at the same time.
+This is the recommended setup when embeddings are enabled, so each chat doesn't load its own copy of the model.
 
 Daemon lifecycle commands:
 
@@ -148,39 +155,38 @@ Start your MCP client and verify the server is visible. Parazettel currently exp
 
 Then run a simple smoke test such as creating an area note or fetching an existing note.
 
-## Step 7: Optional Migration from SQLite
+## Step 7: Optional Migration from Kuzu
 
-If you are migrating an older vault:
+If your vault was indexed by an earlier Kuzu-based release (`graph.kuzu`), stop the daemon and every Claude session, then run:
 
 ```bash
-python scripts/migrate_to_graphdb.py \
-  --notes-dir /absolute/path/to/notes \
-  --graph-db-path /absolute/path/to/data/db/graph.kuzu
+python scripts/migrate_kuzu_to_sqlite.py
 ```
 
 Notes:
 
-- rerunning against an existing graph target updates/imports current notes
-- reruns do not prune stale nodes for deleted markdown files
-- use a fresh graph target for a clean one-shot migration
+- it opens `graph.kuzu` read-only and rebuilds the SQLite index from the markdown files
+- it carries over retrieval signals and existing embedding vectors, and embeds notes that had none
+- it verifies counts against Kuzu and `check_consistency`, and writes an audit export `kuzu_export.<timestamp>.json`
+- flags: `--reembed`, `--force`, `--accept-differences`, `--export-signals-back` (rollback helper)
+- it requires the `kuzu` package (still installed for now)
+- to roll back, run the previous release against the untouched `graph.kuzu`
+
+New vaults need no migration: the index is created on first start.
 
 ## Troubleshooting
-
-### MCP server starts but a second chat cannot write
-
-You are probably still running in `direct` mode. Switch to shared daemon mode so one process owns `graph.kuzu`.
 
 ### `Parazettel daemon is unavailable`
 
 The MCP facade is configured for daemon mode but could not reach or auto-start the daemon. Check host/port settings and whether another local process is already occupying the daemon port. `python -m parazettel_mcp.main --daemon-status` is the fastest way to verify the current daemon state.
 
-### `Could not set lock on file ... graph.kuzu`
+### `Timed out ... waiting for ... index.sqlite3.write.lock`
 
-That means two direct processes tried to open the same graph DB. Shared daemon mode is the correct fix.
+Writes from every process queue on the cross-process write lock; a write waits up to 10 minutes for another process's write (usually a long rebuild that is re-embedding on CPU) before giving up. Retry once the other write finishes. The lock is released automatically when the holding process exits. (Plain SQLite `database is locked` errors are governed by `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS`, default 10000.)
 
-### Old launcher still passes `--database-path`
+### Old launcher still passes `--graph-db-path` or `--database-path`
 
-That is still supported, but you should migrate config to `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`.
+That is still supported, but you should migrate config to `PARAZETTEL_INDEX_DB_PATH` / `--index-db-path`.
 
 ## Next Reading
 

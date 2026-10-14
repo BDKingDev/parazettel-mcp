@@ -119,7 +119,7 @@ function Clear-StaleLocks([string]$repo) {
 }
 
 Set-DefaultEnv "PARAZETTEL_NOTES_DIR"        (Join-Path $repo "data\notes")
-Set-DefaultEnv "PARAZETTEL_GRAPH_DB_PATH"    (Join-Path $repo "data\db\graph.kuzu")
+Set-DefaultEnv "PARAZETTEL_INDEX_DB_PATH"    (Join-Path $repo "data\db\index.sqlite3")
 Set-DefaultEnv "PARAZETTEL_BACKEND_MODE"     "daemon"
 Set-DefaultEnv "PARAZETTEL_DAEMON_HOST"      "127.0.0.1"
 Set-DefaultEnv "PARAZETTEL_DAEMON_PORT"      "8766"

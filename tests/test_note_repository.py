@@ -7,8 +7,8 @@ from uuid import uuid4
 
 import pytest
 
+import _index_helpers as index_helpers
 from parazettel_mcp.config import config
-from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import LinkType, Note, NoteStatus, NoteType, Tag
 from parazettel_mcp.storage.note_repository import (
     NoteRepository,
@@ -652,24 +652,26 @@ def test_rebuild_index_repopulates_graph(note_repository):
     assert backup_path.exists()
 
 
-def test_create_graph_backup_copies_directory_snapshot(note_repository, tmp_path, monkeypatch):
-    """Directory-backed graph paths should be snapshotted with copytree."""
-    graph_dir = tmp_path / "graph.kuzu"
-    graph_dir.mkdir()
-    nested_file = graph_dir / "data.bin"
-    nested_file.write_text("graph-bytes", encoding="utf-8")
+def test_index_backup_is_a_consistent_copy_and_old_ones_are_pruned(
+    note_repository, monkeypatch
+):
+    """Backups use SQLite's online backup API and keep only the newest N."""
+    import sqlite3
 
-    note_repository.graph_db_path = graph_dir
-    monkeypatch.setattr(note_repository, "close", lambda: None)
-    monkeypatch.setattr(
-        note_repository, "_open_graph_db", lambda allow_rebuild_if_needed=False: None
+    monkeypatch.setattr(config, "index_backup_keep", 2)
+    saved = note_repository.create(Note(title="Backed Up", content="Body"))
+    backups = []
+    for _ in range(3):
+        backups.append(note_repository._create_index_backup())
+    copy = sqlite3.connect(str(backups[-1]))
+    try:
+        assert copy.execute("SELECT id FROM notes").fetchall() == [(saved.id,)]
+    finally:
+        copy.close()
+    remaining = sorted(
+        note_repository.index_db_path.parent.glob(f"{note_repository.index_db_path.name}.*.bak")
     )
-
-    backup_path = note_repository._create_graph_backup()
-
-    assert backup_path is not None
-    assert backup_path.is_dir()
-    assert (backup_path / "data.bin").read_text(encoding="utf-8") == "graph-bytes"
+    assert len(remaining) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -677,14 +679,9 @@ def test_create_graph_backup_copies_directory_snapshot(note_repository, tmp_path
 # ---------------------------------------------------------------------------
 
 
-def test_graph_db_initialized(note_repository):
-    """Graph database should be initialised after repository construction."""
-    conn = note_repository._get_conn()
-    try:
-        result = conn.execute("MATCH (n:Note) RETURN count(n) AS cnt")
-        count = result.get_next()[0]
-    finally:
-        conn.close()
+def test_index_initialized(note_repository):
+    """The index schema should exist after repository construction."""
+    count = note_repository._get_conn().execute("SELECT count(*) FROM notes").fetchone()[0]
     assert count == 0  # empty repository has no notes
 
 
@@ -699,15 +696,22 @@ def test_fetch_notes_by_ids_preserves_requested_order(note_repository):
     assert [note.id for note in ordered] == [second.id, first.id]
 
 
-def test_connection_helper_closes_graph_connection(note_repository):
-    """_connection() should close the underlying Kuzu connection."""
-    fake_conn = MagicMock()
+def test_connections_are_per_thread_and_released_on_close(note_repository):
+    """Each thread reuses its own connection; close() releases all of them."""
+    import sqlite3
+    import threading
 
-    with patch.object(note_repository, "_get_conn", return_value=fake_conn):
-        with note_repository._connection() as conn:
-            assert conn is fake_conn
+    main_conn = note_repository._get_conn()
+    assert note_repository._get_conn() is main_conn
+    other = {}
+    thread = threading.Thread(target=lambda: other.update(conn=note_repository._get_conn()))
+    thread.start()
+    thread.join()
+    assert other["conn"] is not main_conn
 
-    fake_conn.close.assert_called_once()
+    note_repository.close()
+    with pytest.raises(sqlite3.ProgrammingError):
+        main_conn.execute("SELECT 1")
 
 
 def test_closed_repository_rejects_new_connections(note_repository):
@@ -796,66 +800,24 @@ def test_multiple_repositories_share_same_graph_path():
         shutil.rmtree(test_root, ignore_errors=True)
 
 
-def test_repository_falls_back_to_read_only_when_graph_db_locked(monkeypatch):
-    """A second process lock should degrade to read-only mode instead of failing init."""
-    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
-    notes_dir = test_root / "notes"
-    graph_db_path = test_root / "db" / "test_graph.kuzu"
-    notes_dir.mkdir(parents=True, exist_ok=True)
-    graph_db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    original_notes_dir = config.notes_dir
-    original_graph_db_path = config.graph_db_path
-    init_calls = []
-    close_calls = []
-    repository = None
-
-    def fake_init_graph_db(
-        db_path: Path, read_only: bool = False, buffer_pool_size: int = 0
-    ):
-        init_calls.append((Path(db_path), read_only))
-        if not read_only:
-            raise RuntimeError(f"Could not set lock on file {db_path}")
-        return MagicMock(name="readonly_graph_db")
-
-    def fake_close_graph_db(db_path: Path, read_only: bool = False):
-        close_calls.append((Path(db_path), read_only))
-
+def test_two_repositories_on_one_index_can_both_write(test_config):
+    """A second repository (as a second MCP session would open) is never read-only."""
+    first = NoteRepository(notes_dir=test_config.notes_dir)
+    second = NoteRepository(notes_dir=test_config.notes_dir)
     try:
-        config.notes_dir = notes_dir
-        config.graph_db_path = graph_db_path
-        monkeypatch.setattr(
-            "parazettel_mcp.storage.note_repository.init_graph_db",
-            fake_init_graph_db,
-        )
-        monkeypatch.setattr(
-            "parazettel_mcp.storage.note_repository.close_graph_db",
-            fake_close_graph_db,
-        )
-        monkeypatch.setattr(
-            NoteRepository,
-            "rebuild_index_if_needed",
-            lambda self: pytest.fail("read-only fallback should skip rebuild checks"),
-        )
-
-        repository = NoteRepository(notes_dir=notes_dir)
-
-        assert repository.read_only is True
-        assert [read_only for _, read_only in init_calls] == [False, True]
-        assert init_calls[0][0].name == graph_db_path.name
+        assert first.read_only is False and second.read_only is False
+        a = first.create(Note(title="From first", content="a"))
+        b = second.create(Note(title="From second", content="b"))
+        assert {n.id for n in first.get_all()} == {a.id, b.id}
+        assert {n.id for n in second.get_all()} == {a.id, b.id}
     finally:
-        if repository is not None:
-            repository.close()
-        config.notes_dir = original_notes_dir
-        config.graph_db_path = original_graph_db_path
-        shutil.rmtree(test_root, ignore_errors=True)
-
-    assert close_calls
-    assert close_calls[-1][1] is True
+        first.close()
+        second.close()
 
 
 def test_create_uses_graph_db_without_creating_legacy_sqlite():
-    """Repository writes should index into Kuzu without creating the legacy SQLite DB."""
+    """A legacy ``*.kuzu`` path maps to a sibling SQLite index; neither the Kuzu
+    file nor the pre-Kuzu SQLAlchemy database is ever created."""
     test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
     notes_dir = test_root / "notes"
     graph_db_path = test_root / "db" / "test_graph.kuzu"
@@ -865,49 +827,32 @@ def test_create_uses_graph_db_without_creating_legacy_sqlite():
 
     original_notes_dir = config.notes_dir
     original_graph_db_path = config.graph_db_path
+    original_index_db_path = config.index_db_path
     original_database_path = config.database_path
     repository = None
 
     try:
         config.notes_dir = notes_dir
         config.graph_db_path = graph_db_path
+        config.index_db_path = None
         config.database_path = legacy_db_path
 
         repository = NoteRepository(notes_dir=notes_dir)
-        saved = repository.create(Note(title="Graph Write Test", content="Uses Kuzu"))
+        saved = repository.create(Note(title="Index Write Test", content="Uses SQLite"))
 
-        assert graph_db_path.exists()
+        assert repository.index_db_path == graph_db_path.with_name("index.sqlite3")
+        assert repository.index_db_path.exists()
+        assert not graph_db_path.exists()
         assert not legacy_db_path.exists()
-
-        with repository._connection() as conn:
-            result = conn.execute(
-                "MATCH (n:Note {id: $id}) RETURN count(n) AS cnt",
-                {"id": saved.id},
-            )
-            assert result.get_next()[0] == 1
+        assert index_helpers.note_indexed(repository, saved.id)
     finally:
         if repository is not None:
             repository.close()
         config.notes_dir = original_notes_dir
         config.graph_db_path = original_graph_db_path
+        config.index_db_path = original_index_db_path
         config.database_path = original_database_path
         shutil.rmtree(test_root, ignore_errors=True)
-
-
-def test_read_only_repository_rejects_create(note_repository):
-    """Mutating writes should fail fast in read-only graph mode."""
-    note_repository.read_only = True
-
-    with pytest.raises(GraphDatabaseReadOnlyError, match="read-only graph mode"):
-        note_repository.create(Note(title="Blocked Write", content="No writes"))
-
-
-def test_read_only_repository_rejects_rebuild(note_repository):
-    """Index rebuild should fail fast in read-only graph mode."""
-    note_repository.read_only = True
-
-    with pytest.raises(GraphDatabaseReadOnlyError, match="read-only graph mode"):
-        note_repository.rebuild_index()
 
 
 def test_create_leaves_no_tmp_file(note_repository):
@@ -1036,9 +981,9 @@ def test_rebuild_index_if_needed_detects_extra_file(note_repository):
     """rebuild_index_if_needed() should trigger rebuild when a file exists but DB lacks it."""
     note = Note(title="Extra File Test", content="Exists on disk only.")
     saved = note_repository.create(note)
-    # Manually delete from graph DB but leave file
+    # Manually delete from the index but leave the file
     with note_repository._connection() as conn:
-        conn.execute("MATCH (n:Note {id: $id}) DETACH DELETE n", {"id": saved.id})
+        conn.execute("DELETE FROM notes WHERE id = ?", (saved.id,))
     # Should detect mismatch and rebuild (DB re-indexed from file)
     note_repository.rebuild_index_if_needed()
     result = note_repository.get(saved.id)
@@ -1201,54 +1146,6 @@ def test_search_content_matches_get_content(note_repository):
     assert from_db[0].content == from_file.content
 
 
-def test_copy_file_with_retry_recovers_from_transient_lock(tmp_path):
-    """The graph-backup copy retries WinError 33 (locked region) until it clears."""
-    from parazettel_mcp.storage import note_repository as nr
-
-    src = tmp_path / "graph.kuzu"
-    src.write_bytes(b"db-bytes")
-    dst = tmp_path / "graph.kuzu.bak"
-
-    real_copy = shutil.copy2
-    calls = {"n": 0}
-
-    def flaky_copy(s, d, *args, **kwargs):
-        calls["n"] += 1
-        if calls["n"] < 3:
-            err = PermissionError("locked")
-            err.winerror = 33  # ERROR_LOCK_VIOLATION
-            raise err
-        return real_copy(s, d, *args, **kwargs)
-
-    with patch.object(nr.shutil, "copy2", side_effect=flaky_copy):
-        with patch.object(nr.time, "sleep", lambda *_: None):
-            nr._copy_file_with_retry(src, dst)
-
-    assert calls["n"] == 3  # failed twice, succeeded on the third attempt
-    assert dst.read_bytes() == b"db-bytes"
-
-
-def test_copy_file_with_retry_reraises_non_retryable_error(tmp_path):
-    """A non-lock OSError is not retried and propagates immediately."""
-    from parazettel_mcp.storage import note_repository as nr
-
-    src = tmp_path / "graph.kuzu"
-    src.write_bytes(b"x")
-    dst = tmp_path / "graph.kuzu.bak"
-
-    calls = {"n": 0}
-
-    def failing_copy(s, d, *args, **kwargs):
-        calls["n"] += 1
-        raise FileNotFoundError("missing")
-
-    with patch.object(nr.shutil, "copy2", side_effect=failing_copy):
-        with pytest.raises(FileNotFoundError):
-            nr._copy_file_with_retry(src, dst)
-
-    assert calls["n"] == 1  # not retried
-
-
 def test_atomic_write_fsyncs_temp_file_before_replace(note_repository):
     """The temp file is fsync'd BEFORE the atomic rename, not merely sometime.
 
@@ -1285,45 +1182,35 @@ def test_atomic_write_fsyncs_temp_file_before_replace(note_repository):
     assert target.read_text(encoding="utf-8") == "# hi\n\nbody\n"
 
 
-# --- FTS query sanitization (Kuzu native-crash regression) ------------------
+# --- FTS query escaping -----------------------------------------------------
 #
-# Kuzu's FTS parser segfaults (Windows access violation / heap corruption) on
-# structural characters in the query string — markdown '#'/'**', newlines,
-# brackets. The ingest_batch dedup probe builds its FTS query from a note's raw
-# markdown content, so this crashed the whole daemon (a native crash no
-# try/except can catch) and left clients hanging. The query must be reduced to
-# plain word tokens before it reaches Kuzu.
+# Dedup probes and pasted searches are built from raw markdown. User text must
+# never be interpreted as FTS5 query syntax (quotes, NEAR, AND/OR/NOT, *, ^,
+# column filters), so it is reduced to word tokens and each token is quoted.
 
 
-def test_fts_query_is_reduced_to_word_tokens():
-    """The FTS query passed to Kuzu must contain only word tokens — the markdown
-    structure that crashes Kuzu's parser is stripped before conn.execute."""
+def test_fts_query_is_reduced_to_quoted_word_tokens():
+    """The MATCH expression contains only quoted word tokens (stopwords dropped)."""
     captured = {}
 
-    class _FakeResult:
-        def has_next(self):
-            return False
-
-        def get_next(self):  # pragma: no cover - never called
-            return None
-
     class _FakeConn:
-        def execute(self, sql, params=None):
+        def execute(self, sql, params=()):
             captured["sql"] = sql
-            captured["params"] = params or {}
-            return _FakeResult()
+            captured["params"] = params
+            return []
 
     # Unbound call: _query_fts_index_scored only touches the conn it is given.
     NoteRepository._query_fts_index_scored(
         MagicMock(),
         _FakeConn(),
-        "note_text_fts",
-        "# Heading\n\n- **Bold (e.g. x)** runs the flow",
+        "body",
+        "# Heading\n\n- **Bold (e.g. x) OR NEAR** runs the flow",
     )
 
-    sent = captured["params"]["query"]
-    assert sent == "Heading Bold e g x runs the flow"
-    for bad in ("#", "*", "(", ")", "\n"):
+    sent = captured["params"][0]
+    # "or", "near", "the", "e" and "x" are stopwords; the rest are quoted literals.
+    assert sent == '{body} : ("heading" OR "bold" OR "g" OR "runs" OR "flow")'
+    for bad in ("#", "*", "(e", "\n"):
         assert bad not in sent
 
 

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 
 from parazettel_mcp.daemon.client import DaemonUnavailableError
-from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import LinkType, NoteSource, NoteStatus, NoteType
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
 

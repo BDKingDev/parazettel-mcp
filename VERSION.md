@@ -27,6 +27,22 @@ This batch turns the vault from a search index into durable AI memory. Brings th
 - **Memory primitives** — new `origin` (provenance) and `last_verified` note fields; graph-side retrieval signals (`hit_count`, `last_retrieved_at`) carried across rebuilds; tags normalized on every write (lowercase-hyphenated, `@` GTD prefix preserved).
 - **Reliability** — daemon auto-start serialized with an OS file lock (kills the double-spawn read-only race); `delete()` is resilient to unparseable notes; test suite parallelized (~5.5 min → ~2 min) via a session-scoped template DB and a serialized rebuild group.
 
+### Storage: the index moves from Kuzu to SQLite
+
+Kuzu was archived upstream in October 2025 (final release 0.11.3), so the index is now SQLite (stdlib `sqlite3`, WAL mode). Markdown files remain the source of truth; the index rebuilds from them.
+
+- **New index path** — `PARAZETTEL_INDEX_DB_PATH` / `--index-db-path`, default `data/db/index.sqlite3`. `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path` are deprecated but still honoured (a `*.kuzu` value places the index at a sibling `index.sqlite3`; never the Kuzu file itself), so existing configs keep working. `PARAZETTEL_DATABASE_PATH` mapping is unchanged.
+- **Migration** — stop the daemon and all Claude sessions, then run `scripts/migrate_kuzu_to_sqlite.py`. It opens `graph.kuzu` read-only, rebuilds from markdown, imports retrieval signals and existing vectors, embeds notes that had none, verifies against Kuzu and `check_consistency`, and writes a `kuzu_export.<ts>.json` audit export (`--reembed`, `--force`, `--accept-differences`, `--export-signals-back`). Rollback = previous release + the untouched `graph.kuzu`. The `kuzu` dependency stays for now and is removed in a later release.
+- **No more read-only mode** — every MCP process (each Claude session) can read and write. A cross-process write lock (`<index>.write.lock`) serializes writes so concurrent sessions can't lose each other's markdown edits. The daemon is no longer needed for correctness; it still keeps the embedding model and reranker warm.
+- **Full-text search on FTS5** — porter stemming and the same English stopword list; digits are now searchable; query text is quoted so it can't inject FTS syntax. BM25 stays higher-is-better.
+- **Exact vector search** — float32 vectors searched brute-force (cosine/l2/dotproduct via numpy, now a core dependency); no HNSW index or `PendingEmbedding` table. A note matches on the closer of its doc and title vectors.
+- **Faster rebuilds** — a rebuild reuses each stored vector whose model and embedded text are unchanged, and runs in one write transaction (readers see the old index until commit). Backups use SQLite's online backup API; `PARAZETTEL_INDEX_BACKUP_KEEP` (default 5) bounds them.
+- **New settings** — `PARAZETTEL_INDEX_BACKUP_KEEP`, `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS` (default 10000), `PARAZETTEL_DEDUP_MIN_BM25` (default 1.5). `PARAZETTEL_KUZU_BUFFER_POOL_BYTES` is removed (ignored with a warning).
+- **`/health` embedding status** — the daemon health payload now includes `index` (`backend`, `path`, `notes`, `journal_mode`) and `embeddings` (`enabled`, `model_id`, `vectors_stored`, `generation`).
+- **`scripts/search_eval.py`** — `generate` / `run` / `compare` harness for measuring search quality across backends.
+- **Fixed:** a note's vector no longer changes after a rebuild — create and rebuild now embed the same file body.
+- **Tests** — `pytest -n 4` is enough (~10s); `--dist loadgroup` is no longer needed because rebuild tests aren't serialized.
+
 ## v0.5.1.1 (Current Release)
 
 **Release Date:** 2026-05-11

@@ -20,6 +20,7 @@ dependencies = [
     "mcp[cli]>=1.2.0",
     "tomli; python_version < '3.11'",
     "kuzu>=0.11.3,<0.12",
+    "numpy>=1.26",
     "pydantic>=2.0.0",
     "python-frontmatter>=1.0.0",
     "markdown>=3.4.0",
@@ -37,6 +38,12 @@ dev = [
 ]
 migration = [
     "sqlalchemy>=2.0.0",
+]
+# Reads the old Kuzu database for the one-time migration to the SQLite index
+# (scripts/migrate_kuzu_to_sqlite.py). Kuzu is still a core dependency for now;
+# this extra keeps the migration installable once it is dropped from the core.
+legacy-kuzu = [
+    "kuzu>=0.11.3,<0.12",
 ]
 # Optional semantic embeddings (PARAZETTEL_EMBEDDING_ENABLED=true). Two tiers:
 # "lite" = fastembed (ONNX, no PyTorch — small, fast, recommended default);

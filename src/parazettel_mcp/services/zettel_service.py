@@ -21,6 +21,7 @@ from parazettel_mcp.models.schema import (
     Tag,
     normalize_tag,
 )
+from parazettel_mcp.storage.file_lock import file_lock
 from parazettel_mcp.storage.note_repository import (
     WIKI_TARGET_SUFFIX,
     NoteRepository,
@@ -28,6 +29,9 @@ from parazettel_mcp.storage.note_repository import (
 
 logger = logging.getLogger(__name__)
 _UNSET = object()
+# How long a write waits for another process's write to finish. Generous: a full
+# rebuild of a large vault (re-embedding on CPU) can hold the lock for minutes.
+_WRITE_LOCK_TIMEOUT_SECONDS = 600.0
 _INVERSE_LINK_TYPES = {
     LinkType.REFERENCE: LinkType.REFERENCE,
     LinkType.EXTENDS: LinkType.EXTENDED_BY,
@@ -54,15 +58,20 @@ class ZettelService:
     def __init__(self, repository: Optional[NoteRepository] = None):
         """Initialize the service."""
         self.repository = repository or NoteRepository()
-        # A single global write lock serializes ALL mutating operations. The
-        # underlying Kuzu database is single-writer (only one write transaction
-        # may exist process-wide), and the daemon dispatches RPC calls on
-        # separate threads, so concurrent writes — even to *different* notes —
-        # must be serialized or Kuzu raises. A reentrant lock lets a mutator call
+        # One write lock serializes ALL mutating operations — within this process
+        # (the daemon dispatches RPC calls on separate threads) AND across
+        # processes (every Claude session can open the vault directly). Writes
+        # are markdown read-modify-writes (e.g. adding a counter-link to a hub
+        # note), so two writers interleaving would lose one update even though
+        # the index itself stays consistent. A reentrant lock lets a mutator call
         # another mutator (e.g. update_task -> update_task_status, or a routing
         # helper that also rewrites the parent) without self-deadlocking, and it
         # blocks (queues) rather than failing, so overlapping callers run in turn.
         self._write_lock = threading.RLock()
+        # Nesting depth of _write_locked on the thread holding _write_lock; the
+        # cross-process lock is taken only by the outermost level. Only read or
+        # written while _write_lock is held, so it needs no lock of its own.
+        self._write_depth = 0
         # The dedup cross-encoder lives HERE, in the data-owning service, not in
         # every per-session facade. In daemon mode that means it is built once and
         # the facade reaches it over RPC (:meth:`rerank`) instead of importing
@@ -79,12 +88,26 @@ class ZettelService:
         """Serialize a mutating operation against all other writers.
 
         Held across the whole read-modify-write (and any nested mutators) so a
-        note's get -> mutate -> update can't interleave with another writer, and
-        so two writes never hit Kuzu's single write transaction at once. Callers
-        block until the lock is free rather than erroring.
+        note's get -> mutate -> update can't interleave with another writer in
+        this process or any other. Callers block until the lock is free rather
+        than erroring (a cross-process wait longer than the timeout raises).
         """
         with self._write_lock:
-            yield
+            if self._write_depth > 0:
+                self._write_depth += 1
+                try:
+                    yield
+                finally:
+                    self._write_depth -= 1
+                return
+            with file_lock(
+                self.repository.write_lock_path, timeout=_WRITE_LOCK_TIMEOUT_SECONDS
+            ):
+                self._write_depth = 1
+                try:
+                    yield
+                finally:
+                    self._write_depth = 0
 
     def initialize(self) -> None:
         """Initialize the service and dependencies (idempotent).
@@ -428,8 +451,10 @@ class ZettelService:
         """Record that *note_ids* were explicitly retrieved (recency/frequency).
 
         Best-effort and never raises: retrieval tracking is an enhancement to
-        the read path and must not be able to break a read. Serialized by the
-        write lock because it mutates the graph (Kuzu is single-writer).
+        the read path and must not be able to break a read. Deliberately NOT
+        under the write lock: it is one atomic index upsert (no markdown
+        read-modify-write), and taking the cross-process lock here would make
+        every search wait behind another session's long write or rebuild.
         """
         ids = [str(nid) for nid in note_ids if nid]
         if not ids:
@@ -438,8 +463,7 @@ class ZettelService:
         if not callable(recorder):
             return
         try:
-            with self._write_locked():
-                recorder(ids)
+            recorder(ids)
         except Exception as exc:  # pragma: no cover - advisory only
             logger.debug("Could not record retrieval for %s: %s", ids, exc)
 
@@ -899,12 +923,11 @@ class ZettelService:
         return self._get_project_for_routing(project_id)
 
     def rebuild_index(self) -> Optional[Path]:
-        """Rebuild the graph index from files.
+        """Rebuild the index from files.
 
-        Serialized by the global write lock so a rebuild (which swaps the whole
-        graph DB) can't run concurrently with another write. In daemon mode the
-        facade additionally rejects overlapping writes via maintenance mode; this
-        lock also covers direct (in-process) mode.
+        Serialized by the write lock so a rebuild (which re-reads every file)
+        can't interleave with another write in any process. In daemon mode the
+        facade additionally rejects overlapping writes via maintenance mode.
         """
         with self._write_locked():
             return self.repository.rebuild_index()

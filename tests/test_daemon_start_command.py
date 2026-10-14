@@ -13,7 +13,7 @@ def test_format_daemon_start_command_is_absolute_and_complete():
 
     assert "--run-daemon" in cmd
     assert "--notes-dir" in cmd
-    assert "--graph-db-path" in cmd
+    assert "--index-db-path" in cmd
     assert "--daemon-host" in cmd
     assert "--daemon-port" in cmd
 

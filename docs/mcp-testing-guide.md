@@ -10,8 +10,8 @@ Replace `{AREA_ID}`, `{PROJECT_ID}`, etc. with the actual IDs returned from each
 
 Pick the runtime mode you want to validate:
 
-- **Direct mode**: simplest for isolated local testing, but only one write-enabled process should own `graph.kuzu`.
-- **Daemon mode**: recommended for validating real multi-chat behavior. MCP launches in daemon mode now auto-start the local daemon if needed, but you can still start it manually when you want explicit control.
+- **Direct mode**: simplest for isolated local testing. Every process can read and write the SQLite index; a cross-process write lock (`<index>.write.lock`) serializes writes, so several direct sessions are safe.
+- **Daemon mode**: recommended for validating the shared-daemon setup (keeps the embedding model and reranker warm). MCP launches in daemon mode now auto-start the local daemon if needed, but you can still start it manually when you want explicit control.
 
 Example shared-daemon startup:
 
@@ -19,7 +19,7 @@ Example shared-daemon startup:
 python -m parazettel_mcp.main \
   --run-daemon \
   --notes-dir ./data/notes \
-  --graph-db-path ./data/db/graph.kuzu \
+  --index-db-path ./data/db/index.sqlite3 \
   --daemon-host 127.0.0.1 \
   --daemon-port 8766
 ```
@@ -39,6 +39,8 @@ Useful daemon lifecycle commands while testing:
 python -m parazettel_mcp.main --daemon-status
 python -m parazettel_mcp.main --stop-daemon
 ```
+
+The daemon's `/health` endpoint (e.g. `curl http://127.0.0.1:8766/health`) also reports `index` (`backend`, `path`, `notes`, `journal_mode`) and `embeddings` (`enabled`, `model_id`, `vectors_stored`, `generation`) — a quick check that the index is SQLite in WAL mode and that vectors exist for roughly every note.
 
 The daemon shuts itself down after an idle period (default 3600s) during manual testing; override the window by passing `--daemon-idle-timeout <seconds>` when starting it manually (`0` keeps it always-on).
 
@@ -823,7 +825,7 @@ Found 1 matching notes:
 
 ```
 
-For a text `query`, results are ranked by the Kuzu full-text **BM25 relevance score**, and each hit shows a `Relevance:` line (higher = stronger match) so a strong match is distinguishable from a weak one. The `Match:` line shows *why* the note matched and is prefixed with the field it matched — `Title: …` when the query hits the title (as above, since "atomic" is in the title) or `Content: …<snippet>…` when it hits the body. It replaces the `Preview:` line, which is only shown when there is no matched context (e.g. a tag- or type-only filter with no text query).
+For a text `query`, results are ranked by the SQLite FTS5 full-text **BM25 relevance score** (porter stemming, English stopwords; digits are searchable, and query text is quoted so it can't inject FTS syntax), and each hit shows a `Relevance:` line (higher = stronger match) so a strong match is distinguishable from a weak one. The `Match:` line shows *why* the note matched and is prefixed with the field it matched — `Title: …` when the query hits the title (as above, since "atomic" is in the title) or `Content: …<snippet>…` when it hits the body. It replaces the `Preview:` line, which is only shown when there is no matched context (e.g. a tag- or type-only filter with no text query).
 
 **Call (by note\_type):**
 
@@ -1060,7 +1062,7 @@ Returns notes *updated* on or after the start date, sorted by `updated_at`. Usef
 
 ### `pzk_rebuild_index`
 
-Rebuilds the Kuzu graph index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped file snapshot backup of the current graph database is created first; then a fresh index is built into a temporary database and atomically swapped into place (the live index is never cleared in place). Because the rebuilt graph contains exactly what the files declare, it also reconciles hand edits to tags/links and drops orphaned tag nodes.
+Rebuilds the SQLite index from the Markdown files on disk. Use after manually editing `.md` files. A timestamped `<index>.<timestamp>.bak` backup is taken first via SQLite's online backup API (the newest `PARAZETTEL_INDEX_BACKUP_KEEP`, default 5, are kept); then the index is refilled from the files inside a single write transaction, so readers in any process keep seeing the previous index until it commits and a failure rolls back untouched. Stored embedding vectors are reused when the model and embedded text are unchanged. Because the rebuilt index contains exactly what the files declare, it also reconciles hand edits to tags/links and drops orphaned tags.
 
 In daemon mode, rebuild runs as an explicit maintenance operation. Other chats and clients can still connect to the daemon, but normal RPC calls are rejected until the rebuild finishes.
 
@@ -1087,13 +1089,13 @@ Change in note count: 0
 
 > **Note:** the `WARNING:` line only appears in **direct (in-process) mode**. In daemon-backed mode the facade can't read the skipped-file list back across the RPC boundary, so skipped files are recorded in the **daemon log** rather than the returned message. The rebuild itself still skips and reports them the same way internally.
 
-If the graph database file did not exist yet, the backup line will report that no backup was created.
+If the index held no notes yet (e.g. a fresh vault), no backup is taken and the backup line reports `none`.
 
 `Change in note count` will be non-zero only if `.md` files were added or removed outside the MCP server.
 
 ### `pzk_check_consistency`
 
-Read-only audit that compares the Markdown files (the source of truth) against the Kuzu graph index and reports the ways they can silently disagree. Unlike `pzk_rebuild_index`, it never modifies either store — run it to decide *whether* a rebuild is needed.
+Read-only audit that compares the Markdown files (the source of truth) against the SQLite index and reports the ways they can silently disagree. Unlike `pzk_rebuild_index`, it never modifies either store — run it to decide *whether* a rebuild is needed.
 
 **Call:** *(no parameters)*
 

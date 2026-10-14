@@ -14,7 +14,9 @@ from parazettel_mcp.daemon.client import (
     DaemonRpcClient,
     DaemonUnavailableError,
     RemoteServiceProxy,
+    set_daemon_recovery_hook,
 )
+from parazettel_mcp.daemon.codec import encode_value
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.models.schema import Note, NoteSource, NoteType
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
@@ -659,6 +661,77 @@ def test_daemon_client_reports_connection_failures_cleanly():
     # The error must tell the user how to bring the daemon back up.
     assert "python -m parazettel_mcp.main --run-daemon" in message
     assert "--daemon-status" in message
+
+
+@pytest.fixture
+def reset_recovery_hook():
+    """Clear the process-wide daemon recovery hook before and after each test."""
+    set_daemon_recovery_hook(None)
+    try:
+        yield
+    finally:
+        set_daemon_recovery_hook(None)
+
+
+def test_daemon_call_auto_recovers_and_retries_once(reset_recovery_hook):
+    """A call against a downed daemon runs the recovery hook and retries once."""
+    client = DaemonRpcClient("http://127.0.0.1:65500", timeout_seconds=0.2)
+    counters = {"request": 0, "recover": 0}
+
+    def fake_request(method, path, *, payload=None):
+        counters["request"] += 1
+        if counters["request"] == 1:
+            raise DaemonUnavailableError("Parazettel daemon is unavailable.")
+        return {"result": encode_value("recovered")}
+
+    def fake_recover():
+        counters["recover"] += 1
+
+    client._request_json = fake_request  # type: ignore[assignment]
+    set_daemon_recovery_hook(fake_recover)
+
+    assert client.call("zettel_service", "ping") == "recovered"
+    assert counters["recover"] == 1
+    assert counters["request"] == 2  # original failed attempt + one retry
+
+
+def test_daemon_call_without_recovery_hook_fails_fast(reset_recovery_hook):
+    """With no hook installed, a downed daemon still fails immediately (no retry)."""
+    client = DaemonRpcClient("http://127.0.0.1:65500", timeout_seconds=0.2)
+    counters = {"request": 0}
+
+    def fake_request(method, path, *, payload=None):
+        counters["request"] += 1
+        raise DaemonUnavailableError("Parazettel daemon is unavailable.")
+
+    client._request_json = fake_request  # type: ignore[assignment]
+    set_daemon_recovery_hook(None)
+
+    with pytest.raises(DaemonUnavailableError):
+        client.call("zettel_service", "ping")
+    assert counters["request"] == 1  # no retry without a recovery hook
+
+
+def test_daemon_call_propagates_when_recovery_cannot_start(reset_recovery_hook):
+    """If recovery cannot restart the daemon, the call fails without retrying."""
+    client = DaemonRpcClient("http://127.0.0.1:65500", timeout_seconds=0.2)
+    counters = {"request": 0, "recover": 0}
+
+    def fake_request(method, path, *, payload=None):
+        counters["request"] += 1
+        raise DaemonUnavailableError("Parazettel daemon is unavailable.")
+
+    def failing_recover():
+        counters["recover"] += 1
+        raise DaemonUnavailableError("Failed to auto-start the Parazettel daemon.")
+
+    client._request_json = fake_request  # type: ignore[assignment]
+    set_daemon_recovery_hook(failing_recover)
+
+    with pytest.raises(DaemonUnavailableError, match="Failed to auto-start"):
+        client.call("zettel_service", "ping")
+    assert counters["recover"] == 1
+    assert counters["request"] == 1  # recovery raised before any retry
 
 
 def test_daemon_shutdown_endpoint_stops_server(daemon_server):

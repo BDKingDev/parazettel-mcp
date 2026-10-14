@@ -88,8 +88,9 @@ def test_suggest_areas_ranks_matching_area_first(test_config, monkeypatch):
                  note_type=NoteType.AREA)
         )
         # Query with area_a's exact embedding text -> a hash twin of its stored
-        # document vector -> cosine 1.0 for area_a, ~0 for the other.
-        query = repo._embedding_text(area_a)
+        # document vector -> cosine 1.0 for area_a, ~0 for the other. The stored
+        # vector embeds the note as written to its file, so read it back first.
+        query = repo._embedding_text(repo.get(area_a.id))
         results = service.suggest_areas(query, limit=5)
         assert results, "expected area suggestions"
         assert results[0][0].id == area_a.id

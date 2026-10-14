@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import _index_helpers as index_helpers
 from parazettel_mcp.models.schema import LinkType
 
 
@@ -39,17 +40,8 @@ def _strip_links_lines(service, note_id: str, *link_types: str) -> None:
 
 
 def edge_types(service, source_id: str, target_id: str) -> set:
-    """Return the LINKS_TO edge types from source to target, read straight from Kuzu."""
-    with service.repository._connection() as conn:
-        result = conn.execute(
-            "MATCH (s:Note {id: $s})-[r:LINKS_TO]->(t:Note {id: $t}) "
-            "RETURN r.link_type",
-            {"s": source_id, "t": target_id},
-        )
-        types = set()
-        while result.has_next():
-            types.add(result.get_next()[0])
-        return types
+    """Return the link types from source to target, read straight from the index."""
+    return index_helpers.edge_types(service, source_id, target_id)
 
 
 @pytest.fixture
