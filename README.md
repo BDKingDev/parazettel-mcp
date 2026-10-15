@@ -377,15 +377,7 @@ python -m parazettel_mcp.main --stop-daemon
 
 ### Migrating from the Kuzu graph index
 
-Earlier releases indexed into a Kuzu graph database (`graph.kuzu`). Kuzu was archived upstream in October 2025, so the index is now SQLite. The markdown notes are unaffected; to move an existing vault over, **stop the daemon and every Claude session** (Kuzu refuses to open a database another process holds), then run:
-
-```bash
-python scripts/migrate_kuzu_to_sqlite.py
-```
-
-It opens `graph.kuzu` **read-only**, rebuilds the SQLite index from the markdown files, imports retrieval signals (`hit_count` / `last_retrieved_at`) and the existing embedding vectors, embeds any notes that had no vector, verifies the result against Kuzu and `check_consistency`, and writes an audit export (`kuzu_export.<timestamp>.json`). Paths default to your config (`--notes-dir`, `--kuzu-path`, `--index-db-path` override them). Other flags: `--reembed` (embed every note now instead of importing vectors), `--force` (move an existing SQLite index aside instead of refusing), `--accept-differences` (exit 0 even if note/link/tag sets differ — they are still reported), and `--export-signals-back` (rollback helper: copy SQLite retrieval signals back into Kuzu). The script needs the `kuzu` package, which is still installed for now.
-
-To roll back, run the previous release against the untouched `graph.kuzu`.
+Earlier releases indexed into a Kuzu graph database (`graph.kuzu`). Kuzu was archived upstream in October 2025, so the index is now SQLite. The markdown notes are unaffected. The one-time migration script (`scripts/migrate_kuzu_to_sqlite.py`) has been retired; recover it with `git show d0eeb77:scripts/migrate_kuzu_to_sqlite.py` if you still have a Kuzu vault to convert (it needs the `kuzu` package).
 
 To compare search quality across backends, `scripts/search_eval.py` provides a `generate` / `run` / `compare` harness: build a fixed query set from a frozen notes copy, capture each backend's results, and diff a candidate run against a baseline.
 

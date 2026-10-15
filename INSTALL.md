@@ -155,24 +155,12 @@ Start your MCP client and verify the server is visible. Parazettel currently exp
 
 Then run a simple smoke test such as creating an area note or fetching an existing note.
 
-## Step 7: Optional Migration from Kuzu
+## Step 7: Vaults from a Kuzu-based release
 
-If your vault was indexed by an earlier Kuzu-based release (`graph.kuzu`), stop the daemon and every Claude session, then run:
-
-```bash
-python scripts/migrate_kuzu_to_sqlite.py
-```
-
-Notes:
-
-- it opens `graph.kuzu` read-only and rebuilds the SQLite index from the markdown files
-- it carries over retrieval signals and existing embedding vectors, and embeds notes that had none
-- it verifies counts against Kuzu and `check_consistency`, and writes an audit export `kuzu_export.<timestamp>.json`
-- flags: `--reembed`, `--force`, `--accept-differences`, `--export-signals-back` (rollback helper)
-- it requires the `kuzu` package (still installed for now)
-- to roll back, run the previous release against the untouched `graph.kuzu`
-
-New vaults need no migration: the index is created on first start.
+New vaults need no migration: the index is created on first start. The one-time
+Kuzu → SQLite migration script has been retired; recover it with
+`git show d0eeb77:scripts/migrate_kuzu_to_sqlite.py`
+(it needs `pip install "kuzu>=0.11.3,<0.12"`).
 
 ## Troubleshooting
 

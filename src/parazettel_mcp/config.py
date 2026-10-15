@@ -105,7 +105,7 @@ class ZettelkastenConfig(BaseModel):
     )
     # Deprecated: the pre-SQLite Kuzu database path. Still honoured as the source
     # of the index location — a ``*.kuzu`` path maps to a sibling
-    # ``index.sqlite3`` — and read by the one-time Kuzu migration script.
+    # ``index.sqlite3``.
     graph_db_path: Path = Field(
         default_factory=lambda: Path(
             os.getenv("PARAZETTEL_GRAPH_DB_PATH", "data/db/graph.kuzu")
@@ -329,10 +329,6 @@ class ZettelkastenConfig(BaseModel):
     def get_graph_db_path(self) -> Path:
         """Deprecated alias of :meth:`get_index_db_path`."""
         return self.get_index_db_path()
-
-    def get_legacy_kuzu_path(self) -> Path:
-        """Absolute path of the pre-SQLite Kuzu database (migration only)."""
-        return self.get_absolute_path(self.graph_db_path)
 
     def get_db_url(self) -> str:
         """Get the legacy SQLite database URL (used by migration tooling only)."""

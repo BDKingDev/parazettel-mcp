@@ -104,16 +104,13 @@ python -m parazettel_mcp.main --daemon-status
 # Stop the managed daemon
 python -m parazettel_mcp.main --stop-daemon
 
-# Migrate a vault indexed by an earlier Kuzu-based release
-# (stop the daemon and every Claude session first)
-python scripts/migrate_kuzu_to_sqlite.py
 ```
 
 ## If Something Fails
 
 - write-lock timeout (`... .write.lock`): another process is mid-write (usually a long rebuild); retry once it finishes.
 - daemon unavailable: start the daemon or fix `PARAZETTEL_DAEMON_HOST` / `PARAZETTEL_DAEMON_PORT`. `python -m parazettel_mcp.main --daemon-status` is the quickest check.
-- old `graph.kuzu` or `.db` paths: switch to `PARAZETTEL_INDEX_DB_PATH`, though `PARAZETTEL_GRAPH_DB_PATH` (a `*.kuzu` value places the index at a sibling `index.sqlite3`) and `PARAZETTEL_DATABASE_PATH` are still accepted for compatibility. Existing Kuzu vaults: see the migration command above.
+- old `graph.kuzu` or `.db` paths: switch to `PARAZETTEL_INDEX_DB_PATH`, though `PARAZETTEL_GRAPH_DB_PATH` (a `*.kuzu` value places the index at a sibling `index.sqlite3`) and `PARAZETTEL_DATABASE_PATH` are still accepted for compatibility. Existing Kuzu vaults: see INSTALL.md, Step 7.
 
 ## Next Docs
 

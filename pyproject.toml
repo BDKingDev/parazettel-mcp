@@ -38,12 +38,6 @@ dev = [
 migration = [
     "sqlalchemy>=2.0.0",
 ]
-# Reads the old Kuzu database for the one-time migration to the SQLite index
-# (scripts/migrate_kuzu_to_sqlite.py) and the Kuzu baseline in scripts/search_eval.py.
-# Not needed at runtime: the index is SQLite.
-legacy-kuzu = [
-    "kuzu>=0.11.3,<0.12",
-]
 # Optional semantic embeddings (PARAZETTEL_EMBEDDING_ENABLED=true). Two tiers:
 # "lite" = fastembed (ONNX, no PyTorch — small, fast, recommended default);
 # full   = sentence-transformers (PyTorch — widest model support incl.
