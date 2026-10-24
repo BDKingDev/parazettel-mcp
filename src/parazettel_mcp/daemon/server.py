@@ -11,6 +11,7 @@ import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any, Dict, Optional, Set
 
 from parazettel_mcp.config import config
@@ -31,7 +32,10 @@ def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
     """Return (working_set_MB, commit_MB) for this process, or None.
 
     Windows: Win32 GetProcessMemoryInfo (working set + private commit /
-    PagefileUsage). POSIX: resource.getrusage RSS (no commit figure). Best-effort
+    PagefileUsage). POSIX: the CURRENT resident set (Linux /proc/self/statm, macOS
+    ``ps``), falling back to peak RSS (ru_maxrss) only if those fail — the
+    recycle check must not keep tripping on a past spike. No commit figure on
+    POSIX. Best-effort
     — any failure returns None so memory logging never affects request handling.
     """
     try:
@@ -76,13 +80,34 @@ def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
                 counters.WorkingSetSize / 1048576.0,
                 counters.PagefileUsage / 1048576.0,
             )
+        current = _current_rss_mb_posix()
+        if current is not None:
+            return (current, None)
         import resource
         import sys
 
-        # ru_maxrss is KB on Linux but BYTES on macOS — convert to MB per platform.
+        # Fallback: PEAK rss. ru_maxrss is KB on Linux but BYTES on macOS.
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         rss_mb = rss / 1048576.0 if sys.platform == "darwin" else rss / 1024.0
         return (rss_mb, None)
+    except Exception:  # pragma: no cover - diagnostics must never raise
+        return None
+
+
+def _current_rss_mb_posix() -> Optional[float]:
+    """Current (not peak) resident set in MB on Linux/macOS, or None."""
+    try:
+        statm = Path("/proc/self/statm")
+        if statm.exists():  # Linux: fields are in pages; [1] = resident
+            resident_pages = int(statm.read_text().split()[1])
+            return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1048576.0
+        import subprocess
+
+        out = subprocess.run(  # macOS has no /proc; ps reports RSS in KB
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        return int(out) / 1024.0 if out else None
     except Exception:  # pragma: no cover - diagnostics must never raise
         return None
 

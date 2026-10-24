@@ -123,7 +123,7 @@ def test_rpc_recovers_via_on_unavailable_then_retries(monkeypatch):
     def fake_urlopen(req, timeout=None):
         state["calls"] += 1
         if state["calls"] == 1:
-            raise urlerror.URLError("connection refused")
+            raise urlerror.URLError(ConnectionRefusedError("refused"))
         return _FakeHealthResponse()
 
     monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
@@ -169,7 +169,7 @@ def test_rpc_retries_only_once_then_gives_up(monkeypatch):
 
     def fake_urlopen(req, timeout=None):
         state["calls"] += 1
-        raise urlerror.URLError("still down")
+        raise urlerror.URLError(ConnectionRefusedError("still down"))
 
     monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
 
@@ -182,6 +182,67 @@ def test_rpc_retries_only_once_then_gives_up(monkeypatch):
         client.health()
     assert state["restarts"] == 1
     assert state["calls"] == 2  # original + a single retry
+
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError("reset"),
+        "url-timeout",
+    ],
+    ids=["socket-timeout", "connection-reset", "urlerror-wrapped-timeout"],
+)
+def test_rpc_never_replays_when_daemon_may_have_run_the_request(monkeypatch, failure):
+    """A timeout/reset may arrive after the daemon executed a write, so replaying
+    could double-apply it (e.g. a duplicate note). Only a refused connection is
+    replayed; everything else surfaces without restart or retry."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    if failure == "url-timeout":
+        failure = urlerror.URLError(TimeoutError("timed out"))
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        raise failure
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with pytest.raises(DaemonUnavailableError):
+        client.call("zettel_service", "create_note", kwargs={"title": "x"})
+    assert state["restarts"] == 0
+    assert state["calls"] == 1  # never replayed
+
+
+def test_rpc_restart_callback_failure_is_logged(monkeypatch, caplog):
+    """A failing restart callback falls back to DaemonUnavailableError but logs why."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    def fake_urlopen(req, timeout=None):
+        raise urlerror.URLError(ConnectionRefusedError("refused"))
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        raise RuntimeError("could not spawn daemon")
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with caplog.at_level("WARNING", logger="parazettel_mcp.daemon.client"):
+        with pytest.raises(DaemonUnavailableError):
+            client.health()
+    assert "restart callback failed" in caplog.text
+    assert "could not spawn daemon" in caplog.text
 
 
 def _create_area(client: DaemonRpcClient) -> Note:
@@ -676,7 +737,7 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
 
     class FakeClient:
         def __init__(self, base_url: str, timeout_seconds: float = 5.0, **kwargs):
-            client_calls.append((base_url, timeout_seconds))
+            client_calls.append((base_url, timeout_seconds, kwargs))
 
         def health(self):
             return {"ok": True}
@@ -695,10 +756,11 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
 
     server = ZettelkastenMcpServer()
     try:
-        assert client_calls == [
-            ("http://127.0.0.1:8766", 5.0),
-            ("http://127.0.0.1:8766", 123.0),
-        ]
+        # Health client: short timeout, no restart callback.
+        assert client_calls[0] == ("http://127.0.0.1:8766", 5.0, {})
+        # RPC client: long timeout AND the auto-restart callback wired in.
+        assert client_calls[1][:2] == ("http://127.0.0.1:8766", 123.0)
+        assert callable(client_calls[1][2].get("on_unavailable"))
     finally:
         server.close()
         config.backend_mode = original_backend_mode

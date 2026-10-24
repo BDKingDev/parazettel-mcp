@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 from urllib import error, request
 
 from parazettel_mcp.daemon.codec import decode_value, encode_value
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.services.reranker import RerankerError, RerankerLoadTimeoutError
+
+logger = logging.getLogger(__name__)
+
+
+def _request_never_reached_daemon(exc: BaseException) -> bool:
+    """True only when the connection was refused, i.e. nothing was listening.
+
+    That is the one transport failure where the daemon provably never saw the
+    request, so replaying it after a restart cannot double-apply a write. A
+    timeout or reset may arrive AFTER the daemon executed a mutating RPC (e.g.
+    note creation), so those are never replayed. ``urlopen`` wraps socket
+    errors in ``URLError``, so unwrap ``.reason``.
+    """
+    if isinstance(exc, error.URLError) and not isinstance(exc, error.HTTPError):
+        exc = exc.reason if isinstance(exc.reason, BaseException) else exc
+    return isinstance(exc, ConnectionRefusedError)
 
 
 class DaemonUnavailableError(RuntimeError):
@@ -120,9 +137,15 @@ class DaemonRpcClient:
                 raise RuntimeError(body or str(exc)) from exc
             self._raise_remote_error(payload.get("error", {}))
         except (error.URLError, OSError) as exc:
-            # The daemon may have recycled or idle-shut-down. Try to (re)start it
-            # once and replay the request so the caller's tool call still succeeds.
-            if allow_restart and self._try_restart_daemon():
+            # The daemon may have recycled or idle-shut-down. If the connection
+            # was refused (the request provably never ran), (re)start it once and
+            # replay so the caller's tool call still succeeds. Any other failure
+            # (timeout, reset) is ambiguous for writes, so it is surfaced as-is.
+            if (
+                allow_restart
+                and _request_never_reached_daemon(exc)
+                and self._try_restart_daemon()
+            ):
                 return self._request_json(
                     method, path, payload=payload, allow_restart=False
                 )
@@ -145,7 +168,8 @@ class DaemonRpcClient:
             return False
         try:
             return bool(self._on_unavailable())
-        except Exception:  # pragma: no cover - recovery is best-effort
+        except Exception:  # recovery is best-effort, but never silent
+            logger.warning("Parazettel daemon restart callback failed", exc_info=True)
             return False
 
     def _raise_remote_error(self, error_payload: Dict[str, Any]) -> None:
