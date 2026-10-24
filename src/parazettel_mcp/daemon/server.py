@@ -512,10 +512,28 @@ class ParazettelDaemonServer:
         self._closed = True
         self.zettel_service.close()
 
+    def _release_thread_resources(self) -> None:
+        """Release the calling (short-lived) thread's index connection."""
+        repository = getattr(self.zettel_service, "repository", None)
+        release = getattr(repository, "release_thread_connection", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:  # pragma: no cover - teardown must never raise
+                logger.debug("Releasing thread connection failed", exc_info=True)
+
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
+            def finish(self) -> None:
+                # Each request runs on a fresh thread; release its index
+                # connection so connections don't accumulate per request.
+                try:
+                    super().finish()
+                finally:
+                    daemon._release_thread_resources()
+
             def _ensure_loopback_client(self) -> bool:
                 client_host = self.client_address[0]
                 if _is_loopback_host(client_host):
@@ -717,6 +735,7 @@ class ParazettelDaemonServer:
         except BaseException as exc:  # noqa: BLE001 - record, never crash the worker
             error = exc
             logger.error("Background rebuild_index failed: %s", exc, exc_info=True)
+        self._release_thread_resources()  # the worker thread is about to exit
         repository = getattr(self.zettel_service, "repository", None)
         skipped = getattr(repository, "last_rebuild_skipped", [])
         if not isinstance(skipped, (list, tuple)):

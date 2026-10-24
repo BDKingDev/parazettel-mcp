@@ -376,3 +376,18 @@ def test_other_metrics(db_path, metric, expected):
 def test_invalid_metric_is_rejected():
     with pytest.raises(ValueError):
         VectorIndex("hamming")
+
+
+def test_ensure_schema_does_not_take_the_write_lock_when_current(db_path):
+    """A process opening an already-current index must not need the write lock:
+    while another process holds BEGIN IMMEDIATE, ensure_schema returns at once
+    instead of waiting out the busy timeout (or failing with 'locked')."""
+    holder = connect(db_path)
+    opener = connect(db_path, busy_timeout_ms=100)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        ensure_schema(opener)  # would raise "database is locked" before the fix
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+        opener.close()

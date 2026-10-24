@@ -767,6 +767,21 @@ def test_daemon_call_never_replays_after_timeout_via_recovery_hook(reset_recover
     assert counters["request"] == 1  # never replayed
 
 
+
+def test_daemon_requests_do_not_accumulate_index_connections(daemon_server):
+    """ThreadingHTTPServer runs every request on a new thread. Each request must
+    release its SQLite connection, or the daemon leaks one per request."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    repository = daemon_server.zettel_service.repository
+    for _ in range(25):
+        client.health()
+    # The handler releases in finish(), just after the response is sent.
+    deadline = time.time() + 5
+    while time.time() < deadline and len(repository._connections) > 2:
+        time.sleep(0.05)
+    assert len(repository._connections) <= 2  # main thread (+ at most one in flight)
+
+
 def test_daemon_shutdown_endpoint_stops_server(daemon_server):
     """The daemon should expose a clean shutdown endpoint for lifecycle management."""
     client = DaemonRpcClient(daemon_server.base_url)

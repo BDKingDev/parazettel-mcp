@@ -240,6 +240,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     here.
     """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == SCHEMA_VERSION:
+        # Already current: don't take BEGIN IMMEDIATE, so a reader opening the
+        # index while another process writes isn't stuck behind the busy timeout.
+        return
     with transaction(conn):
         if version not in (0, SCHEMA_VERSION):
             logger.warning(

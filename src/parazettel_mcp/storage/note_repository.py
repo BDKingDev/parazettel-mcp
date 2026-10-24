@@ -406,6 +406,28 @@ class NoteRepository(Repository[Note]):
                 self._connections.append(conn)
         return conn
 
+    def release_thread_connection(self) -> None:
+        """Close the calling thread's connection, if it has one.
+
+        Call at the end of work done on a short-lived thread: the daemon's
+        ThreadingHTTPServer runs every request on a NEW thread, and without this
+        each request would leave an open connection (file handles + page cache)
+        in ``_connections`` until shutdown. The next call on the thread reopens.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._connections_lock:
+            try:
+                self._connections.remove(conn)
+            except ValueError:  # already released by close()
+                return
+        try:
+            conn.close()
+        except sqlite3.Error:  # pragma: no cover - best effort
+            pass
+
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
         """Yield this thread's index connection (kept open for reuse)."""
@@ -678,6 +700,10 @@ class NoteRepository(Repository[Note]):
                 # Children first; FTS rows are keyed by notes.pk, not cascaded.
                 for table in ("note_fts", "embeddings", "links", "note_tags", "notes"):
                     conn.execute(f"DELETE FROM {table}")
+                # Embeddings were just cleared: invalidate every process's cached
+                # vector matrix even if nothing is re-written below (embeddings
+                # disabled in this process, or an empty vault).
+                bump_counter(conn, EMBEDDING_GENERATION_KEY)
                 for note in notes:
                     self._write_note_rows(conn, note, note.content)
                 self._write_links(conn, notes)

@@ -1235,3 +1235,42 @@ def test_fts_search_with_markdown_query_does_not_crash(note_repository):
 
     assert isinstance(scores, dict)
     assert note.id in scores
+
+
+def test_short_lived_threads_do_not_accumulate_connections(note_repository):
+    """The daemon serves each request on a new thread; releasing the thread's
+    connection afterwards keeps the open-connection count bounded."""
+    import threading
+
+    baseline = len(note_repository._connections)
+
+    def request():
+        note_repository.index_status()
+        note_repository.release_thread_connection()
+
+    for _ in range(30):
+        worker = threading.Thread(target=request)
+        worker.start()
+        worker.join()
+
+    assert len(note_repository._connections) == baseline
+
+
+def test_release_thread_connection_reopens_on_next_use(note_repository):
+    note_repository.release_thread_connection()
+    note_repository.release_thread_connection()  # idempotent
+    assert note_repository.index_status()["index"]["backend"] == "sqlite"
+
+
+def test_rebuild_invalidates_cached_vectors_even_without_embeddings(note_repository):
+    """A rebuild clears the embeddings table; it must bump the generation so other
+    processes reload their cached vector matrix, even when this process writes no
+    embeddings (embeddings disabled here, or an empty vault)."""
+    from parazettel_mcp.storage.index_db import EMBEDDING_GENERATION_KEY, get_counter
+
+    note_repository._embedding_provider = None  # this process: embeddings off
+    with note_repository._connection() as conn:
+        before = get_counter(conn, EMBEDDING_GENERATION_KEY)
+    note_repository.rebuild_index()
+    with note_repository._connection() as conn:
+        assert get_counter(conn, EMBEDDING_GENERATION_KEY) > before
