@@ -17,10 +17,15 @@ recall hook falls back to. Neither ever rebuilds the index or waits on a writer.
 import argparse
 import os
 import sys
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import NoteType
+
+if TYPE_CHECKING:  # imported lazily at runtime, after the config override
+    from parazettel_mcp.services.search_service import SearchService
+    from parazettel_mcp.services.zettel_service import ZettelService
 
 RECALL_THRESHOLD = 0.55  # min cosine similarity worth injecting (semantic)
 RECALL_LIMIT = 4  # max notes to surface
@@ -30,23 +35,35 @@ MIN_PROMPT_CHARS = 24  # skip trivial prompts ("yes", "continue", "fix that")
 DEFAULT_RECALL_MIN_BM25 = 10.0
 
 
-def _services(*, embeddings: bool):
-    """Open the index read-mostly: no startup rebuild, embeddings optional."""
-    if not embeddings:
-        config.embedding_enabled = False
+@contextmanager
+def _services(*, embeddings: bool) -> Iterator[Tuple["ZettelService", "SearchService"]]:
+    """Open the index read-mostly: no startup rebuild, embeddings optional.
+
+    Turning embeddings off flips the shared ``config.embedding_enabled``, which
+    ZettelService reads at call time, so it is restored on exit -- otherwise a
+    later semantic recall in the same process would silently find nothing.
+    """
     from parazettel_mcp.services.search_service import SearchService
     from parazettel_mcp.services.zettel_service import ZettelService
     from parazettel_mcp.storage.note_repository import NoteRepository
 
-    repository = NoteRepository(reconcile=False)
-    zettel_service = ZettelService(repository=repository)
-    return zettel_service, SearchService(zettel_service)
+    previous = config.embedding_enabled
+    if not embeddings:
+        config.embedding_enabled = False
+    try:
+        repository = NoteRepository(reconcile=False)
+        try:
+            zettel_service = ZettelService(repository=repository)
+            yield zettel_service, SearchService(zettel_service)
+        finally:
+            repository.close()
+    finally:
+        config.embedding_enabled = previous
 
 
 def briefing() -> Optional[str]:
     """Active projects, due tasks, reminders and central notes, as text."""
-    zettel_service, search_service = _services(embeddings=False)
-    try:
+    with _services(embeddings=False) as (zettel_service, search_service):
         lines: List[str] = []
         projects = [
             p
@@ -78,8 +95,6 @@ def briefing() -> Optional[str]:
             for note, _count in central[:6]:
                 lines.append(f"  - {note.title} (ID: {note.id})")
         return "\n".join(lines) if lines else None
-    finally:
-        zettel_service.repository.close()
 
 
 def recall(prompt: str, mode: str) -> Optional[str]:
@@ -88,20 +103,14 @@ def recall(prompt: str, mode: str) -> Optional[str]:
     if len(prompt) < MIN_PROMPT_CHARS:
         return None
     if mode == "semantic":
-        zettel_service, _ = _services(embeddings=True)
-        try:
+        with _services(embeddings=True) as (zettel_service, _):
             pairs = zettel_service.find_similar_to_text(
                 prompt, threshold=RECALL_THRESHOLD, limit=RECALL_LIMIT
             )
-        finally:
-            zettel_service.repository.close()
     elif mode == "lexical":
         floor = float(os.getenv("PARAZETTEL_RECALL_MIN_BM25", DEFAULT_RECALL_MIN_BM25))
-        zettel_service, _ = _services(embeddings=False)
-        try:
+        with _services(embeddings=False) as (zettel_service, _):
             notes, scores = zettel_service.repository.search_scored(text=prompt)
-        finally:
-            zettel_service.repository.close()
         pairs = [(n, scores.get(n.id, 0.0)) for n in notes[:RECALL_LIMIT]]
         pairs = [(n, s) for n, s in pairs if s >= floor]
     else:

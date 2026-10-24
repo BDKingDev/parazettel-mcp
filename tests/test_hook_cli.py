@@ -100,3 +100,26 @@ def test_cli_prints_nothing_when_nothing_qualifies(vault, monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO("ok"))
     assert hook_cli.main(["recall", "--mode", "lexical"]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_hook_helpers_restore_the_shared_embedding_flag(vault, monkeypatch):
+    """briefing() and lexical recall() turn embeddings off for their own read;
+    they must restore config.embedding_enabled, or a later semantic recall in
+    the same process would silently find nothing."""
+    monkeypatch.setattr(config, "embedding_enabled", True)
+    hook_cli.briefing()
+    assert config.embedding_enabled is True
+    hook_cli.recall(PROMPT, "lexical")
+    assert config.embedding_enabled is True
+
+
+def test_hook_helpers_never_reconcile_the_index(vault, monkeypatch):
+    """The hook helpers themselves (not just NoteRepository) must open the
+    index with reconcile=False."""
+    monkeypatch.setattr(
+        NoteRepository,
+        "rebuild_index_if_needed",
+        lambda self: pytest.fail("a hook read must not reconcile the index"),
+    )
+    hook_cli.briefing()
+    hook_cli.recall(PROMPT, "lexical")

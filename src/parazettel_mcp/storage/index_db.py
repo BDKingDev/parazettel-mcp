@@ -52,6 +52,15 @@ FTS_WEIGHTS = {
 }
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+# Apostrophes (straight and curly) are removed before tokenizing so a
+# contraction stays one token: "doesn't" -> "doesnt", which the stopword list
+# holds, instead of "doesn" + "t" (neither of which it does).
+_APOSTROPHE_RE = re.compile("['’]")
+
+
+def _tokens(text: Optional[str]) -> List[str]:
+    """Lowercased word tokens of *text*, with apostrophes removed first."""
+    return _TOKEN_RE.findall(_APOSTROPHE_RE.sub("", (text or "").lower()))
 
 
 class GraphDatabaseReadOnlyError(RuntimeError):
@@ -142,11 +151,15 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    else:
+        # Inside the try: a failed COMMIT (disk full, I/O error) must roll back,
+        # or this thread's reused connection stays stuck mid-transaction.
         conn.execute("COMMIT")
+    except BaseException:
+        # SQLite may already have rolled back on its own; don't let a "no
+        # transaction is active" error mask the original exception.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +258,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         # index while another process writes isn't stuck behind the busy timeout.
         return
     with transaction(conn):
+        # Re-read under the write lock: another process may have upgraded the
+        # schema since the check above, and must not have its fresh tables
+        # dropped again by a stale version read.
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == SCHEMA_VERSION:
+            return
         if version not in (0, SCHEMA_VERSION):
             logger.warning(
                 "Index schema version %s != %s; recreating derived tables "
@@ -311,7 +330,7 @@ def prune_backups(db_path: Path, keep: int) -> List[Path]:
 def fts_terms(text: Optional[str]) -> List[str]:
     """Lowercased word tokens of *text*, minus stopwords, in first-seen order."""
     seen: List[str] = []
-    for token in _TOKEN_RE.findall((text or "").lower()):
+    for token in _tokens(text):
         if token in ENGLISH_STOPWORDS or token in seen:
             continue
         seen.append(token)
@@ -326,7 +345,7 @@ def fts_index_text(text: Optional[str]) -> str:
     """
     return " ".join(
         token
-        for token in _TOKEN_RE.findall((text or "").lower())
+        for token in _tokens(text)
         if token not in ENGLISH_STOPWORDS
     )
 

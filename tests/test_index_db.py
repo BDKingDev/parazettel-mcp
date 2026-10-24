@@ -391,3 +391,34 @@ def test_ensure_schema_does_not_take_the_write_lock_when_current(db_path):
         holder.execute("ROLLBACK")
         holder.close()
         opener.close()
+
+
+def test_failed_commit_rolls_back_and_frees_the_connection(db_path):
+    """If COMMIT itself fails, the transaction must be rolled back: connections
+    are reused per thread, so a stuck transaction would break the next
+    BEGIN IMMEDIATE with "cannot start a transaction within a transaction"."""
+    conn = connect(db_path)
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE child(pid INTEGER REFERENCES parent(id) "
+        "DEFERRABLE INITIALLY DEFERRED)"
+    )
+    try:
+        # A deferred FK violation is only checked at COMMIT, so COMMIT raises.
+        with pytest.raises(sqlite3.IntegrityError):
+            with transaction(conn):
+                conn.execute("INSERT INTO child(pid) VALUES (999)")
+        assert not conn.in_transaction
+        with transaction(conn):  # the connection is usable again
+            conn.execute("INSERT INTO parent(id) VALUES (1)")
+        assert conn.execute("SELECT count(*) FROM child").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_contractions_tokenize_to_stopwords_not_fragments():
+    """"doesn't" must become the stopword "doesnt", not the fragment "doesn"
+    (which would be required by conjunctive queries); curly quotes too."""
+    assert fts_terms("why doesn't sync work") == ["sync", "work"]
+    assert fts_terms("it won’t sync") == ["sync"]
+    assert fts_index_text("Bailey's note doesn't sync") == "baileys note sync"
