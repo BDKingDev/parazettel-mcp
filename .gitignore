@@ -43,6 +43,7 @@ htmlcov/
 .pytest_cache/
 # Local pytest --basetemp dirs and the conftest fixture root
 .pytest-tmp/
+.pytest_tmp/
 .tmp/
 
 # Local configuration
