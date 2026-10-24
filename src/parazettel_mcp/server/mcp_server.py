@@ -156,6 +156,26 @@ class DirectBackendBundle:
         self.zettel_service.close()
 
 
+def _ensure_daemon_running() -> bool:
+    """(Re)start the daemon for a mid-session RPC retry; True if it is up after.
+
+    The daemon can idle-shut-down or recycle itself (memory ceiling) between
+    requests; without this an existing session's next tool call would fail and
+    need a manual restart. Imports main lazily to avoid an import cycle (main
+    imports this module).
+    """
+    try:
+        import argparse
+
+        from parazettel_mcp import main as _main
+
+        _main.ensure_daemon_running(argparse.Namespace(log_level="INFO"))
+        return True
+    except Exception as exc:  # pragma: no cover - best-effort recovery
+        logger.warning("Auto-restart of the Parazettel daemon failed: %s", exc)
+        return False
+
+
 class DaemonBackendBundle:
     """Thin MCP bundle that proxies service calls through the local daemon."""
 
@@ -163,8 +183,12 @@ class DaemonBackendBundle:
         self.health_client = DaemonRpcClient(
             base_url, timeout_seconds=_DAEMON_HEALTH_TIMEOUT_SECONDS
         )
+        # Tool-call RPCs auto-(re)start a recycled / idle-stopped daemon and retry
+        # once, so a mid-session recycle is transparent to the caller.
         self.rpc_client = DaemonRpcClient(
-            base_url, timeout_seconds=config.daemon_rpc_timeout_seconds
+            base_url,
+            timeout_seconds=config.daemon_rpc_timeout_seconds,
+            on_unavailable=_ensure_daemon_running,
         )
         self.zettel_service = RemoteServiceProxy(self.rpc_client, "zettel_service")
         self.search_service = RemoteServiceProxy(self.rpc_client, "search_service")
@@ -264,6 +288,61 @@ class ZettelkastenMcpServer:
             # Unexpected errors - log with full stack trace but return generic message
             logger.error(f"Unexpected error [{error_id}]: {str(error)}", exc_info=True)
             return f"An unexpected error occurred. Error ID: {error_id}"
+
+    @staticmethod
+    def _format_skipped_warning(skipped: List[str]) -> str:
+        """One-line warning naming up to 10 unparseable files (empty if none)."""
+        if not skipped:
+            return ""
+        preview = ", ".join(skipped[:10])
+        if len(skipped) > 10:
+            preview += f", … (+{len(skipped) - 10} more)"
+        return f"WARNING: {len(skipped)} file(s) failed to parse and were skipped: {preview}"
+
+    def _format_rebuild_started(self, result: dict, note_count_before: int) -> str:
+        """Message for the daemon's async rebuild trigger (see pzk_rebuild_index)."""
+        status = result.get("status")
+        if status == "started":
+            return (
+                f"Index rebuild started in the background ({note_count_before} notes).\n"
+                "It runs safely (the new index is built into a temporary database and "
+                "swapped in atomically), and typically takes a few minutes on a large "
+                "vault. While it runs, other parazettel calls report "
+                "'busy rebuilding the search index'.\n"
+                "Check progress and the final result with pzk_rebuild_status."
+            )
+        if result.get("already_running") or status == "running":
+            return (
+                "An index rebuild is already running in the background. "
+                "Check progress with pzk_rebuild_status."
+            )
+        # Unexpected shape — surface it rather than silently swallow.
+        return f"Index rebuild trigger returned an unexpected status: {result}"
+
+    def _format_rebuild_status(self, snap: dict) -> str:
+        """Human-readable summary of a rebuild-status snapshot (see pzk_rebuild_status)."""
+        status = snap.get("status", "unknown")
+        if status == "running":
+            return (
+                "Index rebuild is in progress (running in the background). Other "
+                "parazettel calls report 'busy rebuilding the search index' until it "
+                "completes — check again in a moment."
+            )
+        if status == "success":
+            lines = ["Last index rebuild: SUCCESS."]
+            if snap.get("backup_path"):
+                lines.append(f"Backup: {snap['backup_path']}")
+            warning = self._format_skipped_warning(list(snap.get("skipped") or []))
+            if warning:
+                lines.append(warning)
+            return "\n".join(lines)
+        if status == "error":
+            return f"Last index rebuild FAILED: {snap.get('error') or 'unknown error'}"
+        if status == "idle":
+            return snap.get("detail") or (
+                "No index rebuild has run since the daemon started."
+            )
+        return f"Index rebuild status: {snap}"
 
     def _find_duplicate_candidates(
         self, title: str, content: str
@@ -1785,15 +1864,27 @@ class ZettelkastenMcpServer:
         # Rebuild the index
         @self.mcp.tool(name="pzk_rebuild_index")
         def pzk_rebuild_index() -> str:
-            """Rebuild the database index from files."""
+            """Rebuild the database index from files.
+
+            With the daemon backend the rebuild can take minutes on a large vault —
+            longer than the tool-call timeout — so it is started in the background
+            and this returns immediately. Track progress and see the final result
+            (or any failure) with pzk_rebuild_status. In direct (non-daemon) mode the
+            rebuild runs synchronously and the full result is returned here.
+            """
             try:
                 # Get count before rebuild
                 note_count_before = len(self.zettel_service.get_all_notes())
 
-                # Perform the rebuild
-                backup_path = self.zettel_service.rebuild_index()
+                # Perform the rebuild. The daemon backend returns a status dict
+                # immediately (async); the direct backend returns the backup Path
+                # (or None) once the synchronous rebuild finishes.
+                result = self.zettel_service.rebuild_index()
+                if isinstance(result, dict):
+                    return self._format_rebuild_started(result, note_count_before)
+                backup_path = result
 
-                # Get count after rebuild
+                # Get count after rebuild (direct/synchronous path only)
                 note_count_after = len(self.zettel_service.get_all_notes())
                 backup_message = (
                     f"Backup created: {backup_path}\n"
@@ -1833,6 +1924,21 @@ class ZettelkastenMcpServer:
                 # Provide a detailed error message
                 logger.error(f"Failed to rebuild index: {e}", exc_info=True)
                 return self.format_error_response(e)
+
+        @self.mcp.tool(name="pzk_rebuild_status")
+        def pzk_rebuild_status() -> str:
+            """Report the status of the most recent index rebuild.
+
+            Pairs with pzk_rebuild_index, which starts the rebuild in the background
+            (daemon backend) and returns immediately. Call this to see whether the
+            rebuild is still running, succeeded, or failed.
+            """
+            try:
+                snap = self.zettel_service.rebuild_status() or {}
+            except Exception as e:
+                logger.error(f"Failed to get rebuild status: {e}", exc_info=True)
+                return self.format_error_response(e)
+            return self._format_rebuild_status(snap)
 
         @self.mcp.tool(name="pzk_check_consistency")
         def pzk_check_consistency() -> str:

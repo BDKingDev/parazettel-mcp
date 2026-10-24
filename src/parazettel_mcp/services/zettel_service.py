@@ -909,6 +909,23 @@ class ZettelService:
         with self._write_locked():
             return self.repository.rebuild_index()
 
+    def rebuild_status(self) -> Dict[str, Any]:
+        """Status of the most recent rebuild.
+
+        Only the daemon runs rebuilds asynchronously (and overrides this via its
+        own state machine). In direct (in-process) mode a rebuild is synchronous
+        and ``pzk_rebuild_index`` returns its result inline, so there is never a
+        background rebuild to report here.
+        """
+        return {
+            "status": "idle",
+            "mode": "direct",
+            "detail": (
+                "Direct (non-daemon) mode runs rebuilds synchronously; "
+                "pzk_rebuild_index returns the result directly."
+            ),
+        }
+
     def check_consistency(self) -> Dict[str, Any]:
         """Report drift between the markdown files and the graph index (read-only)."""
         return self.repository.check_consistency()

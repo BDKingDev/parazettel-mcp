@@ -27,12 +27,27 @@ if _REPO_ENV_PATH.exists():
 # cap it at a bounded default and expose PARAZETTEL_KUZU_BUFFER_POOL_BYTES to tune
 # it (0 restores Kuzu's ~80%-RAM default). The test suite bounds it further via
 # the conftest fixture so per-test databases stay tiny.
-DEFAULT_KUZU_BUFFER_POOL_BYTES = 8 * 1024**3  # 8 GiB
-# Seconds of inactivity after which the daemon shuts itself down (it is
-# auto-restarted on the next request). A non-zero default means a daemon left
+# Kuzu buffer-pool cap. Kept well below the old 8 GiB: the pool is *committed*
+# lazily up to this cap, so it dominates the daemon's pagefile/commit charge —
+# 3 GiB keeps that bounded while still caching plenty for a typical vault. Raise
+# it (PARAZETTEL_KUZU_BUFFER_POOL_BYTES) for a very large vault that thrashes.
+DEFAULT_KUZU_BUFFER_POOL_BYTES = 3 * 1024**3  # 3 GiB
+# Working-set ceiling that triggers a daemon RECYCLE: when the resident set grows
+# past this AND the daemon is idle with no request in flight, it shuts down (a
+# fresh one is auto-started on the next request). This bounds Kuzu 0.11.3's
+# per-vector-query native leak (which no Python-side cleanup reclaims, and which
+# has no upstream fix — Kuzu is archived). 0 disables. Set above the legitimate
+# peak (a full rebuild transiently holds the live + temp DB at ~4 GiB) so only a
+# genuine leak trips it — the monitor also never recycles while a request runs.
+DEFAULT_DAEMON_MAX_RSS_BYTES = 6 * 1024**3  # 6 GiB
+# Seconds of inactivity after which the daemon shuts itself down (a fresh one is
+# auto-started on the next request). A non-zero default means a daemon left
 # behind when an MCP client exits without reaping it reaps itself instead of
 # holding the Kuzu DB and embedding model forever.
 DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 3600.0
+# Once the daemon is over the RSS ceiling, wait for at least this many seconds of
+# inactivity before recycling, so an in-flight request is never cut off.
+DEFAULT_DAEMON_MEMORY_RECYCLE_IDLE_GRACE_SECONDS = 20.0
 
 # --- Dedup-on-create reranker defaults (code constants, not env-configurable) ---
 # Cross-encoder that confirms BM25 dedup candidates: it reads both notes together
@@ -117,6 +132,24 @@ class ZettelkastenConfig(BaseModel):
     # per-launch via the --daemon-idle-timeout CLI flag; 0 keeps it always-on.
     daemon_idle_timeout_seconds: float = Field(
         default=DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
+    )
+    # Recycle the daemon once its resident set passes this (see
+    # DEFAULT_DAEMON_MAX_RSS_BYTES); 0 disables. Bounds the Kuzu vector-query leak.
+    daemon_max_rss_bytes: int = Field(
+        default=int(
+            os.getenv(
+                "PARAZETTEL_DAEMON_MAX_RSS_BYTES",
+                str(DEFAULT_DAEMON_MAX_RSS_BYTES),
+            )
+        )
+    )
+    daemon_memory_recycle_idle_grace_seconds: float = Field(
+        default=float(
+            os.getenv(
+                "PARAZETTEL_DAEMON_MEMORY_RECYCLE_IDLE_GRACE_SECONDS",
+                str(DEFAULT_DAEMON_MEMORY_RECYCLE_IDLE_GRACE_SECONDS),
+            )
+        )
     )
     daemon_runtime_dir: Path = Field(
         default_factory=lambda: Path(

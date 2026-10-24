@@ -1627,15 +1627,20 @@ class NoteRepository(Repository[Note]):
                         if not note_vector_index_exists(conn, index_name):
                             continue
                         try:
-                            hnsw = conn.execute(
+                            # Close the QueryResult (context manager) so Kuzu frees
+                            # its native result buffer immediately. Leaving it to GC
+                            # leaks per query, and vector search runs on every
+                            # find-similar / suggested-links call — the dominant
+                            # source of the daemon's RSS climb under query load.
+                            with conn.execute(
                                 "CALL QUERY_VECTOR_INDEX("
                                 f"'Note', '{index_name}', $q, $k"
                                 ") RETURN node.id AS id, distance ORDER BY distance",
                                 {"q": query_vector, "k": fetch_k},
-                            )
-                            while hnsw.has_next():
-                                row = hnsw.get_next()
-                                merge_min(index_dist, row[0], float(row[1]))
+                            ) as hnsw:
+                                while hnsw.has_next():
+                                    row = hnsw.get_next()
+                                    merge_min(index_dist, row[0], float(row[1]))
                         except Exception as exc:
                             logger.warning(
                                 "HNSW vector query (%s) failed: %s", index_name, exc
@@ -1644,17 +1649,17 @@ class NoteRepository(Repository[Note]):
                 for column, expr in (("embedding", doc_expr),
                                      ("title_embedding", title_expr)):
                     try:
-                        brute = conn.execute(
+                        with conn.execute(
                             "MATCH (p:PendingEmbedding) MATCH (n:Note {id: p.id}) "
                             f"WHERE p.{column} IS NOT NULL "
                             "AND p.embedding_model = $model "
                             f"RETURN p.id AS id, {expr} AS dist "
                             "ORDER BY dist LIMIT $k",
                             {"q": query_vector, "model": model_id, "k": fetch_k},
-                        )
-                        while brute.has_next():
-                            row = brute.get_next()
-                            merge_min(pending_dist, row[0], float(row[1]))
+                        ) as brute:
+                            while brute.has_next():
+                                row = brute.get_next()
+                                merge_min(pending_dist, row[0], float(row[1]))
                     except Exception as exc:
                         logger.warning(
                             "Brute-force vector fallback (%s) failed: %s", column, exc

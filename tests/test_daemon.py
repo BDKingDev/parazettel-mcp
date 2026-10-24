@@ -10,6 +10,7 @@ import pytest
 
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import (
+    DaemonBusyError,
     DaemonRpcClient,
     DaemonUnavailableError,
     RemoteServiceProxy,
@@ -96,6 +97,203 @@ def test_daemon_rejects_non_loopback_bind():
     """The daemon should refuse non-loopback bind hosts."""
     with pytest.raises(ValueError, match="loopback hosts"):
         ParazettelDaemonServer("0.0.0.0", 8766)
+
+
+class _FakeHealthResponse:
+    """Minimal context-manager response with a health-shaped JSON body."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"ok": true, "version": "test"}'
+
+
+def test_rpc_recovers_via_on_unavailable_then_retries(monkeypatch):
+    """A first connection failure triggers one (re)start + retry, then succeeds."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise urlerror.URLError(ConnectionRefusedError("refused"))
+        return _FakeHealthResponse()
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    result = client.health()
+
+    assert result["ok"] is True
+    assert state["restarts"] == 1  # restarted exactly once
+    assert state["calls"] == 2  # original request + one retry
+
+
+def test_rpc_without_callback_raises_immediately(monkeypatch):
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        raise urlerror.URLError("down")
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+    client = DaemonRpcClient("http://127.0.0.1:8766")  # no on_unavailable
+
+    with pytest.raises(DaemonUnavailableError):
+        client.health()
+    assert calls["n"] == 1  # no retry without a restart callback
+
+
+def test_rpc_retries_only_once_then_gives_up(monkeypatch):
+    """If the daemon stays down, retry exactly once — never loop forever."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        raise urlerror.URLError(ConnectionRefusedError("still down"))
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with pytest.raises(DaemonUnavailableError):
+        client.health()
+    assert state["restarts"] == 1
+    assert state["calls"] == 2  # original + a single retry
+
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out"),
+        ConnectionResetError("reset"),
+        "url-timeout",
+    ],
+    ids=["socket-timeout", "connection-reset", "urlerror-wrapped-timeout"],
+)
+def test_rpc_never_replays_when_daemon_may_have_run_the_request(monkeypatch, failure):
+    """A timeout/reset may arrive after the daemon executed a write, so replaying
+    could double-apply it (e.g. a duplicate note). Only a refused connection is
+    replayed; everything else surfaces without restart or retry."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    if failure == "url-timeout":
+        failure = urlerror.URLError(TimeoutError("timed out"))
+    state = {"calls": 0, "restarts": 0}
+
+    def fake_urlopen(req, timeout=None):
+        state["calls"] += 1
+        raise failure
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        state["restarts"] += 1
+        return True
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with pytest.raises(DaemonUnavailableError):
+        client.call("zettel_service", "create_note", kwargs={"title": "x"})
+    assert state["restarts"] == 0
+    assert state["calls"] == 1  # never replayed
+
+
+def test_rpc_restart_callback_failure_is_logged(monkeypatch, caplog):
+    """A failing restart callback falls back to DaemonUnavailableError but logs why."""
+    from urllib import error as urlerror
+
+    import parazettel_mcp.daemon.client as client_mod
+
+    def fake_urlopen(req, timeout=None):
+        raise urlerror.URLError(ConnectionRefusedError("refused"))
+
+    monkeypatch.setattr(client_mod.request, "urlopen", fake_urlopen)
+
+    def on_unavailable():
+        raise RuntimeError("could not spawn daemon")
+
+    client = DaemonRpcClient("http://127.0.0.1:8766", on_unavailable=on_unavailable)
+    with caplog.at_level("WARNING", logger="parazettel_mcp.daemon.client"):
+        with pytest.raises(DaemonUnavailableError):
+            client.health()
+    assert "restart callback failed" in caplog.text
+    assert "could not spawn daemon" in caplog.text
+
+
+
+def test_posix_rss_reads_current_resident_set_from_proc_statm(monkeypatch, tmp_path):
+    """Linux: resident pages (statm field 2) x page size, not the ru_maxrss peak."""
+    import parazettel_mcp.daemon.server as server_mod
+
+    statm = tmp_path / "statm"
+    statm.write_text("500000 2560 100 1 0 300 0")  # 2560 resident pages
+    real_path = server_mod.Path
+    monkeypatch.setattr(
+        server_mod, "Path",
+        lambda p: statm if p == "/proc/self/statm" else real_path(p),
+    )
+    monkeypatch.setattr(server_mod.os, "sysconf", lambda name: 4096, raising=False)
+
+    assert server_mod._current_rss_mb_posix() == 2560 * 4096 / 1048576.0  # 10 MB
+
+
+def test_posix_rss_falls_back_to_ps_on_macos_and_caches(monkeypatch, tmp_path):
+    """macOS (no /proc): RSS comes from `ps -o rss=` (KB), cached between polls
+    so the 1 s idle monitor doesn't spawn a process every second."""
+    import subprocess
+    from types import SimpleNamespace
+
+    import parazettel_mcp.daemon.server as server_mod
+
+    real_path = server_mod.Path
+    monkeypatch.setattr(
+        server_mod, "Path",
+        lambda p: tmp_path / "no-proc" if p == "/proc/self/statm" else real_path(p),
+    )
+    monkeypatch.setattr(server_mod, "_ps_rss_cache", {})
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(stdout="  20480 ")  # KB
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Age the cache entry rather than patching time.monotonic: server_mod.time is
+    # the process-wide time module, and freezing it would stall any daemon
+    # threads other fixtures left running in this worker.
+
+    assert server_mod._current_rss_mb_posix() == 20.0
+    assert calls[0][:3] == ["ps", "-o", "rss="]
+    assert server_mod._current_rss_mb_posix() == 20.0  # cached: no new ps spawn
+    assert len(calls) == 1
+    server_mod._ps_rss_cache["at"] -= server_mod._PS_RSS_CACHE_SECONDS + 1  # stale
+    server_mod._current_rss_mb_posix()
+    assert len(calls) == 2
 
 
 def _create_area(client: DaemonRpcClient) -> Note:
@@ -251,10 +449,17 @@ def test_daemon_client_can_rebuild_index(daemon_server):
         },
     )
 
-    backup_path = client.call("zettel_service", "rebuild_index")
-    fetched = client.call("zettel_service", "get_note", args=[created.id])
+    # The rebuild is async: the trigger returns immediately, the work runs on a
+    # background worker, and we wait for maintenance to clear before reading back.
+    start = client.call("zettel_service", "rebuild_index")
+    assert start == {"status": "started"}
+    assert _wait_for(
+        lambda: client.health()["maintenance_reason"] is None, timeout=30.0
+    )
+    status = client.call("zettel_service", "rebuild_status")
+    assert status["status"] == "success"
 
-    assert backup_path is not None
+    fetched = client.call("zettel_service", "get_note", args=[created.id])
     assert fetched is not None
     assert fetched.id == created.id
 
@@ -323,13 +528,23 @@ def test_daemon_link_queries_reflect_live_note_links(daemon_server):
     assert all(found.id != target.id for found in orphaned_after)
 
 
-def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
-    """Maintenance-mode rebuilds should reject concurrent RPC calls cleanly."""
+def _wait_for(predicate, timeout=5.0, interval=0.02):
+    """Poll predicate() until truthy or timeout; return its last value."""
+    deadline = time.time() + timeout
+    value = predicate()
+    while not value and time.time() < deadline:
+        time.sleep(interval)
+        value = predicate()
+    return value
+
+
+def test_rebuild_index_runs_async_and_rejects_concurrent_calls(daemon_server, monkeypatch):
+    """The rebuild trigger returns immediately (async) while the work runs on a
+    background worker; concurrent calls are rejected cleanly until it finishes."""
     rebuild_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=5.0)
     other_client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=1.0)
     started = threading.Event()
     release = threading.Event()
-    result_holder = {}
 
     def slow_rebuild():
         started.set()
@@ -338,24 +553,76 @@ def test_daemon_rejects_other_calls_during_rebuild(daemon_server, monkeypatch):
 
     monkeypatch.setattr(daemon_server.zettel_service, "rebuild_index", slow_rebuild)
 
-    thread = threading.Thread(
-        target=lambda: result_holder.setdefault(
-            "result", rebuild_client.call("zettel_service", "rebuild_index")
-        ),
-        daemon=True,
-    )
-    thread.start()
-    assert started.wait(timeout=5.0)
+    # The trigger returns immediately with a "started" status — it does NOT block
+    # for the duration of the rebuild (that was the timeout that read as a crash).
+    start = rebuild_client.call("zettel_service", "rebuild_index")
+    assert start == {"status": "started"}
+    assert started.wait(timeout=5.0)  # the background worker actually began
 
     health = rebuild_client.health()
     assert health["maintenance_reason"] == "rebuild_index"
+    assert rebuild_client.call("zettel_service", "rebuild_status")["status"] == "running"
 
-    with pytest.raises(RuntimeError, match="busy with rebuild_index"):
+    # A second trigger does not start a duplicate — it reports the running status.
+    second = rebuild_client.call("zettel_service", "rebuild_index")
+    assert second.get("already_running") is True
+    assert second.get("status") == "running"
+
+    # Other calls are rejected with a DaemonBusyError (not a bare RuntimeError that
+    # reads like a crash); the message names the maintenance in human terms while
+    # still carrying the raw reason token.
+    with pytest.raises(DaemonBusyError) as excinfo:
         other_client.call("zettel_service", "get_all_tags")
+    message = str(excinfo.value)
+    assert "rebuilding the search index" in message
+    assert "rebuild_index" in message
 
+    # Let the worker finish; maintenance clears and status flips to success.
     release.set()
-    thread.join(timeout=5.0)
-    assert result_holder["result"] is None
+    assert _wait_for(lambda: rebuild_client.health()["maintenance_reason"] is None)
+    final = rebuild_client.call("zettel_service", "rebuild_status")
+    assert final["status"] == "success"
+    assert final["error"] is None
+
+
+def test_rebuild_status_reports_worker_failure(daemon_server, monkeypatch):
+    """A rebuild that raises is captured into status (not crashed) and maintenance
+    is cleared so the daemon keeps serving."""
+    client = DaemonRpcClient(daemon_server.base_url, timeout_seconds=5.0)
+
+    def boom():
+        raise RuntimeError("kaboom during rebuild")
+
+    monkeypatch.setattr(daemon_server.zettel_service, "rebuild_index", boom)
+
+    assert client.call("zettel_service", "rebuild_index") == {"status": "started"}
+    assert _wait_for(lambda: client.health()["maintenance_reason"] is None)
+
+    status = client.call("zettel_service", "rebuild_status")
+    assert status["status"] == "error"
+    assert "kaboom during rebuild" in status["error"]
+    # Daemon still serves normal calls after a failed rebuild.
+    assert isinstance(client.call("zettel_service", "get_all_tags"), list)
+
+
+def test_maintenance_busy_message_falls_back_to_raw_reason():
+    """An unknown maintenance reason is still named (raw token), never bare 'busy'."""
+    from parazettel_mcp.daemon.server import _maintenance_busy_message
+
+    known = _maintenance_busy_message("rebuild_index")
+    assert "rebuilding the search index" in known
+    assert "rebuild_index" in known
+
+    unknown = _maintenance_busy_message("compacting_store")
+    assert "compacting_store" in unknown
+    assert "Try the request again" in unknown
+
+
+def test_daemon_busy_error_is_registered_for_client_decode():
+    """The client can reconstruct a remote DaemonBusyError as its own type."""
+    from parazettel_mcp.daemon.client import ERROR_REGISTRY
+
+    assert ERROR_REGISTRY["DaemonBusyError"] is DaemonBusyError
 
 
 def test_two_clients_share_one_daemon_without_db_lock(daemon_server):
@@ -520,8 +787,8 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
     mock_mcp.tool = fake_tool_decorator
 
     class FakeClient:
-        def __init__(self, base_url: str, timeout_seconds: float = 5.0):
-            client_calls.append((base_url, timeout_seconds))
+        def __init__(self, base_url: str, timeout_seconds: float = 5.0, **kwargs):
+            client_calls.append((base_url, timeout_seconds, kwargs))
 
         def health(self):
             return {"ok": True}
@@ -540,10 +807,11 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
 
     server = ZettelkastenMcpServer()
     try:
-        assert client_calls == [
-            ("http://127.0.0.1:8766", 5.0),
-            ("http://127.0.0.1:8766", 123.0),
-        ]
+        # Health client: short timeout, no restart callback.
+        assert client_calls[0] == ("http://127.0.0.1:8766", 5.0, {})
+        # RPC client: long timeout AND the auto-restart callback wired in.
+        assert client_calls[1][:2] == ("http://127.0.0.1:8766", 123.0)
+        assert callable(client_calls[1][2].get("on_unavailable"))
     finally:
         server.close()
         config.backend_mode = original_backend_mode

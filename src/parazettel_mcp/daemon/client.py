@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Dict, Optional
 from urllib import error, request
 
@@ -10,13 +11,43 @@ from parazettel_mcp.daemon.codec import decode_value, encode_value
 from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.services.reranker import RerankerError, RerankerLoadTimeoutError
 
+logger = logging.getLogger(__name__)
+
+
+def _request_never_reached_daemon(exc: BaseException) -> bool:
+    """True only when the connection was refused, i.e. nothing was listening.
+
+    That is the one transport failure where the daemon provably never saw the
+    request, so replaying it after a restart cannot double-apply a write. A
+    timeout or reset may arrive AFTER the daemon executed a mutating RPC (e.g.
+    note creation), so those are never replayed. ``urlopen`` wraps socket
+    errors in ``URLError``, so unwrap ``.reason``.
+    """
+    if isinstance(exc, error.URLError) and not isinstance(exc, error.HTTPError):
+        exc = exc.reason if isinstance(exc.reason, BaseException) else exc
+    return isinstance(exc, ConnectionRefusedError)
+
 
 class DaemonUnavailableError(RuntimeError):
     """Raised when the configured daemon cannot be reached."""
 
 
+class DaemonBusyError(RuntimeError):
+    """Raised when the daemon is in maintenance mode and cannot serve a request.
+
+    Defined here (rather than in the daemon server) so the facade-side client can
+    reconstruct it from a remote 503 response and callers can distinguish a
+    transient "vault is rebuilding" condition from a real crash. The daemon server
+    imports this same class so both sides agree on the type name.
+    """
+
+
 ERROR_REGISTRY = {
     "GraphDatabaseReadOnlyError": GraphDatabaseReadOnlyError,
+    # A maintenance-mode rejection (e.g. mid index rebuild). Reconstructed as its
+    # own type so the facade surfaces "try again shortly", not a crash-looking
+    # generic RuntimeError.
+    "DaemonBusyError": DaemonBusyError,
     # The dedup reranker now runs in the daemon; relay its failures back to the
     # facade as the SAME type so _rerank_confirm / ingest_batch can recognize and
     # surface them (a wedged/failed rerank must fail loud, not silently degrade).
@@ -33,9 +64,19 @@ ERROR_REGISTRY = {
 class DaemonRpcClient:
     """Simple JSON-over-HTTP client for the local Parazettel daemon."""
 
-    def __init__(self, base_url: str, timeout_seconds: float = 5.0):
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 5.0,
+        on_unavailable: Optional[Any] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # Optional zero-arg callback invoked when the daemon is unreachable. If it
+        # returns truthy (it (re)started the daemon), the request is retried ONCE.
+        # Lets a recycled or idle-shut-down daemon recover transparently mid-
+        # session instead of failing the caller's tool call.
+        self._on_unavailable = on_unavailable
 
     def health(self) -> Dict[str, Any]:
         """Fetch daemon health and status information."""
@@ -71,6 +112,7 @@ class DaemonRpcClient:
         path: str,
         *,
         payload: Optional[Dict[str, Any]] = None,
+        allow_restart: bool = True,
     ) -> Dict[str, Any]:
         data = None
         headers = {"Accept": "application/json"}
@@ -95,6 +137,18 @@ class DaemonRpcClient:
                 raise RuntimeError(body or str(exc)) from exc
             self._raise_remote_error(payload.get("error", {}))
         except (error.URLError, OSError) as exc:
+            # The daemon may have recycled or idle-shut-down. If the connection
+            # was refused (the request provably never ran), (re)start it once and
+            # replay so the caller's tool call still succeeds. Any other failure
+            # (timeout, reset) is ambiguous for writes, so it is surfaced as-is.
+            if (
+                allow_restart
+                and _request_never_reached_daemon(exc)
+                and self._try_restart_daemon()
+            ):
+                return self._request_json(
+                    method, path, payload=payload, allow_restart=False
+                )
             raise DaemonUnavailableError(
                 "Parazettel daemon is unavailable. Start it with: "
                 "python -m parazettel_mcp.main --run-daemon "
@@ -107,6 +161,16 @@ class DaemonRpcClient:
         if payload.get("ok") is False:
             self._raise_remote_error(payload.get("error", {}))
         return payload
+
+    def _try_restart_daemon(self) -> bool:
+        """Run the unavailable-callback to (re)start the daemon; False on any error."""
+        if self._on_unavailable is None:
+            return False
+        try:
+            return bool(self._on_unavailable())
+        except Exception:  # recovery is best-effort, but never silent
+            logger.warning("Parazettel daemon restart callback failed", exc_info=True)
+            return False
 
     def _raise_remote_error(self, error_payload: Dict[str, Any]) -> None:
         error_type = error_payload.get("type", "RuntimeError")
