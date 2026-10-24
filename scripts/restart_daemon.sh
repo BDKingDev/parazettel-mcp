@@ -25,7 +25,11 @@ if [ -z "$py" ]; then
 fi
 
 : "${PARAZETTEL_NOTES_DIR:=$repo/data/notes}"
-: "${PARAZETTEL_INDEX_DB_PATH:=$repo/data/db/index.sqlite3}"
+# Only default the index path when no legacy graph path is set: an explicit
+# PARAZETTEL_INDEX_DB_PATH outranks it and would bypass the legacy mapping.
+if [ -z "${PARAZETTEL_GRAPH_DB_PATH:-}" ]; then
+  : "${PARAZETTEL_INDEX_DB_PATH:=$repo/data/db/index.sqlite3}"
+fi
 : "${PARAZETTEL_BACKEND_MODE:=daemon}"
 : "${PARAZETTEL_DAEMON_HOST:=127.0.0.1}"
 : "${PARAZETTEL_DAEMON_PORT:=8766}"

@@ -115,6 +115,14 @@ def _prepare_environment(
     from ``parazettel_mcp`` is imported, because the config object reads the
     environment at import time.
     """
+    work, src = work_dir.resolve(), notes_src.resolve()
+    if work == src or work in src.parents or src in work.parents:
+        sys.exit(
+            f"--work-dir {work_dir} overlaps --notes-src {notes_src}; refusing to "
+            "delete it (the work dir is wiped and must be separate from the notes)."
+        )
+    if seed_index is not None and work in seed_index.resolve().parents:
+        sys.exit(f"--seed-index {seed_index} is inside --work-dir, which is wiped.")
     if work_dir.exists():
         shutil.rmtree(work_dir)
     notes_dir = work_dir / "notes"

@@ -119,7 +119,12 @@ function Clear-StaleLocks([string]$repo) {
 }
 
 Set-DefaultEnv "PARAZETTEL_NOTES_DIR"        (Join-Path $repo "data\notes")
-Set-DefaultEnv "PARAZETTEL_INDEX_DB_PATH"    (Join-Path $repo "data\db\index.sqlite3")
+# Only default the index path when no legacy graph path is set: an explicit
+# PARAZETTEL_INDEX_DB_PATH outranks it, which would bypass the legacy mapping
+# (graph.kuzu -> sibling index.sqlite3) that other sessions still use.
+if (-not $env:PARAZETTEL_GRAPH_DB_PATH) {
+  Set-DefaultEnv "PARAZETTEL_INDEX_DB_PATH"  (Join-Path $repo "data\db\index.sqlite3")
+}
 Set-DefaultEnv "PARAZETTEL_BACKEND_MODE"     "daemon"
 Set-DefaultEnv "PARAZETTEL_DAEMON_HOST"      "127.0.0.1"
 Set-DefaultEnv "PARAZETTEL_DAEMON_PORT"      "8766"
