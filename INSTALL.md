@@ -158,9 +158,14 @@ Then run a simple smoke test such as creating an area note or fetching an existi
 ## Step 7: Vaults from a Kuzu-based release
 
 New vaults need no migration: the index is created on first start. The one-time
-Kuzu → SQLite migration script has been retired; recover it with
-`git show d0eeb77:scripts/migrate_kuzu_to_sqlite.py`
-(it needs `pip install "kuzu>=0.11.3,<0.12"`).
+Kuzu → SQLite migration script has been retired. If you still have a Kuzu vault
+to convert, recover the script from history (this finds the commit that deleted
+it, so it works whatever the commit hashes are):
+
+```bash
+git show "$(git rev-list -n 1 HEAD -- scripts/migrate_kuzu_to_sqlite.py)^:scripts/migrate_kuzu_to_sqlite.py" > migrate_kuzu_to_sqlite.py
+pip install "kuzu>=0.11.3,<0.12"
+```
 
 ## Troubleshooting
 

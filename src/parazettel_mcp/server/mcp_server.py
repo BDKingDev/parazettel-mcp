@@ -304,8 +304,9 @@ class ZettelkastenMcpServer:
         if status == "started":
             return (
                 f"Index rebuild started in the background ({note_count_before} notes).\n"
-                "It runs safely (the new index is built into a temporary database and "
-                "swapped in atomically), and typically takes a few minutes on a large "
+                "It runs safely (the current index is backed up when non-empty, then "
+                "refilled in a single transaction that rolls back on failure), and "
+                "typically takes a few minutes on a large "
                 "vault. While it runs, other parazettel calls report "
                 "'busy rebuilding the search index'.\n"
                 "Check progress and the final result with pzk_rebuild_status."

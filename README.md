@@ -377,7 +377,7 @@ python -m parazettel_mcp.main --stop-daemon
 
 ### Migrating from the Kuzu graph index
 
-Earlier releases indexed into a Kuzu graph database (`graph.kuzu`). Kuzu was archived upstream in October 2025, so the index is now SQLite. The markdown notes are unaffected. The one-time migration script (`scripts/migrate_kuzu_to_sqlite.py`) has been retired; recover it with `git show d0eeb77:scripts/migrate_kuzu_to_sqlite.py` if you still have a Kuzu vault to convert (it needs the `kuzu` package).
+Earlier releases indexed into a Kuzu graph database (`graph.kuzu`). Kuzu was archived upstream in October 2025, so the index is now SQLite. The markdown notes are unaffected. The one-time migration script (`scripts/migrate_kuzu_to_sqlite.py`) has been retired. If you still have a Kuzu vault to convert, see [INSTALL.md, Step 7](INSTALL.md) to recover it from history (it needs the `kuzu` package).
 
 To compare search quality across backends, `scripts/search_eval.py` provides a `generate` / `run` / `compare` harness: build a fixed query set from a frozen notes copy, capture each backend's results, and diff a candidate run against a baseline.
 
