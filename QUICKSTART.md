@@ -1,6 +1,6 @@
 # Quick Start Guide
 
-Get Parazettel running quickly, with the recommended shared-daemon setup for multi-chat use.
+Get Parazettel running quickly, with the recommended shared-daemon setup (keeps the embedding model warm across chats).
 
 ## 1. Install
 
@@ -14,14 +14,14 @@ uv sync --extra dev
 
 ## 2. Choose Your Mode
 
-- **Single chat / local dev:** use `direct`
-- **Multiple chats at once:** use `daemon` (recommended)
+- **Simple / local dev:** use `direct` — safe even with several chats open; writes are serialized by a cross-process lock
+- **Embeddings enabled, several chats:** use `daemon` (recommended) so the embedding model and reranker load once
 
 ## 3. Set Paths
 
 ```bash
 export PARAZETTEL_NOTES_DIR="$HOME/Documents/zettelkasten"
-export PARAZETTEL_GRAPH_DB_PATH="$HOME/Documents/zettelkasten-db/graph.kuzu"
+export PARAZETTEL_INDEX_DB_PATH="$HOME/Documents/zettelkasten-db/index.sqlite3"
 export PARAZETTEL_LOG_LEVEL="INFO"
 ```
 
@@ -38,13 +38,13 @@ The daemon auto-shuts down after an idle period (default 3600s); override it wit
 
 ## 4. Start the Shared Daemon
 
-If you want multiple chat windows, daemon mode is recommended. In normal use the MCP facade now auto-starts the daemon if needed, so this manual startup is optional:
+Daemon mode is recommended when embeddings are enabled. In normal use the MCP facade now auto-starts the daemon if needed, so this manual startup is optional:
 
 ```bash
 python -m parazettel_mcp.main \
   --run-daemon \
   --notes-dir "$PARAZETTEL_NOTES_DIR" \
-  --graph-db-path "$PARAZETTEL_GRAPH_DB_PATH" \
+  --index-db-path "$PARAZETTEL_INDEX_DB_PATH" \
   --daemon-host 127.0.0.1 \
   --daemon-port 8766
 ```
@@ -63,7 +63,7 @@ Add to `~/.claude.json` or your MCP client config:
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/notes",
-        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/data/db/graph.kuzu",
+        "PARAZETTEL_INDEX_DB_PATH": "/absolute/path/to/data/db/index.sqlite3",
         "PARAZETTEL_BACKEND_MODE": "daemon",
         "PARAZETTEL_DAEMON_HOST": "127.0.0.1",
         "PARAZETTEL_DAEMON_PORT": "8766",
@@ -74,7 +74,7 @@ Add to `~/.claude.json` or your MCP client config:
 }
 ```
 
-For single-chat direct mode, omit the daemon variables or set `PARAZETTEL_BACKEND_MODE=direct`.
+For direct mode, omit the daemon variables or set `PARAZETTEL_BACKEND_MODE=direct`.
 
 ## 6. Verify
 
@@ -104,15 +104,13 @@ python -m parazettel_mcp.main --daemon-status
 # Stop the managed daemon
 python -m parazettel_mcp.main --stop-daemon
 
-# Migrate an old SQLite-era vault
-python scripts/migrate_to_graphdb.py --notes-dir ./data/notes --graph-db-path ./data/db/graph.kuzu
 ```
 
 ## If Something Fails
 
-- `graph.kuzu` lock errors: you are likely using multiple direct processes; use daemon mode.
+- write-lock timeout (`... .write.lock`): another process is mid-write (usually a long rebuild); retry once it finishes.
 - daemon unavailable: start the daemon or fix `PARAZETTEL_DAEMON_HOST` / `PARAZETTEL_DAEMON_PORT`. `python -m parazettel_mcp.main --daemon-status` is the quickest check.
-- old `.db` paths: switch to `PARAZETTEL_GRAPH_DB_PATH`, though `PARAZETTEL_DATABASE_PATH` is still accepted for compatibility.
+- old `graph.kuzu` or `.db` paths: switch to `PARAZETTEL_INDEX_DB_PATH`, though `PARAZETTEL_GRAPH_DB_PATH` (a `*.kuzu` value places the index at a sibling `index.sqlite3`) and `PARAZETTEL_DATABASE_PATH` are still accepted for compatibility. Existing Kuzu vaults: see INSTALL.md, Step 7.
 
 ## Next Docs
 

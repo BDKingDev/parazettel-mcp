@@ -423,10 +423,10 @@ def test_build_daemon_command_uses_absolute_storage_paths(monkeypatch):
     """Spawned daemons should receive resolved storage paths, not raw config values."""
     args = argparse.Namespace(log_level="INFO")
     absolute_notes_dir = Path("C:/abs/notes")
-    absolute_graph_path = Path("C:/abs/db/graph.kuzu")
+    absolute_index_path = Path("C:/abs/db/index.sqlite3")
 
     monkeypatch.setattr(config, "notes_dir", Path("relative-notes"))
-    monkeypatch.setattr(config, "graph_db_path", Path("relative-db/graph.kuzu"))
+    monkeypatch.setattr(config, "index_db_path", Path("relative-db/index.sqlite3"))
     monkeypatch.setattr(config, "daemon_host", "127.0.0.1")
     monkeypatch.setattr(config, "daemon_port", 8766)
     monkeypatch.setattr(config, "daemon_idle_timeout_seconds", 0.0)
@@ -437,16 +437,17 @@ def test_build_daemon_command_uses_absolute_storage_paths(monkeypatch):
     )
     monkeypatch.setattr(
         type(config),
-        "get_graph_db_path",
-        lambda self: absolute_graph_path,
+        "get_index_db_path",
+        lambda self: absolute_index_path,
     )
 
     command = main_module._build_daemon_command(args)
 
     notes_index = command.index("--notes-dir") + 1
-    graph_index = command.index("--graph-db-path") + 1
+    index_index = command.index("--index-db-path") + 1
     assert command[notes_index] == str(absolute_notes_dir)
-    assert command[graph_index] == str(absolute_graph_path)
+    assert command[index_index] == str(absolute_index_path)
+    assert "--graph-db-path" not in command
 
 
 def test_main_reports_daemon_status(monkeypatch, capsys, workspace_temp_dir):

@@ -2,30 +2,34 @@
 
 Status: **off by default.** Enable with `PARAZETTEL_EMBEDDING_ENABLED=true` plus an
 install tier (below). When disabled, the system behaves exactly as before
-(BM25 + lexical) and pulls in no ML dependencies.
+(BM25 + lexical) and pulls in no ML dependencies (numpy, used for vector math,
+is a core dependency).
 
 ## Design
 
-- **Vectors live in Kuzu.** Each `Note` node gets an `embedding FLOAT[dim]`
-  property and a native **HNSW** vector index (Kuzu 0.11.x ships the `vector`
-  extension statically linked). One store, one backup, one atomic swap — no
+- **Vectors live in the SQLite index.** Each note gets a **doc** vector and a
+  **title** vector, stored as float32 BLOBs in the `embeddings` table alongside
+  the model id and a hash of the embedded text. One store, one backup — no
   sidecar vector DB.
+- **Exact search, no ANN index.** At vault scale (thousands of notes) an exact
+  scan is a single matrix-vector product, so vectors are searched brute-force
+  (cosine / l2 / dotproduct via numpy) — no HNSW index, no approximation. A note
+  matches on the **closer** of its doc and title vectors. Each process caches
+  the vector matrices and reloads them only when an embedding write (in *any*
+  process) bumps a generation counter, so every session sees fresh vectors.
 - **Hybrid retrieval via Reciprocal Rank Fusion.** Keep BM25 for exact terms,
   add dense vectors for meaning, fuse on *rank* (RRF, `k=60`) to avoid the
   score-incompatibility problem. Each result keeps its **BM25 score** so
   score-threshold consumers (dedup-on-create) are unaffected; vector-only hits
   carry score 0. Structural filters are applied to vector hits by intersecting
   with the existing filter query (no duplicated filter logic).
-- **Rebuild-driven index + brute-force fallback.** The HNSW index is (re)built in
-  the existing rebuild → atomic-swap pipeline (also backfills `Note.embedding`).
-  Notes changed since the last rebuild can't update `Note.embedding` — once the
-  HNSW index exists Kuzu locks that column against `SET` — so their vectors are
-  written to a separate, un-indexed **`PendingEmbedding`** table, and a
-  brute-force cosine pass (`array_cosine_similarity`) over that small dirty set
-  covers them at query time (fresh vectors override stale index entries). A
-  rebuild repopulates `Note.embedding` from the files and starts the pending
-  table empty. (Embeddings are currently computed under the global write lock;
-  moving the compute outside it is a planned optimization.)
+- **Writes update vectors in place; rebuild reuses them.** Creating or updating
+  a note writes its vectors directly (there is no separate pending table). A
+  rebuild embeds notes *before* its write transaction opens and **reuses a stored
+  vector when the model and the embedded text (text hash) are unchanged**, so
+  only the first rebuild — or one after a model change — re-embeds the whole
+  vault. Create and rebuild embed the same file body, so a note's vector no
+  longer changes just because the index was rebuilt.
 - **Provider abstraction.** Everything depends only on the small
   `EmbeddingProvider` protocol (`services/embedding_provider.py`); the model and
   runtime are swappable via config.
@@ -112,12 +116,22 @@ The GPU's larger memory also lifts the CPU 4 GB-attention limit, so
    session-level settings file: `PARAZETTEL_EMBEDDING_ENABLED=true`, the
    provider/model/dim/metric, and a persistent `FASTEMBED_CACHE_PATH`.
 3. Restart the daemon so it loads the embedding code, the env, and the model.
-4. Run `pzk_rebuild_index` once to backfill embeddings and build the HNSW index.
+4. Run `pzk_rebuild_index` once to backfill embeddings (later rebuilds reuse
+   unchanged vectors).
    Large bulk embeds are memory-bound — keep `PARAZETTEL_EMBEDDING_BATCH_SIZE`
    small. Changing the model or dim later requires another rebuild (re-embeds the
    whole vault), so choose before the first rebuild.
+5. Verify via the daemon's `/health` endpoint: its `embeddings` block
+   (`enabled`, `model_id`, `vectors_stored`, `generation`) should show
+   `enabled: true` with `vectors_stored` close to `index.notes`. Far fewer
+   vectors than notes means the provider failed silently (e.g. a missing model
+   file).
 
 ## Phased delivery (one PR each)
+
+*Historical: these PRs were delivered against the earlier Kuzu backend (HNSW
+index, `PendingEmbedding` table). The SQLite index replaced both with exact
+search over stored vectors; see **Design** above.*
 
 - **PR-0 — foundation:** config + provider abstraction + lite/full tiers + Kuzu
   embedding schema / HNSW vector-index helpers. Each piece is tested in isolation

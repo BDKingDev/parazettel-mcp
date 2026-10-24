@@ -1,7 +1,7 @@
 """File <-> graph synchronization contract tests.
 
 Three guarantees are pinned here, each verified at BOTH layers (the markdown
-file on disk and the Kuzu LINKS_TO edges), because their historical failure
+file on disk and the indexed link rows), because their historical failure
 mode is exactly one layer silently disagreeing with the other:
 
 1. Every kind of manual .md edit (## Links lines, inline prose refs,
@@ -18,6 +18,8 @@ import datetime
 import os
 
 import pytest
+
+import _index_helpers as index_helpers
 
 from parazettel_mcp.models.schema import LinkType, NoteType
 
@@ -42,17 +44,8 @@ def write_md(service, note_id: str, text: str) -> None:
 
 
 def edge_types(service, source_id: str, target_id: str) -> set:
-    """LINKS_TO edge types from source to target, read straight from Kuzu."""
-    with service.repository._connection() as conn:
-        result = conn.execute(
-            "MATCH (s:Note {id: $s})-[r:LINKS_TO]->(t:Note {id: $t}) "
-            "RETURN r.link_type",
-            {"s": source_id, "t": target_id},
-        )
-        types = set()
-        while result.has_next():
-            types.add(result.get_next()[0])
-        return types
+    """Link types from source to target, read straight from the index."""
+    return index_helpers.edge_types(service, source_id, target_id)
 
 
 def links_section(service, note_id: str) -> str:
@@ -187,13 +180,7 @@ def test_hand_written_duplicate_link_lines_dedupe_to_one_edge(zettel_service):
         + f"\n## Links\n- reference [[{b.id}]]\n- reference [[{b.id}]]\n",
     )
     zettel_service.rebuild_index()
-    with zettel_service.repository._connection() as conn:
-        result = conn.execute(
-            "MATCH (s:Note {id: $s})-[r:LINKS_TO]->(t:Note {id: $t}) "
-            "RETURN count(r)",
-            {"s": a.id, "t": b.id},
-        )
-        assert result.get_next()[0] == 1
+    assert index_helpers.edge_count(zettel_service, a.id, b.id) == 1
 
 
 def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
@@ -212,13 +199,9 @@ def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
         lk for lk in zettel_service.get_note(a.id).links if lk.target_id == b.id
     )
     assert link.created_at == datetime.datetime.fromisoformat(stamp)
-    with zettel_service.repository._connection() as conn:
-        result = conn.execute(
-            "MATCH (s:Note {id: $s})-[r:LINKS_TO]->(t:Note {id: $t}) "
-            "RETURN r.created_at",
-            {"s": a.id, "t": b.id},
-        )
-        assert result.get_next()[0] == datetime.datetime.fromisoformat(stamp)
+    assert index_helpers.edge_created_at(zettel_service, a.id, b.id) == [
+        datetime.datetime.fromisoformat(stamp)
+    ]
 
 
 def test_hand_edited_frontmatter_routing_propagates(zettel_service):
@@ -285,11 +268,7 @@ def test_hand_deleted_file_drops_node_and_edges(zettel_service):
     zettel_service.repository.rebuild_index_if_needed()
 
     assert edge_types(zettel_service, a.id, doomed.id) == set()
-    with zettel_service.repository._connection() as conn:
-        result = conn.execute(
-            "MATCH (n:Note {id: $id}) RETURN count(n)", {"id": doomed.id}
-        )
-        assert result.get_next()[0] == 0
+    assert not index_helpers.note_indexed(zettel_service, doomed.id)
     # The survivor's stale ## Links line is now a dangling ref the
     # consistency check reports (file scrub only happens on API deletes).
     report = zettel_service.check_consistency()

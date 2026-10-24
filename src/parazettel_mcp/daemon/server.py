@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _IDLE_POLL_INTERVAL_SECONDS = 1.0
 # Log this process's memory every N RPC requests so a slow climb over a long
 # session is visible in the daemon log — which distinguishes a true leak
-# (monotonic climb) from the Kuzu buffer pool's bounded high-water plateau.
+# (monotonic climb) from a bounded high-water plateau (e.g. loaded models).
 _MEMORY_LOG_EVERY_N_REQUESTS = 200
 
 
@@ -424,9 +424,8 @@ class ParazettelDaemonServer:
     def _should_recycle_for_memory(self, idle_for: float) -> bool:
         """Whether to recycle now because the resident set is over the ceiling.
 
-        Bounds Kuzu 0.11.3's per-vector-query native leak — which no Python-side
-        cleanup reclaims and which has no upstream fix (Kuzu is archived). The
-        caller (the monitor) only asks once no request is in flight, and this
+        A safety net against slow native/memory growth in a long-lived daemon
+        (originally added for Kuzu 0.11.3's vector-query leak). The caller (the monitor) only asks once no request is in flight, and this
         additionally requires the idle grace window, so a fresh request right
         before a poll isn't cut off; the next request auto-starts a fresh daemon.
         """
@@ -442,7 +441,7 @@ class ParazettelDaemonServer:
         logger.warning(
             "Recycling Parazettel daemon: working_set=%.0f MB is over the %.0f MB "
             "ceiling after %.0fs idle (a fresh daemon auto-starts on the next "
-            "request). Bounds the Kuzu vector-query native leak.",
+            "request).",
             mem[0],
             cap / (1024 * 1024),
             idle_for,
@@ -513,10 +512,28 @@ class ParazettelDaemonServer:
         self._closed = True
         self.zettel_service.close()
 
+    def _release_thread_resources(self) -> None:
+        """Release the calling (short-lived) thread's index connection."""
+        repository = getattr(self.zettel_service, "repository", None)
+        release = getattr(repository, "release_thread_connection", None)
+        if callable(release):
+            try:
+                release()
+            except Exception:  # pragma: no cover - teardown must never raise
+                logger.debug("Releasing thread connection failed", exc_info=True)
+
     def _build_handler(self) -> type[BaseHTTPRequestHandler]:
         daemon = self
 
         class Handler(BaseHTTPRequestHandler):
+            def finish(self) -> None:
+                # Each request runs on a fresh thread; release its index
+                # connection so connections don't accumulate per request.
+                try:
+                    super().finish()
+                finally:
+                    daemon._release_thread_resources()
+
             def _ensure_loopback_client(self) -> bool:
                 client_host = self.client_address[0]
                 if _is_loopback_host(client_host):
@@ -537,20 +554,26 @@ class ParazettelDaemonServer:
                 if not self._ensure_loopback_client():
                     return
                 if self.path == "/health":
-                    self._send_json(
-                        200,
-                        {
-                            "ok": True,
-                            "version": config.server_version,
-                            "mode": "daemon",
-                            "graph_writable": not daemon.zettel_service.repository.read_only,
-                            "pid": os.getpid(),
-                            "port": daemon.server_address[1],
-                            "idle_timeout_seconds": daemon._idle_timeout_seconds,
-                            "pid_file": str(config.get_daemon_pid_file()),
-                            "maintenance_reason": daemon._maintenance_reason,
-                        },
-                    )
+                    repository = daemon.zettel_service.repository
+                    payload = {
+                        "ok": True,
+                        "version": config.server_version,
+                        "mode": "daemon",
+                        # Always true under SQLite WAL; kept for older clients.
+                        "graph_writable": not repository.read_only,
+                        "pid": os.getpid(),
+                        "port": daemon.server_address[1],
+                        "idle_timeout_seconds": daemon._idle_timeout_seconds,
+                        "pid_file": str(config.get_daemon_pid_file()),
+                        "maintenance_reason": daemon._maintenance_reason,
+                    }
+                    status = getattr(repository, "index_status", None)
+                    if callable(status):
+                        try:
+                            payload.update(status())
+                        except Exception as exc:  # health must answer regardless
+                            payload["index_error"] = repr(exc)
+                    self._send_json(200, payload)
                     return
                 self._send_json(404, {"ok": False, "error": {"type": "NotFound", "message": "Unknown path"}})
 
@@ -712,6 +735,7 @@ class ParazettelDaemonServer:
         except BaseException as exc:  # noqa: BLE001 - record, never crash the worker
             error = exc
             logger.error("Background rebuild_index failed: %s", exc, exc_info=True)
+        self._release_thread_resources()  # the worker thread is about to exit
         repository = getattr(self.zettel_service, "repository", None)
         skipped = getattr(repository, "last_rebuild_skipped", [])
         if not isinstance(skipped, (list, tuple)):

@@ -19,31 +19,23 @@ if _REPO_ENV_PATH.exists():
 
 
 # --- Resource-tuning defaults ---
-# Max Kuzu buffer-pool size in bytes. The buffer pool is a lazy page cache: under
-# sustained query load (many vector searches paging the DB + HNSW index in) it
-# grows toward this cap and stays resident. Kuzu's own default (selected by 0) is
-# ~80% of physical RAM *per database instance*, which on a long-lived daemon
-# balloons commit charge to tens of GB and inflates the Windows pagefile. So we
-# cap it at a bounded default and expose PARAZETTEL_KUZU_BUFFER_POOL_BYTES to tune
-# it (0 restores Kuzu's ~80%-RAM default). The test suite bounds it further via
-# the conftest fixture so per-test databases stay tiny.
-# Kuzu buffer-pool cap. Kept well below the old 8 GiB: the pool is *committed*
-# lazily up to this cap, so it dominates the daemon's pagefile/commit charge —
-# 3 GiB keeps that bounded while still caching plenty for a typical vault. Raise
-# it (PARAZETTEL_KUZU_BUFFER_POOL_BYTES) for a very large vault that thrashes.
-DEFAULT_KUZU_BUFFER_POOL_BYTES = 3 * 1024**3  # 3 GiB
+# File name of the SQLite index when its location is derived from a legacy
+# ``*.kuzu`` path. Deliberately not ``parazettel.db``, the pre-Kuzu SQLAlchemy
+# database that may still sit (with its backups) in the same directory.
+DEFAULT_INDEX_DB_NAME = "index.sqlite3"
+DEFAULT_INDEX_BACKUP_KEEP = 5
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 10_000
 # Working-set ceiling that triggers a daemon RECYCLE: when the resident set grows
 # past this AND the daemon is idle with no request in flight, it shuts down (a
-# fresh one is auto-started on the next request). This bounds Kuzu 0.11.3's
-# per-vector-query native leak (which no Python-side cleanup reclaims, and which
-# has no upstream fix — Kuzu is archived). 0 disables. Set above the legitimate
-# peak (a full rebuild transiently holds the live + temp DB at ~4 GiB) so only a
-# genuine leak trips it — the monitor also never recycles while a request runs.
+# fresh one is auto-started on the next request). Originally added to bound Kuzu
+# 0.11.3's per-vector-query native leak; with the SQLite index it remains a cheap
+# safety net against any slow native/memory growth in a long-lived daemon. 0
+# disables. The monitor never recycles while a request or maintenance op runs.
 DEFAULT_DAEMON_MAX_RSS_BYTES = 6 * 1024**3  # 6 GiB
-# Seconds of inactivity after which the daemon shuts itself down (a fresh one is
-# auto-started on the next request). A non-zero default means a daemon left
+# Seconds of inactivity after which the daemon shuts itself down (it is
+# auto-restarted on the next request). A non-zero default means a daemon left
 # behind when an MCP client exits without reaping it reaps itself instead of
-# holding the Kuzu DB and embedding model forever.
+# holding the embedding model forever.
 DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 3600.0
 # Once the daemon is over the RSS ceiling, wait for at least this many seconds of
 # inactivity before recycling, so an in-flight request is never cut off.
@@ -58,11 +50,22 @@ DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
 DEFAULT_DEDUP_RERANK_MIN_SCORE = 3.0
-# Max distinct terms kept in a text FTS query. A long query with many moderately
-# common terms makes Kuzu's FTS match most of the corpus and drop even the best
-# match; reducing to the K lowest-DF (most discriminative) terms bounds the match
-# set so the best lexical hit stays findable. Only long queries are reduced.
-DEFAULT_FTS_MAX_QUERY_TERMS = 12
+# Max distinct terms kept in a text FTS query (0 = keep all). Reducing a long
+# query to its K lowest-DF terms was a workaround for Kuzu's FTS, whose negative
+# IDF on common terms could drop the best match entirely. FTS5 floors IDF at ~0
+# instead, and on the vault eval (scripts/search_eval.py) keeping every term was
+# as good or better (dedup BM25 MRR@10 0.9925 -> 0.995, no regressions), so it
+# is off by default; set PARAZETTEL_FTS_MAX_QUERY_TERMS to re-enable.
+DEFAULT_FTS_MAX_QUERY_TERMS = 0
+# Minimum BM25 score for a lexical dedup candidate before the cross-encoder
+# confirm, and for the "strong lexical match" search verdict. Calibrated on the
+# vault (scripts/search_eval.py, 200 self-retrieval probes): FTS5 scores run
+# ~2.6x Kuzu's (FTS5 floors common-term IDF at ~0 where Kuzu went negative), yet
+# any floor from 1.0 to 4.0 gives the same split there — every true duplicate
+# passes, and the cross-encoder does the precision work. The floor only matters
+# for SMALL vaults, where IDF (so every score) is low; 4.0 would hide their real
+# duplicates, so the original 1.5 stays. Re-derive if the scoring changes.
+DEFAULT_DEDUP_MIN_BM25 = 1.5
 # Execution device for the dedup reranker. Defaults to CPU and is INTENTIONALLY
 # decoupled from embedding_device: the reranker is loaded per-session in each MCP
 # facade, so on CUDA every concurrent (and every orphaned) session stacks another
@@ -90,10 +93,37 @@ class ZettelkastenConfig(BaseModel):
     notes_dir: Path = Field(
         default_factory=lambda: Path(os.getenv("PARAZETTEL_NOTES_DIR", "data/notes"))
     )
-    # Graph database configuration (Kuzu database file path)
+    # SQLite index database path. Unset means "derive from graph_db_path" (see
+    # get_index_db_path), so existing configs that only set the old Kuzu path
+    # keep working.
+    index_db_path: Optional[Path] = Field(
+        default_factory=lambda: (
+            Path(os.environ["PARAZETTEL_INDEX_DB_PATH"])
+            if os.getenv("PARAZETTEL_INDEX_DB_PATH")
+            else None
+        )
+    )
+    # Deprecated: the pre-SQLite Kuzu database path. Still honoured as the source
+    # of the index location — a ``*.kuzu`` path maps to a sibling
+    # ``index.sqlite3``.
     graph_db_path: Path = Field(
         default_factory=lambda: Path(
             os.getenv("PARAZETTEL_GRAPH_DB_PATH", "data/db/graph.kuzu")
+        )
+    )
+    # Number of timestamped index backups (taken before each rebuild) to keep.
+    index_backup_keep: int = Field(
+        default_factory=lambda: int(
+            os.getenv("PARAZETTEL_INDEX_BACKUP_KEEP", str(DEFAULT_INDEX_BACKUP_KEEP))
+        )
+    )
+    # How long a writer waits for another process's write transaction to finish
+    # before giving up.
+    sqlite_busy_timeout_ms: int = Field(
+        default_factory=lambda: int(
+            os.getenv(
+                "PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS", str(DEFAULT_SQLITE_BUSY_TIMEOUT_MS)
+            )
         )
     )
     # Legacy SQLite path – kept for backward compatibility and migration tooling only
@@ -134,7 +164,7 @@ class ZettelkastenConfig(BaseModel):
         default=DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS
     )
     # Recycle the daemon once its resident set passes this (see
-    # DEFAULT_DAEMON_MAX_RSS_BYTES); 0 disables. Bounds the Kuzu vector-query leak.
+    # DEFAULT_DAEMON_MAX_RSS_BYTES); 0 disables.
     daemon_max_rss_bytes: int = Field(
         default=int(
             os.getenv(
@@ -175,9 +205,9 @@ class ZettelkastenConfig(BaseModel):
         )
     )
     # Embedding / semantic search configuration (disabled by default).
-    # When enabled, note bodies are embedded into a dense vector stored on the
-    # Note node and indexed with Kuzu's native HNSW vector index, enabling
-    # hybrid (BM25 + semantic) retrieval. See services/embedding_provider.py.
+    # When enabled, note bodies (and titles) are embedded into dense vectors
+    # stored in the index and searched exactly, enabling hybrid (BM25 +
+    # semantic) retrieval. See services/embedding_provider.py.
     embedding_enabled: bool = Field(
         default_factory=lambda: os.getenv("PARAZETTEL_EMBEDDING_ENABLED", "false")
         .strip()
@@ -224,14 +254,11 @@ class ZettelkastenConfig(BaseModel):
         .strip()
         .lower()
     )
-    # Max Kuzu buffer-pool size in bytes (see DEFAULT_KUZU_BUFFER_POOL_BYTES).
-    # PARAZETTEL_KUZU_BUFFER_POOL_BYTES overrides it (0 = Kuzu's ~80%-RAM default).
-    kuzu_buffer_pool_bytes: int = Field(
-        default=int(
-            os.getenv(
-                "PARAZETTEL_KUZU_BUFFER_POOL_BYTES",
-                str(DEFAULT_KUZU_BUFFER_POOL_BYTES),
-            )
+    # Minimum BM25 score for a lexical dedup-on-create candidate (see
+    # DEFAULT_DEDUP_MIN_BM25). PARAZETTEL_DEDUP_MIN_BM25 overrides it.
+    dedup_min_bm25: float = Field(
+        default_factory=lambda: float(
+            os.getenv("PARAZETTEL_DEDUP_MIN_BM25", str(DEFAULT_DEDUP_MIN_BM25))
         )
     )
     # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
@@ -279,15 +306,29 @@ class ZettelkastenConfig(BaseModel):
             return path
         return self.base_dir / path
 
-    def get_graph_db_path(self) -> Path:
-        """Get the absolute path for the Kuzu graph database file.
+    def get_index_db_path(self) -> Path:
+        """Get the absolute path of the SQLite index database.
 
-        The parent directory is created if it does not exist.  The path itself
-        must *not* be pre-created; Kuzu manages its own file structure.
+        ``index_db_path`` wins when set. Otherwise the location is derived from
+        the legacy ``graph_db_path``: a Kuzu path (``*.kuzu``) maps to a sibling
+        ``index.sqlite3`` — never the Kuzu file itself — and any other path is
+        used as-is. The parent directory is created if it does not exist.
         """
-        graph_db_path = self.get_absolute_path(self.graph_db_path)
-        graph_db_path.parent.mkdir(parents=True, exist_ok=True)
-        return graph_db_path
+        if self.index_db_path is not None:
+            path = self.get_absolute_path(self.index_db_path)
+        else:
+            legacy = self.get_absolute_path(self.graph_db_path)
+            path = (
+                legacy.with_name(DEFAULT_INDEX_DB_NAME)
+                if legacy.suffix == ".kuzu"
+                else legacy
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_graph_db_path(self) -> Path:
+        """Deprecated alias of :meth:`get_index_db_path`."""
+        return self.get_index_db_path()
 
     def get_db_url(self) -> str:
         """Get the legacy SQLite database URL (used by migration tooling only)."""
@@ -318,7 +359,7 @@ class ZettelkastenConfig(BaseModel):
 
         Deliberately uses ``sys.executable`` (python.exe), not pythonw.exe: this
         command is meant for a human to run manually, where seeing startup logs
-        and errors (e.g. a Kuzu lock conflict) matters.
+        and errors (e.g. a missing embedding model) matters.
         """
         parts = [
             sys.executable,
@@ -327,8 +368,8 @@ class ZettelkastenConfig(BaseModel):
             "--run-daemon",
             "--notes-dir",
             str(self.get_absolute_path(self.notes_dir)),
-            "--graph-db-path",
-            str(self.get_absolute_path(self.graph_db_path)),
+            "--index-db-path",
+            str(self.get_index_db_path()),
             "--daemon-host",
             self.daemon_host,
             "--daemon-port",

@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Dict, Iterator, Optional
 
 from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
-from parazettel_mcp.daemon.client import DaemonRpcClient, DaemonUnavailableError
+from parazettel_mcp.daemon.client import (
+    DaemonRpcClient,
+    DaemonUnavailableError,
+    set_daemon_recovery_hook,
+)
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
+from parazettel_mcp.storage.file_lock import file_lock
 from parazettel_mcp.utils import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -35,8 +40,17 @@ def parse_args():
         default=os.environ.get("PARAZETTEL_NOTES_DIR"),
     )
     parser.add_argument(
+        "--index-db-path",
+        help="SQLite index database file path",
+        type=str,
+        default=os.environ.get("PARAZETTEL_INDEX_DB_PATH"),
+    )
+    parser.add_argument(
         "--graph-db-path",
-        help="Kuzu graph database file path",
+        help=(
+            "Deprecated: the pre-SQLite Kuzu database path. Without --index-db-path, "
+            "a *.kuzu value places the index at a sibling index.sqlite3."
+        ),
         type=str,
         default=os.environ.get("PARAZETTEL_GRAPH_DB_PATH"),
     )
@@ -116,6 +130,8 @@ def update_config(args):
     """Update the global config with command line arguments."""
     if args.notes_dir:
         config.notes_dir = Path(args.notes_dir)
+    if getattr(args, "index_db_path", None):
+        config.index_db_path = Path(args.index_db_path)
     if args.graph_db_path:
         config.graph_db_path = Path(args.graph_db_path)
     elif getattr(args, "database_path", None):
@@ -271,7 +287,7 @@ def _get_windows_background_python() -> str:
 def _build_daemon_command(args: argparse.Namespace) -> list[str]:
     """Build the detached daemon launch command matching the current config."""
     absolute_notes_dir = config.get_absolute_path(config.notes_dir)
-    absolute_graph_db_path = config.get_graph_db_path()
+    absolute_index_db_path = config.get_index_db_path()
     command = [
         _get_windows_background_python() if os.name == "nt" else sys.executable,
         "-m",
@@ -279,8 +295,8 @@ def _build_daemon_command(args: argparse.Namespace) -> list[str]:
         "--run-daemon",
         "--notes-dir",
         str(absolute_notes_dir),
-        "--graph-db-path",
-        str(absolute_graph_db_path),
+        "--index-db-path",
+        str(absolute_index_db_path),
         "--log-level",
         args.log_level,
         "--daemon-host",
@@ -373,57 +389,17 @@ def _daemon_start_lock() -> Iterator[None]:
 
     Without it, two MCP clients starting simultaneously can both see an
     unhealthy daemon and both spawn one; the loser of the port race dies to
-    DEVNULL and the second client may fall back to read-only mode. Best-effort:
-    if the lock cannot be acquired within the timeout (or the platform refuses
-    file locking), the start proceeds unlocked rather than deadlocking.
+    DEVNULL. Best-effort: if the lock cannot be acquired within the timeout (or
+    the platform refuses file locking), the start proceeds unlocked rather than
+    deadlocking.
     """
-    lock_path = config.get_daemon_runtime_dir() / "daemon-start.lock"
-    try:
-        handle = open(lock_path, "a+b")
-    except OSError:
+    with file_lock(
+        config.get_daemon_runtime_dir() / "daemon-start.lock",
+        timeout=_DAEMON_START_LOCK_TIMEOUT_SECONDS,
+        poll_interval=_DAEMON_START_LOCK_POLL_SECONDS,
+        best_effort=True,
+    ):
         yield
-        return
-
-    locked = False
-    deadline = time.time() + _DAEMON_START_LOCK_TIMEOUT_SECONDS
-    try:
-        if os.name == "nt":
-            import msvcrt
-
-            while time.time() < deadline:
-                try:
-                    # Non-blocking probe; retry until the holder releases it.
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    locked = True
-                    break
-                except OSError:
-                    time.sleep(_DAEMON_START_LOCK_POLL_SECONDS)
-        else:
-            import fcntl
-
-            while time.time() < deadline:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    locked = True
-                    break
-                except OSError:
-                    time.sleep(_DAEMON_START_LOCK_POLL_SECONDS)
-        yield
-    finally:
-        try:
-            if locked:
-                if os.name == "nt":
-                    import msvcrt
-
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError:
-            pass
-        handle.close()
 
 
 def ensure_daemon_running(args: argparse.Namespace) -> None:
@@ -628,8 +604,12 @@ def main():
     # Ensure directories exist
     notes_dir = config.get_absolute_path(config.notes_dir)
     notes_dir.mkdir(parents=True, exist_ok=True)
-    graph_db_path = config.get_graph_db_path()
-    logger.info(f"Using Kuzu graph database: {graph_db_path}")
+    logger.info(f"Using SQLite index database: {config.get_index_db_path()}")
+    if os.environ.get("PARAZETTEL_KUZU_BUFFER_POOL_BYTES"):
+        logger.warning(
+            "PARAZETTEL_KUZU_BUFFER_POOL_BYTES is set but no longer used (the "
+            "index is SQLite now); remove it from your environment."
+        )
 
     # Create and run the daemon or MCP facade
     daemon = None
@@ -668,6 +648,11 @@ def main():
         else:
             if config.backend_mode == "daemon":
                 ensure_daemon_running(args)
+                # If the daemon later dies (reboot, kill, crash), let an RPC
+                # auto-restart it and retry instead of failing. Bound to this
+                # facade's args; reuses the health-check-then-spawn path, so it
+                # detects an already-running daemon first and never double-spawns.
+                set_daemon_recovery_hook(lambda: ensure_daemon_running(args))
             logger.info("Starting Zettelkasten MCP server")
             # Self-terminate if the Claude session that spawned this facade dies,
             # so it never lingers as an orphan (the restart-script reap is the

@@ -6,9 +6,10 @@
 # latest code (and new graph columns are added idempotently on open), so this is
 # the right way to apply code changes to a running daemon.
 #
-# Embedding settings default to this vault's GPU config; any PARAZETTEL_* /
-# FASTEMBED_* value already exported takes precedence. Edit the defaults below if
-# your vault uses a different model/device.
+# Embedding settings default to this vault's GPU config, except the device:
+# macOS has no CUDA, so it defaults to CPU there and to cuda on GPU hosts. Any
+# PARAZETTEL_* / FASTEMBED_* value already exported takes precedence. Edit the
+# defaults below if your vault uses a different model/device.
 #
 # Usage: bash scripts/restart_daemon.sh
 set -euo pipefail
@@ -24,7 +25,11 @@ if [ -z "$py" ]; then
 fi
 
 : "${PARAZETTEL_NOTES_DIR:=$repo/data/notes}"
-: "${PARAZETTEL_GRAPH_DB_PATH:=$repo/data/db/graph.kuzu}"
+# Only default the index path when no legacy graph path is set: an explicit
+# PARAZETTEL_INDEX_DB_PATH outranks it and would bypass the legacy mapping.
+if [ -z "${PARAZETTEL_GRAPH_DB_PATH:-}" ]; then
+  : "${PARAZETTEL_INDEX_DB_PATH:=$repo/data/db/index.sqlite3}"
+fi
 : "${PARAZETTEL_BACKEND_MODE:=daemon}"
 : "${PARAZETTEL_DAEMON_HOST:=127.0.0.1}"
 : "${PARAZETTEL_DAEMON_PORT:=8766}"
@@ -33,9 +38,17 @@ fi
 : "${PARAZETTEL_EMBEDDING_MODEL:=mixedbread-ai/mxbai-embed-large-v1}"
 : "${PARAZETTEL_EMBEDDING_DIM:=1024}"
 : "${PARAZETTEL_EMBEDDING_METRIC:=cosine}"
-: "${PARAZETTEL_EMBEDDING_DEVICE:=cuda}"
+# macOS has no CUDA: default the device to CPU there, cuda on GPU hosts. An
+# explicit PARAZETTEL_EMBEDDING_DEVICE in the environment still wins.
+if [ -z "${PARAZETTEL_EMBEDDING_DEVICE:-}" ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    PARAZETTEL_EMBEDDING_DEVICE=cpu
+  else
+    PARAZETTEL_EMBEDDING_DEVICE=cuda
+  fi
+fi
 : "${FASTEMBED_CACHE_PATH:=$repo/data/fastembed_cache}"
-export PARAZETTEL_NOTES_DIR PARAZETTEL_GRAPH_DB_PATH PARAZETTEL_BACKEND_MODE \
+export PARAZETTEL_NOTES_DIR PARAZETTEL_INDEX_DB_PATH PARAZETTEL_BACKEND_MODE \
   PARAZETTEL_DAEMON_HOST PARAZETTEL_DAEMON_PORT PARAZETTEL_EMBEDDING_ENABLED \
   PARAZETTEL_EMBEDDING_PROVIDER PARAZETTEL_EMBEDDING_MODEL PARAZETTEL_EMBEDDING_DIM \
   PARAZETTEL_EMBEDDING_METRIC PARAZETTEL_EMBEDDING_DEVICE FASTEMBED_CACHE_PATH

@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib import error, request
 
 from parazettel_mcp.daemon.codec import decode_value, encode_value
-from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.services.reranker import RerankerError, RerankerLoadTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,21 @@ ERROR_REGISTRY = {
 }
 
 
+# Process-wide daemon auto-recovery hook. A facade installs this (bound to its
+# launch args) via set_daemon_recovery_hook so an RPC that finds the daemon down
+# can (re)start it and retry, instead of surfacing a hard failure. Kept as a
+# module hook rather than importing main.ensure_daemon_running so this low-level
+# client never depends on the facade entry point. ``None`` => no auto-recovery
+# (``call`` fails as before — e.g. in tests, or when no facade installed one).
+_recovery_hook: Optional[Callable[[], None]] = None
+
+
+def set_daemon_recovery_hook(hook: Optional[Callable[[], None]]) -> None:
+    """Install (or clear with ``None``) the daemon auto-recovery hook used by call()."""
+    global _recovery_hook
+    _recovery_hook = hook
+
+
 class DaemonRpcClient:
     """Simple JSON-over-HTTP client for the local Parazettel daemon."""
 
@@ -94,16 +109,32 @@ class DaemonRpcClient:
         args: Optional[list[Any]] = None,
         kwargs: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        """Invoke a daemon service method and decode the structured result."""
+        """Invoke a daemon service method and decode the structured result.
+
+        If the daemon is down and a recovery hook is installed (a facade installs
+        one bound to its launch args), (re)start the daemon and retry the call
+        once before giving up — so a call that races a daemon restart or reboot
+        recovers transparently instead of failing. Like ``_request_json``'s own
+        restart, this only replays when the connection was refused: after a
+        timeout or reset the daemon may already have executed a write.
+        """
         payload = {
             "args": encode_value(args or []),
             "kwargs": encode_value(kwargs or {}),
         }
-        response = self._request_json(
-            "POST",
-            f"/rpc/{service}/{method}",
-            payload=payload,
-        )
+        path = f"/rpc/{service}/{method}"
+        try:
+            response = self._request_json("POST", path, payload=payload)
+        except DaemonUnavailableError as exc:
+            if _recovery_hook is None or not _request_never_reached_daemon(
+                exc.__cause__
+            ):
+                raise
+            # The hook health-checks before spawning, so an already-running
+            # daemon is detected and never double-spawned; it blocks until the
+            # daemon is ready, or raises if it cannot be started.
+            _recovery_hook()
+            response = self._request_json("POST", path, payload=payload)
         return decode_value(response["result"])
 
     def _request_json(

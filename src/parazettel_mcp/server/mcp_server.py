@@ -16,7 +16,7 @@ from parazettel_mcp.daemon.client import (
     DaemonUnavailableError,
     RemoteServiceProxy,
 )
-from parazettel_mcp.models.graph_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import (
     LinkType,
     Note,
@@ -44,10 +44,9 @@ _DEDUP_NOTE_TYPES = frozenset(
         NoteType.HUB,
     }
 )
-# A candidate must clear this BM25 relevance score to count as a likely
-# duplicate. Tuned to flag clear title/content overlap without crying wolf on
+# A lexical candidate must clear config.dedup_min_bm25 (BM25 relevance) to count
+# as a likely duplicate: flags clear title/content overlap without crying wolf on
 # every loosely-related note; callers can always bypass with check_duplicates.
-_DEDUP_MIN_SCORE = 1.5
 _DEDUP_MAX_CANDIDATES = 5
 
 # Cosine-similarity bands for the verdict line appended to semantic results.
@@ -305,8 +304,9 @@ class ZettelkastenMcpServer:
         if status == "started":
             return (
                 f"Index rebuild started in the background ({note_count_before} notes).\n"
-                "It runs safely (the new index is built into a temporary database and "
-                "swapped in atomically), and typically takes a few minutes on a large "
+                "It runs safely (the current index is backed up when non-empty, then "
+                "refilled in a single transaction that rolls back on failure), and "
+                "typically takes a few minutes on a large "
                 "vault. While it runs, other parazettel calls report "
                 "'busy rebuilding the search index'.\n"
                 "Check progress and the final result with pzk_rebuild_status."
@@ -398,7 +398,7 @@ class ZettelkastenMcpServer:
         candidates: List[Tuple[Note, float]] = []
         for result in results:
             score = result.score
-            if not isinstance(score, (int, float)) or score < _DEDUP_MIN_SCORE:
+            if not isinstance(score, (int, float)) or score < config.dedup_min_bm25:
                 continue
             # Only knowledge notes are duplicate candidates — an unrelated task,
             # project, or area match must never block creating a knowledge note.
@@ -686,7 +686,7 @@ class ZettelkastenMcpServer:
         for result in results:
             if isinstance(result.score, (int, float)):
                 top = max(top, float(result.score))
-        if top >= _DEDUP_MIN_SCORE:
+        if top >= config.dedup_min_bm25:
             return (
                 "Verdict: strong lexical match present (top BM25 "
                 f"{top:.2f}) — review the top results before creating "
@@ -1889,7 +1889,7 @@ class ZettelkastenMcpServer:
                 backup_message = (
                     f"Backup created: {backup_path}\n"
                     if backup_path
-                    else "Backup created: none (database file did not exist)\n"
+                    else "Backup created: none (the index was empty)\n"
                 )
 
                 # Surface any markdown files that failed to parse so a shrinking

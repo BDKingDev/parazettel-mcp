@@ -20,8 +20,9 @@ The result is one unified vault where knowledge notes and action items share the
 - Link notes with typed semantic relationships and inverse-link handling
 - Tag notes for categorical organisation
 - Search notes by content, tags, type, status, project, area, and more
-- Dual storage: Markdown files (source of truth) + Kuzu graph index (fast queries and traversals)
-- Graph-backed search, link traversal, and PARA/GTD routing queries
+- Dual storage: Markdown files (source of truth) + SQLite index (fast queries and traversals)
+- Indexed full-text search (SQLite FTS5 / BM25), link traversal, and PARA/GTD routing queries
+- Safe multi-session writes: every MCP process can read and write; a cross-process write lock serializes edits
 - Knowledge notes must be routed to an `area_id` directly or inherit one from `project_id`
 - Tasks with status lifecycle, priorities, energy levels, GTD contexts, and due dates
 - Projects linked to areas with optional subprojects via the PARA hierarchy
@@ -34,7 +35,7 @@ The result is one unified vault where knowledge notes and action items share the
 - Link creation times persist in markdown (HTML comment) and survive index rebuilds
 - Tags normalized on write (lowercase-hyphenated, `@` GTD prefix preserved) to prevent vocabulary sprawl
 - Note provenance (`origin`) and verification (`last_verified`) fields
-- Retrieval signals (hit count, last retrieved) tracked graph-side and carried across rebuilds
+- Retrieval signals (hit count, last retrieved) tracked index-side and carried across rebuilds
 - AI-caller ergonomics: server-level usage instructions, one-call session briefing, batch ingestion, neighborhood maps, tension surfacing, calibrated result verdicts
 
 ---
@@ -128,7 +129,7 @@ All tools are prefixed `pzk_`.
 | `pzk_find_central_notes` | Find most-connected notes |
 | `pzk_find_orphaned_notes` | Find notes with no connections |
 | `pzk_list_notes_by_date` | List notes by creation or update date |
-| `pzk_rebuild_index` | Rebuild the Kuzu graph index from Markdown files |
+| `pzk_rebuild_index` | Rebuild the SQLite index from Markdown files |
 | `pzk_check_consistency` | Read-only audit of file-vs-index drift + dangling wiki references |
 
 ### AI-memory ergonomics
@@ -170,13 +171,16 @@ All tools are prefixed `pzk_`.
 ## Storage Architecture
 
 1. **Markdown files** — source of truth. Human-readable, version-controllable, directly editable. Each note is `{id}.md` with YAML frontmatter.
-2. **Kuzu graph database** — indexing and traversal layer. Used for search, link traversal, and PARA/GTD routing queries. Automatically rebuilt from files when needed via `pzk_rebuild_index`.
+2. **SQLite index** — indexing and traversal layer (stdlib `sqlite3`, WAL mode) at `PARAZETTEL_INDEX_DB_PATH` (default `data/db/index.sqlite3`). Used for search, link traversal, and PARA/GTD routing queries. Derived data only: it is rebuilt from the files via `pzk_rebuild_index`.
+   - **Full-text search** uses SQLite FTS5 with porter stemming and the same English stopword list the Kuzu index used. BM25 scores are higher-is-better. Digits are searchable, and query text is quoted so it can never inject FTS syntax.
+   - **Vectors** (when embeddings are enabled) are stored as float32 BLOBs and searched exactly (brute-force cosine/l2/dotproduct via numpy) — no approximate index. See [`docs/embeddings.md`](docs/embeddings.md).
+   - **Concurrency:** every MCP process (each Claude session) can read *and* write. A cross-process write lock (`<index>.write.lock`) serializes writes, so concurrent sessions can't lose each other's markdown edits. The daemon is not required for correctness; it keeps the embedding model and reranker warm.
 
-> **Rebuild safety:** `pzk_rebuild_index` creates a timestamped file snapshot backup of the graph database, then builds a fresh index into a temporary database and atomically swaps it into place (the live index is never cleared in place). Files that fail to parse are logged, and in direct (in-process) mode also surfaced in the tool's returned message; in daemon-backed mode they appear only in the daemon log. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
+> **Rebuild safety:** `pzk_rebuild_index` first snapshots the index to a timestamped `<index>.<timestamp>.bak` via SQLite's online backup API (the newest `PARAZETTEL_INDEX_BACKUP_KEEP` backups are kept, default 5), then refills it from the files inside a single write transaction — readers in any process keep seeing the previous index until it commits, and a failure rolls back to it untouched. Stored vectors are reused when the model and the embedded text are unchanged, so rebuilds after the first are fast. Files that fail to parse are logged, and in direct (in-process) mode also surfaced in the tool's returned message; in daemon-backed mode they appear only in the daemon log. While rebuild is running, the daemon reports maintenance mode and other RPC calls are rejected until it completes.
 >
 > **Obsidian aliases:** piped wiki links like `[[20260322T181907454570000|Habits and Habit Creation]]` are normalized to the underlying note ID during reads and index rebuilds.
 
-> **Compatibility:** `PARAZETTEL_DATABASE_PATH` and `--database-path` are still accepted for migration and legacy launchers, but the primary runtime path is `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`.
+> **Compatibility:** the primary runtime path is `PARAZETTEL_INDEX_DB_PATH` / `--index-db-path`. The old `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path` are deprecated but still honoured: when no index path is set, a `*.kuzu` value places the index at a sibling `index.sqlite3` (never the Kuzu file itself) and any other value is used as-is, so existing configs keep working. `PARAZETTEL_DATABASE_PATH` and `--database-path` are still accepted for legacy launchers.
 
 ---
 
@@ -193,7 +197,7 @@ uv sync --extra dev
 
 ### Connecting to Claude Desktop
 
-For a single chat or development-only direct run, add this to your Claude Desktop MCP configuration:
+For a direct (in-process) run, add this to your Claude Desktop MCP configuration:
 
 ```json
 {
@@ -203,7 +207,7 @@ For a single chat or development-only direct run, add this to your Claude Deskto
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/parazettel-mcp/data/notes",
-        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/graph.kuzu",
+        "PARAZETTEL_INDEX_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/index.sqlite3",
         "PARAZETTEL_LOG_LEVEL": "INFO"
       }
     }
@@ -211,7 +215,7 @@ For a single chat or development-only direct run, add this to your Claude Deskto
 }
 ```
 
-For multi-chat use, Parazettel can run one shared local daemon and point stdio MCP launches at that daemon. In normal daemon mode, the MCP facade now auto-starts the daemon if it is missing, so manual startup is optional.
+Parazettel can also run one shared local daemon and point stdio MCP launches at that daemon, so the embedding model and reranker stay warm across chats. (Direct mode is equally safe for multiple chats — writes are serialized by a cross-process lock.) In normal daemon mode, the MCP facade now auto-starts the daemon if it is missing, so manual startup is optional.
 
 ```bash
 python -m parazettel_mcp.main \
@@ -230,7 +234,7 @@ Then configure the MCP entry to proxy through it:
       "args": ["-m", "parazettel_mcp.main"],
       "env": {
         "PARAZETTEL_NOTES_DIR": "/absolute/path/to/parazettel-mcp/data/notes",
-        "PARAZETTEL_GRAPH_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/graph.kuzu",
+        "PARAZETTEL_INDEX_DB_PATH": "/absolute/path/to/parazettel-mcp/data/db/index.sqlite3",
         "PARAZETTEL_BACKEND_MODE": "daemon",
         "PARAZETTEL_DAEMON_HOST": "127.0.0.1",
         "PARAZETTEL_DAEMON_PORT": "8766",
@@ -261,8 +265,8 @@ An idle timeout is the safest approximation to “close the daemon once all sess
 
 The package is installed editable, so a running daemon keeps executing whatever
 code it started with. **To apply code changes, restart the daemon** — its new
-process picks up the latest code, and new graph columns are added idempotently
-on open (no migration). A restart must preserve the embedding environment, or
+process picks up the latest code. The index schema is versioned; on a mismatch
+the derived tables are recreated and rebuild from the markdown files. A restart must preserve the embedding environment, or
 the new daemon will come up without semantic search.
 
 One-shot restart scripts handle the stop → detached-start → health-check, with
@@ -289,7 +293,7 @@ missing), then stop, detach-start, and check:
 ```bash
 # Embedding env (adjust model/dim/device to your vault):
 export PARAZETTEL_NOTES_DIR="$PWD/data/notes"
-export PARAZETTEL_GRAPH_DB_PATH="$PWD/data/db/graph.kuzu"
+export PARAZETTEL_INDEX_DB_PATH="$PWD/data/db/index.sqlite3"
 export PARAZETTEL_BACKEND_MODE=daemon
 export PARAZETTEL_EMBEDDING_ENABLED=true
 export PARAZETTEL_EMBEDDING_PROVIDER=fastembed
@@ -316,21 +320,27 @@ Add the same entry to `~/.claude.json` under `mcpServers`.
 
 ## Configuration
 
-Copy `.env.example` to `.env` and set paths as needed. The primary runtime storage path is `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`. Caller or current-working-directory `.env` values are loaded first, and the repo-root `.env` fills in any missing values.
+Copy `.env.example` to `.env` and set paths as needed. The primary runtime storage path is `PARAZETTEL_INDEX_DB_PATH` / `--index-db-path`. Caller or current-working-directory `.env` values are loaded first, and the repo-root `.env` fills in any missing values.
 
 Key runtime settings:
 
-- `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`: primary Kuzu graph path
+- `PARAZETTEL_INDEX_DB_PATH` / `--index-db-path`: SQLite index path (default `data/db/index.sqlite3`)
+- `PARAZETTEL_GRAPH_DB_PATH` / `--graph-db-path`: **deprecated** — without an index path, a `*.kuzu` value places the index at a sibling `index.sqlite3`
+- `PARAZETTEL_INDEX_BACKUP_KEEP`: number of timestamped pre-rebuild index backups to keep (default 5)
+- `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS`: how long a connection waits on a locked index before giving up (default 10000)
+- `PARAZETTEL_DEDUP_MIN_BM25`: minimum BM25 score for a lexical dedup-on-create candidate (default 1.5)
 - `PARAZETTEL_BACKEND_MODE` / `--backend-mode`: `direct` or `daemon`
 - `PARAZETTEL_DAEMON_HOST` / `--daemon-host`: local daemon bind/connect host
 - `PARAZETTEL_DAEMON_PORT` / `--daemon-port`: local daemon bind/connect port
 - `--daemon-idle-timeout`: daemon idle-shutdown window in seconds (default 3600; `0` keeps it always-on). Set in code, not via env var.
 - `PARAZETTEL_MCP_TRANSPORT` / `--transport`: MCP transport, `stdio` or `sse`
 
+`PARAZETTEL_KUZU_BUFFER_POOL_BYTES` has been removed; it is ignored with a warning.
+
 ```bash
 python -m parazettel_mcp.main \
   --notes-dir ./data/notes \
-  --graph-db-path ./data/db/graph.kuzu \
+  --index-db-path ./data/db/index.sqlite3 \
   --backend-mode direct
 ```
 
@@ -340,7 +350,7 @@ To run the shared daemon manually:
 python -m parazettel_mcp.main \
   --run-daemon \
   --notes-dir ./data/notes \
-  --graph-db-path ./data/db/graph.kuzu \
+  --index-db-path ./data/db/index.sqlite3 \
   --daemon-host 127.0.0.1 \
   --daemon-port 8766
 ```
@@ -354,7 +364,7 @@ python -m parazettel_mcp.main \
   --daemon-port 8766
 ```
 
-Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path for compatibility.
+Legacy launchers can still pass `PARAZETTEL_DATABASE_PATH` or `--database-path`. If a legacy `.db` path is supplied, Parazettel maps it to a sibling `graph.kuzu` path, which in turn places the index at a sibling `index.sqlite3`.
 
 In daemon mode, stdio MCP launches will first try the daemon health endpoint. If the daemon is not already running, Parazettel auto-starts it in the background and then connects to it. Manual daemon startup is still available when you want explicit process control.
 
@@ -365,15 +375,11 @@ python -m parazettel_mcp.main --daemon-status
 python -m parazettel_mcp.main --stop-daemon
 ```
 
-If you are migrating an existing vault from SQLite to Kuzu, use:
+### Migrating from the Kuzu graph index
 
-```bash
-python scripts/migrate_to_graphdb.py \
-  --notes-dir ./data/notes \
-  --graph-db-path ./data/db/graph.kuzu
-```
+Earlier releases indexed into a Kuzu graph database (`graph.kuzu`). Kuzu was archived upstream in October 2025, so the index is now SQLite. The markdown notes are unaffected. The one-time migration script (`scripts/migrate_kuzu_to_sqlite.py`) has been retired. If you still have a Kuzu vault to convert, see [INSTALL.md, Step 7](INSTALL.md) to recover it from history (it needs the `kuzu` package).
 
-Rerunning the migration against an existing target updates current notes and links, but it does not prune stale graph nodes for source files that were deleted later. For a clean one-shot migration, use a fresh target path.
+To compare search quality across backends, `scripts/search_eval.py` provides a `generate` / `run` / `compare` harness: build a fixed query set from a frozen notes copy, capture each backend's results, and diff a candidate run against a baseline.
 
 ---
 
@@ -381,16 +387,12 @@ Rerunning the migration against an existing target updates current notes and lin
 
 ```bash
 uv sync --extra dev
-.venv/bin/python -m pytest tests/ -n 4 --dist loadgroup
+.venv/bin/python -m pytest tests/ -n 4
 ```
 
-`-n 4 --dist loadgroup` runs the suite in parallel (~2 min vs ~5.5 min serial).
-Tests that perform a real index rebuild are automatically collected into one
-xdist group (see `tests/conftest.py`) so no two rebuilds run concurrently —
-concurrent rebuilds are the suite's known flake source. Each test gets a
-private graph database seeded by file-copying a once-per-session template, so
-isolation is preserved without paying full schema + FTS-index creation per
-test.
+`-n 4` runs the suite in parallel (~10s). Each test gets its own private
+temporary SQLite index, so rebuild tests no longer need to be serialized and
+`--dist loadgroup` is no longer required.
 
 See [`docs/mcp-testing-guide.md`](docs/mcp-testing-guide.md) for a full tool-by-tool testing walkthrough using the live MCP server.
 

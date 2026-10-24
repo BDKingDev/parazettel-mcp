@@ -1,12 +1,20 @@
 """Tests for reducing a long FTS query to its most discriminative terms.
 
-A long query with many moderately-common terms makes Kuzu's FTS match a large
-fraction of the corpus and drop even the best match. Keeping only the lowest-DF
-(highest-IDF) terms bounds the match set so the best lexical hit stays findable.
+A long query with many moderately-common terms matches a large fraction of the
+corpus. Keeping only the lowest-DF (highest-IDF) terms bounds the match set so
+the best lexical hit stays findable. The reduction is off by default (FTS5 needs
+it far less than Kuzu did), so these tests switch it on explicitly.
 """
+
+import pytest
 
 from parazettel_mcp.config import config
 from parazettel_mcp.models.schema import Note, NoteType
+
+
+@pytest.fixture(autouse=True)
+def _enable_focus(monkeypatch):
+    monkeypatch.setattr(config, "fts_max_query_terms", 12)
 
 # Eight terms that will appear in most notes (high DF); six that appear in only
 # the single distinctive note (DF 1 -> always kept by the focus reduction).

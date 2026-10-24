@@ -1,6 +1,5 @@
 """Common test fixtures for the Zettelkasten MCP server."""
 
-import inspect
 import shutil
 from pathlib import Path
 from uuid import uuid4
@@ -8,35 +7,8 @@ from uuid import uuid4
 import pytest
 
 from parazettel_mcp.config import config
-from parazettel_mcp.models import graph_db
 from parazettel_mcp.services.zettel_service import ZettelService
 from parazettel_mcp.storage.note_repository import NoteRepository
-
-# Tests that perform a REAL index rebuild are serialized into one xdist group:
-# each rebuild opens two Kuzu databases (live + fresh temp) plus file-copy
-# backups, and concurrent rebuilds across workers are the suite's known flake
-# source under high parallelism. Run the suite with:
-#
-#     pytest -n 4 --dist loadgroup
-#
-# The marker is applied automatically below — any test whose source mentions
-# a rebuild joins the group, so new rebuild tests don't need a decorator.
-_REBUILD_GROUP = "kuzu_rebuild"
-
-
-def pytest_collection_modifyitems(config, items):  # noqa: ARG001
-    """Auto-assign rebuild-touching tests to one xdist group so no two real
-    Kuzu rebuilds run concurrently (the suite's known parallel-flake source)."""
-    for item in items:
-        func = getattr(item, "function", None)
-        if func is None:
-            continue
-        try:
-            source = inspect.getsource(func)
-        except (OSError, TypeError):
-            source = ""
-        if "rebuild" in source or "rebuild" in item.name:
-            item.add_marker(pytest.mark.xdist_group(_REBUILD_GROUP))
 
 
 @pytest.fixture(autouse=True)
@@ -55,109 +27,55 @@ def _disable_dedup_reranker():
 
 @pytest.fixture
 def temp_dirs():
-    """Create workspace-local directories for notes and graph database."""
+    """Create workspace-local directories for notes and the index database."""
     test_root = (
         Path(__file__).resolve().parents[1] / ".tmp" / "test-fixtures" / uuid4().hex
     )
     notes_dir = test_root / "notes"
-    graph_db_dir = test_root / "db"
+    db_dir = test_root / "db"
     notes_dir.mkdir(parents=True, exist_ok=True)
-    graph_db_dir.mkdir(parents=True, exist_ok=True)
+    db_dir.mkdir(parents=True, exist_ok=True)
     try:
-        yield notes_dir, graph_db_dir
+        yield notes_dir, db_dir
     finally:
         shutil.rmtree(test_root, ignore_errors=True)
 
 
-@pytest.fixture(scope="session")
-def graph_db_template():
-    """Build ONE initialized empty graph DB per test session (the 'beforeAll').
-
-    Creating a fresh Kuzu database costs ~0.8s, almost all of it spent building
-    the three full-text indexes — and the suite was paying that per test.
-    Opening a file copy of an already-initialized database costs ~0.1s, so each
-    test gets a private copy of this template instead: identical isolation,
-    ~8x cheaper setup. Under pytest-xdist each worker process builds its own
-    template (session scope is per worker).
-    """
-    template_root = (
-        Path(__file__).resolve().parents[1]
-        / ".tmp"
-        / "test-fixtures"
-        / f"_template-{uuid4().hex}"
-    )
-    template_root.mkdir(parents=True, exist_ok=True)
-    template_path = template_root / "template.kuzu"
-    original_default = graph_db._DEFAULT_BUFFER_POOL_SIZE
-    graph_db._DEFAULT_BUFFER_POOL_SIZE = 128 * 1024 * 1024
-    try:
-        graph_db.init_graph_db(template_path)
-        graph_db.force_close_graph_db(template_path)
-    finally:
-        graph_db._DEFAULT_BUFFER_POOL_SIZE = original_default
-    try:
-        yield template_path
-    finally:
-        shutil.rmtree(template_root, ignore_errors=True)
-
-
 @pytest.fixture
-def test_config(temp_dirs, graph_db_template):
+def test_config(temp_dirs):
     """Configure with test paths.
 
-    The test's graph DB starts as a file copy of the session template (schema
-    and FTS indexes already built), so opening it skips the expensive
-    first-time initialization while every test still gets a private database.
+    Each test gets a private SQLite index; creating one takes milliseconds, so
+    there is no shared template to copy.
     """
-    notes_dir, graph_db_dir = temp_dirs
-    graph_db_path = graph_db_dir / "test_graph.kuzu"
-    # Seed the test DB from the template (main file/dir + Kuzu sidecars like the
-    # .wal). Kuzu may back a DB with either a single file or a directory
-    # depending on version, so copy directories recursively rather than assuming
-    # a file (copy2 would raise IsADirectoryError on a directory-backed DB).
-    template_name = graph_db_template.name
-    for template_file in graph_db_template.parent.glob(f"{template_name}*"):
-        suffix = template_file.name[len(template_name):]
-        dest = graph_db_path.parent / f"{graph_db_path.name}{suffix}"
-        if template_file.is_dir():
-            shutil.copytree(template_file, dest)
-        else:
-            shutil.copy2(template_file, dest)
+    notes_dir, db_dir = temp_dirs
     # Save original config values
     original_notes_dir = config.notes_dir
+    original_index_db_path = config.index_db_path
     original_graph_db_path = config.graph_db_path
     original_backend_mode = config.backend_mode
     original_daemon_host = config.daemon_host
     original_daemon_port = config.daemon_port
-    original_kuzu_buffer = config.kuzu_buffer_pool_bytes
-    original_default_buffer = graph_db._DEFAULT_BUFFER_POOL_SIZE
     # Update config for tests
     config.notes_dir = notes_dir
-    config.graph_db_path = graph_db_path
+    config.index_db_path = db_dir / "test_index.sqlite3"
+    config.graph_db_path = db_dir / "test_graph.kuzu"
     config.backend_mode = "direct"
     config.daemon_host = "127.0.0.1"
     config.daemon_port = 8766
-    # Bound the Kuzu buffer pool so each test's fresh DB stays small — otherwise
-    # Kuzu reserves ~80% of RAM per instance, which makes the suite memory-heavy
-    # and impossible to run in parallel (pytest-xdist) without OOM. Bound both the
-    # config value (threaded into NoteRepository) and the module default (so direct
-    # init_graph_db(path) callers, e.g. test_embedding_schema, stay light too).
-    config.kuzu_buffer_pool_bytes = 128 * 1024 * 1024
-    graph_db._DEFAULT_BUFFER_POOL_SIZE = 128 * 1024 * 1024
     yield config
     # Restore original config
     config.notes_dir = original_notes_dir
+    config.index_db_path = original_index_db_path
     config.graph_db_path = original_graph_db_path
     config.backend_mode = original_backend_mode
     config.daemon_host = original_daemon_host
     config.daemon_port = original_daemon_port
-    config.kuzu_buffer_pool_bytes = original_kuzu_buffer
-    graph_db._DEFAULT_BUFFER_POOL_SIZE = original_default_buffer
 
 
 @pytest.fixture
 def note_repository(test_config):
-    """Create a test note repository backed by a temporary Kuzu graph database."""
+    """Create a test note repository backed by a temporary SQLite index."""
     repository = NoteRepository(notes_dir=test_config.notes_dir)
     yield repository
     repository.close()
