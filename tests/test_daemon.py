@@ -245,6 +245,57 @@ def test_rpc_restart_callback_failure_is_logged(monkeypatch, caplog):
     assert "could not spawn daemon" in caplog.text
 
 
+
+def test_posix_rss_reads_current_resident_set_from_proc_statm(monkeypatch, tmp_path):
+    """Linux: resident pages (statm field 2) x page size, not the ru_maxrss peak."""
+    import parazettel_mcp.daemon.server as server_mod
+
+    statm = tmp_path / "statm"
+    statm.write_text("500000 2560 100 1 0 300 0")  # 2560 resident pages
+    real_path = server_mod.Path
+    monkeypatch.setattr(
+        server_mod, "Path",
+        lambda p: statm if p == "/proc/self/statm" else real_path(p),
+    )
+    monkeypatch.setattr(server_mod.os, "sysconf", lambda name: 4096, raising=False)
+
+    assert server_mod._current_rss_mb_posix() == 2560 * 4096 / 1048576.0  # 10 MB
+
+
+def test_posix_rss_falls_back_to_ps_on_macos_and_caches(monkeypatch, tmp_path):
+    """macOS (no /proc): RSS comes from `ps -o rss=` (KB), cached between polls
+    so the 1 s idle monitor doesn't spawn a process every second."""
+    import subprocess
+    from types import SimpleNamespace
+
+    import parazettel_mcp.daemon.server as server_mod
+
+    real_path = server_mod.Path
+    monkeypatch.setattr(
+        server_mod, "Path",
+        lambda p: tmp_path / "no-proc" if p == "/proc/self/statm" else real_path(p),
+    )
+    monkeypatch.setattr(server_mod, "_ps_rss_cache", {})
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(stdout="  20480 ")  # KB
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Age the cache entry rather than patching time.monotonic: server_mod.time is
+    # the process-wide time module, and freezing it would stall any daemon
+    # threads other fixtures left running in this worker.
+
+    assert server_mod._current_rss_mb_posix() == 20.0
+    assert calls[0][:3] == ["ps", "-o", "rss="]
+    assert server_mod._current_rss_mb_posix() == 20.0  # cached: no new ps spawn
+    assert len(calls) == 1
+    server_mod._ps_rss_cache["at"] -= server_mod._PS_RSS_CACHE_SECONDS + 1  # stale
+    server_mod._current_rss_mb_posix()
+    assert len(calls) == 2
+
+
 def _create_area(client: DaemonRpcClient) -> Note:
     """Create a valid area for routing daemon-created notes."""
     return client.call(

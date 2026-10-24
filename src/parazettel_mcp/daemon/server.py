@@ -94,6 +94,13 @@ def _process_memory_mb() -> "Optional[tuple[float, Optional[float]]]":
         return None
 
 
+# macOS has no /proc, so its RSS comes from spawning ``ps``. The idle monitor
+# polls every second, so cache that reading: idle memory barely moves and the
+# recycle is a slow safety net, so a reading up to this old is fine.
+_PS_RSS_CACHE_SECONDS = 30.0
+_ps_rss_cache: Dict[str, float] = {}
+
+
 def _current_rss_mb_posix() -> Optional[float]:
     """Current (not peak) resident set in MB on Linux/macOS, or None."""
     try:
@@ -101,13 +108,19 @@ def _current_rss_mb_posix() -> Optional[float]:
         if statm.exists():  # Linux: fields are in pages; [1] = resident
             resident_pages = int(statm.read_text().split()[1])
             return resident_pages * os.sysconf("SC_PAGE_SIZE") / 1048576.0
+        now = time.monotonic()
+        if now - _ps_rss_cache.get("at", float("-inf")) < _PS_RSS_CACHE_SECONDS:
+            return _ps_rss_cache["mb"]
         import subprocess
 
-        out = subprocess.run(  # macOS has no /proc; ps reports RSS in KB
+        out = subprocess.run(  # macOS: BSD ps reports RSS in KB
             ["ps", "-o", "rss=", "-p", str(os.getpid())],
             capture_output=True, text=True, timeout=5, check=True,
         ).stdout.strip()
-        return int(out) / 1024.0 if out else None
+        if not out:
+            return None
+        _ps_rss_cache.update(at=now, mb=int(out) / 1024.0)
+        return _ps_rss_cache["mb"]
     except Exception:  # pragma: no cover - diagnostics must never raise
         return None
 
