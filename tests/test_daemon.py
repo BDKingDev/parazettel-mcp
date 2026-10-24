@@ -663,6 +663,15 @@ def test_daemon_client_reports_connection_failures_cleanly():
     assert "--daemon-status" in message
 
 
+def _refused() -> DaemonUnavailableError:
+    """A DaemonUnavailableError caused by a refused connection (safe to replay)."""
+    from urllib import error as urlerror
+
+    err = DaemonUnavailableError("Parazettel daemon is unavailable.")
+    err.__cause__ = urlerror.URLError(ConnectionRefusedError("refused"))
+    return err
+
+
 @pytest.fixture
 def reset_recovery_hook():
     """Clear the process-wide daemon recovery hook before and after each test."""
@@ -681,7 +690,7 @@ def test_daemon_call_auto_recovers_and_retries_once(reset_recovery_hook):
     def fake_request(method, path, *, payload=None):
         counters["request"] += 1
         if counters["request"] == 1:
-            raise DaemonUnavailableError("Parazettel daemon is unavailable.")
+            raise _refused()
         return {"result": encode_value("recovered")}
 
     def fake_recover():
@@ -719,7 +728,7 @@ def test_daemon_call_propagates_when_recovery_cannot_start(reset_recovery_hook):
 
     def fake_request(method, path, *, payload=None):
         counters["request"] += 1
-        raise DaemonUnavailableError("Parazettel daemon is unavailable.")
+        raise _refused()
 
     def failing_recover():
         counters["recover"] += 1
@@ -732,6 +741,30 @@ def test_daemon_call_propagates_when_recovery_cannot_start(reset_recovery_hook):
         client.call("zettel_service", "ping")
     assert counters["recover"] == 1
     assert counters["request"] == 1  # recovery raised before any retry
+
+
+def test_daemon_call_never_replays_after_timeout_via_recovery_hook(reset_recovery_hook):
+    """The facade's recovery hook must not replay an RPC that timed out: the
+    daemon may already have executed it, so a replay could duplicate a write."""
+    client = DaemonRpcClient("http://127.0.0.1:65500", timeout_seconds=0.2)
+    counters = {"request": 0, "recover": 0}
+
+    def fake_request(method, path, *, payload=None):
+        counters["request"] += 1
+        err = DaemonUnavailableError("Parazettel daemon is unavailable.")
+        err.__cause__ = TimeoutError("timed out")
+        raise err
+
+    def fake_recover():
+        counters["recover"] += 1
+
+    client._request_json = fake_request  # type: ignore[assignment]
+    set_daemon_recovery_hook(fake_recover)
+
+    with pytest.raises(DaemonUnavailableError):
+        client.call("zettel_service", "create_note", kwargs={"title": "x"})
+    assert counters["recover"] == 0
+    assert counters["request"] == 1  # never replayed
 
 
 def test_daemon_shutdown_endpoint_stops_server(daemon_server):

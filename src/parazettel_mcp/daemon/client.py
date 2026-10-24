@@ -114,7 +114,9 @@ class DaemonRpcClient:
         If the daemon is down and a recovery hook is installed (a facade installs
         one bound to its launch args), (re)start the daemon and retry the call
         once before giving up — so a call that races a daemon restart or reboot
-        recovers transparently instead of failing.
+        recovers transparently instead of failing. Like ``_request_json``'s own
+        restart, this only replays when the connection was refused: after a
+        timeout or reset the daemon may already have executed a write.
         """
         payload = {
             "args": encode_value(args or []),
@@ -123,8 +125,10 @@ class DaemonRpcClient:
         path = f"/rpc/{service}/{method}"
         try:
             response = self._request_json("POST", path, payload=payload)
-        except DaemonUnavailableError:
-            if _recovery_hook is None:
+        except DaemonUnavailableError as exc:
+            if _recovery_hook is None or not _request_never_reached_daemon(
+                exc.__cause__
+            ):
                 raise
             # The hook health-checks before spawning, so an already-running
             # daemon is detected and never double-spawned; it blocks until the
