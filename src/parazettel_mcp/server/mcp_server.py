@@ -204,10 +204,11 @@ class ZettelkastenMcpServer:
 
     def __init__(self):
         """Initialize the MCP server."""
+        # No ``version=``: older FastMCP releases (e.g. the locked mcp 1.6.0)
+        # silently ignored it and newer 1.x releases reject it.
         self.mcp = FastMCP(
             config.server_name,
             instructions=_SERVER_INSTRUCTIONS,
-            version=config.server_version,
             host=config.server_host,
             port=config.server_port,
         )
