@@ -145,3 +145,50 @@ def test_direct_mode_loads_embedding_model_on_startup_thread(test_config, monkey
     assert provider.threads[0] is threading.main_thread()
     # The tool call itself embedded on a worker thread: why the pre-warm matters.
     assert provider.threads[-1] is not threading.main_thread()
+
+
+class _FailingFirstQueryProvider(_ThreadRecordingProvider):
+    """Fails the startup pre-warm (first query embed), then works."""
+
+    def embed_query(self, text: str) -> list[float]:
+        first = not self.threads
+        result = super().embed_query(text)
+        if first:
+            raise RuntimeError("model download failed")
+        return result
+
+
+def test_direct_mode_survives_failed_embedding_prewarm(
+    test_config, monkeypatch, caplog
+):
+    provider = _FailingFirstQueryProvider()
+    monkeypatch.setattr(
+        "parazettel_mcp.storage.note_repository.build_embedding_provider",
+        lambda _config: provider,
+    )
+    server = ZettelkastenMcpServer()
+    try:
+
+        async def scenario():
+            async with Client(server.mcp) as client:
+                return await client.call_tool(
+                    "pzk_create_area", {"title": "After failed warmup", "content": "x"}
+                )
+
+        result = anyio.run(scenario)
+    finally:
+        server.close()
+
+    assert "Embedding model pre-warm failed" in caplog.text
+    assert "Area created successfully" in _text(result)
+
+
+def test_direct_mode_prewarm_is_a_no_op_without_embeddings(test_config, monkeypatch):
+    built = []
+    monkeypatch.setattr(
+        "parazettel_mcp.storage.note_repository.build_embedding_provider",
+        lambda _config: built.append(True),  # embeddings off: no provider
+    )
+    server = ZettelkastenMcpServer()
+    server.close()
+    assert built and server.zettel_service.repository._embedding_provider is None
