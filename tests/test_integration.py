@@ -288,6 +288,45 @@ class TestIntegration:
             "Write integration tests"
         )
 
+    def test_area_and_project_reads_hide_generated_links(self):
+        """pzk_get_area / pzk_get_project show the curated body, not one ## Links
+        line per member, and say how many links were hidden."""
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Busy area", content="Placeholder.")
+        lane = svc.create_note(title="Lane entry note", content="x", area_id=area.id)
+        for i in range(40):
+            svc.create_note(title=f"Member {i:02d}", content="x", area_id=area.id)
+        project = svc.create_project_note(
+            title="Busy project", content="Project goal.", area_id=area.id
+        )
+        for i in range(25):
+            svc.create_note(
+                title=f"Project note {i:02d}", content="x", project_id=project.id
+            )
+        lane_map = f"Main lanes:\n- **Entry**\n  - [[{lane.id}|Lane entry note]]"
+        svc.update_note(area.id, content=f"# Busy area\n\n{lane_map}")
+        area = svc.get_note(area.id)
+        project = svc.get_note(project.id)
+        assert len(area.links) >= 42 and len(project.links) >= 25
+
+        area_out = self.registered_tools["pzk_get_area"](area_id=area.id)
+        assert lane_map in area_out
+        assert "## Links" not in area_out
+        assert "Member 07" not in area_out
+        assert f"[{len(area.links)} link(s) hidden" in area_out
+        assert "Busy project (ID:" in area_out  # the ## Projects list still follows
+
+        project_out = self.registered_tools["pzk_get_project"](project_id=project.id)
+        assert "Project goal." in project_out
+        assert "## Links" not in project_out
+        assert f"[{len(project.links)} link(s) hidden" in project_out
+        assert "Project note 07 (ID:" in project_out  # from Notes:, not ## Links
+
+        full = self.registered_tools["pzk_get_note"](
+            identifier=area.id, include_links=True
+        )
+        assert "Member 07" in full and len(area_out) < len(full) / 3
+
     def test_rebuild_index_flow(self):
         """Test the rebuild index functionality with direct file modifications."""
         # Create a note through the service

@@ -96,6 +96,23 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
         stripped += "\n"
     return stripped, hidden
 
+
+def _container_body(note_id: str, content: str) -> str:
+    """Area/project body for display, with ``## Links`` hidden as pzk_get_note does.
+
+    A container's ``## Links`` holds one line per member, so for a busy area it
+    is nearly all of the note. These tools have no include_links flag, so the
+    notice points at pzk_get_note for the full section.
+    """
+    body, hidden = _strip_links_section(content)
+    if hidden:
+        body += (
+            f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
+            f"pzk_get_neighborhood, or pzk_get_note('{note_id}', "
+            "include_links=true)]\n"
+        )
+    return body
+
 # Operating manual injected into every MCP client session. This is the one
 # piece of documentation the calling model is guaranteed to see, so the
 # empirically-derived usage rules live here rather than only in the README.
@@ -2501,7 +2518,7 @@ class ZettelkastenMcpServer:
                         )
                 else:
                     out += "- None\n"
-                out += f"\n\n{project.content}\n"
+                out += f"\n\n{_container_body(project.id, project.content)}\n"
                 return out
             except Exception as e:
                 return self.format_error_response(e)
@@ -2672,7 +2689,7 @@ class ZettelkastenMcpServer:
                 if cadence:
                     out += f"Cadence: {cadence}\n"
                 out += f"Projects: {len(projects)}\n"
-                out += f"\n{area.content}\n"
+                out += f"\n{_container_body(area.id, area.content)}\n"
                 if projects:
                     out += "\n## Projects\n"
                     for p in projects:
