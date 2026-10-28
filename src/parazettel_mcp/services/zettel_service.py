@@ -739,8 +739,24 @@ class ZettelService:
                 note = None
             if note and note.note_type == NoteType.PROJECT:
                 for member in self.repository.search(project_id=note_id):
-                    if member.id != note_id:
-                        self._update_note_locked(member.id, project_id=None)
+                    if member.id == note_id:
+                        continue
+                    # Best-effort, like the reference scrub in repository.delete:
+                    # an unreadable member is left byte-for-byte as it is rather
+                    # than blocking the delete. Only the read is guarded, so a
+                    # failed write still aborts.
+                    try:
+                        self.repository.get(member.id)
+                    except IOError as exc:
+                        logger.warning(
+                            "Could not clear project %s from member %s during "
+                            "delete: %s",
+                            note_id,
+                            member.id,
+                            exc,
+                        )
+                        continue
+                    self._update_note_locked(member.id, project_id=None)
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:

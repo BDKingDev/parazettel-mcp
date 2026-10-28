@@ -465,7 +465,9 @@ def test_deleting_project_clears_member_associations_both_layers(para):
     )
     sub_task = service.create_task(title="Sub Task", content="st", project_id=sub.id)
     other = service.create_project_note(title="Other", content="o", area_id=area.id)
-    other_task = service.create_task(title="Other Task", content="ot", project_id=other.id)
+    other_task = service.create_task(
+        title="Other Task", content="ot", project_id=other.id
+    )
 
     service.delete_note(project.id)
 
@@ -492,6 +494,26 @@ def test_deleting_project_clears_member_associations_both_layers(para):
     # The members are editable again through the normal update path.
     assert "edited" in service.update_note(task.id, content="edited").content
     assert "edited" in service.update_note(sub.id, content="edited").content
+
+
+def test_deleting_project_skips_unreadable_member(para, caplog):
+    """A member corrupted after indexing is left untouched and doesn't block the delete."""
+    service, area, project = para
+    good = service.create_task(title="Good", content="g", project_id=project.id)
+    bad = service.create_task(title="Bad", content="b", project_id=project.id)
+    corrupt = "---\ntitle: [unclosed\n---\n"
+    write_md(service, bad.id, corrupt)
+
+    with caplog.at_level("WARNING"):
+        service.delete_note(project.id)
+
+    assert service.get_note(project.id) is None
+    assert service.get_note(good.id).project_id is None
+    assert md_text(service, bad.id) == corrupt
+    assert any(
+        "Could not clear project" in r.getMessage() and bad.id in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
