@@ -1802,7 +1802,9 @@ class NoteRepository(Repository[Note]):
 
         Not cached: the file is the source of truth and can be edited outside
         this process, and no stat signal (mtime, size, inode) proves the bytes
-        unchanged. Re-parsing costs about what a deep copy of a cached Note did.
+        unchanged. The old cache was faster for repeat reads of small notes
+        (about 3x at 1 KB) but slower on a miss, and service writes don't
+        notice the difference.
         """
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
