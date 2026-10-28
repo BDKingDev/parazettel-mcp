@@ -724,8 +724,23 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note (serialized against all writers by the global write lock)."""
+        """Delete a note (serialized against all writers by the global write lock).
+
+        Deleting a project keeps its members: each note, task or subproject
+        routed to it has its ``project_id`` cleared first, through the normal
+        update path, so it falls back to its area's routing and stays editable.
+        """
         with self._write_locked():
+            # An unparseable note must still be deletable; it can't be known to
+            # be a project, so it has no members to clear.
+            try:
+                note = self.repository.get(note_id)
+            except IOError:
+                note = None
+            if note and note.note_type == NoteType.PROJECT:
+                for member in self.repository.search(project_id=note_id):
+                    if member.id != note_id:
+                        self._update_note_locked(member.id, project_id=None)
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:

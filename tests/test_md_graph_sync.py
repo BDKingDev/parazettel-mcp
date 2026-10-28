@@ -455,6 +455,45 @@ def test_subproject_wires_parent_and_area_both_layers(para):
     assert edge_types(service, area.id, sub.id) == {"has_part"}
 
 
+def test_deleting_project_clears_member_associations_both_layers(para):
+    """Deleting a project keeps its members, re-routed to the area and editable."""
+    service, area, project = para
+    task = service.create_task(title="Orphan Task", content="t", project_id=project.id)
+    note = service.create_note(title="Orphan Note", content="n", project_id=project.id)
+    sub = service.create_project_note(
+        title="Orphan Sub", content="s", project_id=project.id
+    )
+    sub_task = service.create_task(title="Sub Task", content="st", project_id=sub.id)
+    other = service.create_project_note(title="Other", content="o", area_id=area.id)
+    other_task = service.create_task(title="Other Task", content="ot", project_id=other.id)
+
+    service.delete_note(project.id)
+
+    def assert_cleared():
+        for member in (task, note, sub):
+            current = service.get_note(member.id)
+            assert current.project_id is None
+            assert current.area_id == area.id
+            assert project.id not in md_text(service, member.id)
+            assert edge_types(service, member.id, area.id) >= {"part_of", "reference"}
+            assert f"has_part [[{member.id}" in links_section(service, area.id)
+            assert edge_types(service, area.id, member.id) == {"has_part"}
+        assert service.repository.search(project_id=project.id) == []
+        # The surviving subproject keeps its own task; unrelated routing is untouched.
+        assert service.get_note(sub_task.id).project_id == sub.id
+        assert edge_types(service, sub_task.id, sub.id) == {"part_of"}
+        assert service.get_note(other_task.id).project_id == other.id
+        assert edge_types(service, other_task.id, other.id) == {"part_of"}
+
+    assert_cleared()
+    service.rebuild_index()
+    assert_cleared()
+
+    # The members are editable again through the normal update path.
+    assert "edited" in service.update_note(task.id, content="edited").content
+    assert "edited" in service.update_note(sub.id, content="edited").content
+
+
 # ---------------------------------------------------------------------------
 # 2b. Direct area membership is bidirectional (part_of + materialized has_part)
 # ---------------------------------------------------------------------------
