@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
@@ -63,12 +63,6 @@ from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level LRU cache  {(path_str, mtime_ns): Note}
-# ---------------------------------------------------------------------------
-_NOTE_CACHE: OrderedDict = OrderedDict()
-_NOTE_CACHE_LOCK = threading.Lock()
-_NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
@@ -130,25 +124,6 @@ _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 # splitting a note body on it can't be tripped by an in-prose mention.
 _LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
 
-def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        note = _NOTE_CACHE.get(key)
-        if note is not None:
-            _NOTE_CACHE.move_to_end(key)
-            return note.model_copy(deep=True)
-    return None
-
-
-def _cache_put(path_str: str, mtime_ns: int, note: Note) -> None:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        _NOTE_CACHE[key] = note
-        _NOTE_CACHE.move_to_end(key)
-        while len(_NOTE_CACHE) > _NOTE_CACHE_MAX:
-            _NOTE_CACHE.popitem(last=False)
-
-
 def _dedupe_preserve_order(values: List[str]) -> List[str]:
     """Return values without duplicates while preserving first-seen order."""
     seen: Set[str] = set()
@@ -159,14 +134,6 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
-
-
-def _cache_evict(path_str: str) -> None:
-    """Remove all cache entries for a given file path (any mtime)."""
-    with _NOTE_CACHE_LOCK:
-        stale = [k for k in _NOTE_CACHE if k[0] == path_str]
-        for k in stale:
-            del _NOTE_CACHE[k]
 
 
 def _json_default(obj: Any) -> Any:
@@ -552,10 +519,7 @@ class NoteRepository(Repository[Note]):
         for note_id in sorted(common):
             file_path = self.notes_dir / f"{note_id}.md"
             try:
-                # Read the file directly, bypassing the mtime-keyed note cache: a
-                # consistency check must see the true on-disk bytes, not a cached
-                # copy that may predate an external edit landing in the same
-                # coarse mtime tick.
+                # Only the body is compared, so parse just the frontmatter split.
                 with open(file_path, "r", encoding="utf-8") as f:
                     file_body = frontmatter.loads(f.read()).content
             except Exception:
@@ -1834,21 +1798,19 @@ class NoteRepository(Repository[Note]):
         return note
 
     def get(self, id: str) -> Optional[Note]:
-        """Get a note by ID (reads the markdown file; uses an LRU cache)."""
+        """Get a note by ID, read and parsed from its markdown file.
+
+        Not cached: the file is the source of truth and can be edited outside
+        this process, and no stat signal (mtime, size, inode) proves the bytes
+        unchanged. Re-parsing costs about what a deep copy of a cached Note did.
+        """
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             return None
         try:
-            path_str = str(file_path)
-            mtime_ns = file_path.stat().st_mtime_ns
-            cached = _cache_get(path_str, mtime_ns)
-            if cached is not None:
-                return cached
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
-            note = self._parse_note_from_markdown(content)
-            _cache_put(path_str, mtime_ns, note)
-            return note.model_copy(deep=True)
+            return self._parse_note_from_markdown(content)
         except Exception as e:
             raise IOError(f"Failed to read note {id}: {e}") from e
 
@@ -1941,7 +1903,6 @@ class NoteRepository(Repository[Note]):
         markdown = self._note_to_markdown(note)
         file_path = self.notes_dir / f"{note.id}.md"
         self._write_markdown_atomically(file_path, markdown)
-        _cache_evict(str(file_path))
 
         rendered_body = frontmatter.loads(markdown).content
         # Re-derive inline prose refs from the body actually written, so edits
@@ -1985,7 +1946,6 @@ class NoteRepository(Repository[Note]):
 
         with self.file_lock:
             os.remove(file_path)
-        _cache_evict(str(file_path))
 
         # Match every inline form that normalizes to this id — bare, aliased,
         # and with a ".md"/"#fragment" suffix — so none dangle after delete.

@@ -1,5 +1,6 @@
 """Tests for the NoteRepository class."""
 
+import os
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -552,11 +553,15 @@ def test_delete_preserves_aliases_for_remaining_links(note_repository):
         "Target content.\n",
         encoding="utf-8",
     )
+    # Explicit timestamps: without them every parse falls back to now(), so
+    # there would be no stored updated_at for the delete to preserve.
     source_path.write_text(
         "---\n"
         "id: delete-keep-source\n"
         "title: Delete Keep Source\n"
         "type: permanent\n"
+        "created: '2025-01-02T03:04:05'\n"
+        "updated: '2025-01-02T03:04:05'\n"
         "---\n"
         "# Delete Keep Source\n\n"
         "Source content.\n\n"
@@ -1274,3 +1279,63 @@ def test_rebuild_invalidates_cached_vectors_even_without_embeddings(note_reposit
     note_repository.rebuild_index()
     with note_repository._connection() as conn:
         assert get_counter(conn, EMBEDDING_GENERATION_KEY) > before
+
+
+@pytest.mark.parametrize("edit", ["in_place", "replace"])
+def test_get_sees_external_edit_with_same_size_and_timestamp(note_repository, edit):
+    """An external edit within one timestamp tick, keeping the size, is still read.
+
+    Restoring the original mtime makes the edit invisible to size and mtime
+    checks alike, so only the file's bytes can tell the notes apart.
+    """
+    note = note_repository.create(
+        Note(title="Fresh read", content="state alpha", note_type=NoteType.PERMANENT)
+    )
+    path = note_repository.notes_dir / f"{note.id}.md"
+    assert "state alpha" in note_repository.get(note.id).content
+
+    before = path.stat()
+    edited = path.read_text(encoding="utf-8").replace("state alpha", "state omega")
+    if edit == "in_place":
+        path.write_text(edited, encoding="utf-8")
+    else:
+        replacement = path.with_suffix(".tmp")
+        replacement.write_text(edited, encoding="utf-8")
+        os.replace(replacement, path)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+    assert "state omega" in note_repository.get(note.id).content
+
+
+def test_update_after_same_tick_external_edit_keeps_the_edit(note_repository):
+    """A read-modify-write that starts after an external edit must build on it.
+
+    With a stale read the update would rewrite the old body over the edit.
+    This covers reads that start after the edit; an edit landing between the
+    read and the write is a separate race that a read path can't close.
+    """
+    note = note_repository.create(
+        Note(
+            title="Edit then update",
+            content="state alpha",
+            note_type=NoteType.PERMANENT,
+        )
+    )
+    path = note_repository.notes_dir / f"{note.id}.md"
+    note_repository.get(note.id)
+    before = path.stat()
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("state alpha", "state omega"),
+        encoding="utf-8",
+    )
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    current = note_repository.get(note.id)
+    current.tags.append(Tag(name="touched"))
+    note_repository.update(current)
+
+    on_disk = path.read_text(encoding="utf-8")
+    assert "state omega" in on_disk and "state alpha" not in on_disk
+    assert "touched" in on_disk
