@@ -271,6 +271,129 @@ def test_content_without_links_section_keeps_links(zettel_service):
     assert b.id in {link.target_id for link in parsed.links}
 
 
+# Content that once erased a note's links in a real vault: it mentions the
+# literal "## Links" mid-sentence but has no Links heading. Verbatim except the
+# private report paths, which are replaced with <shared-docs>.
+_PROSE_MENTION_CONTENT = """# Parazettel area and project reads can hide generated links while preserving their maps
+
+At Parazettel candidate 1c4b5295fb4addbe670f3b507d5789bc07cb9c22, pzk_get_area and pzk_get_project use the existing Links-section stripper to suppress the generated ## Links section from displayed content. They retain the curated body and inline map references, show a hidden-link count when applicable, and point to pzk_get_note(include_links=true) or linked-note tools for access to links. Project/member and area/project summary lists remain separate and can still be large; this changes response presentation, not stored Markdown or graph links.
+
+The archivist inspected the exact candidate and independently reran the focused integration test on Linux/Python 3.13: 1 passed. It uses the real service and repository with mocked MCP registration, not a real transport. The review reports 125 related passes and a negative control failing on the parent; clean merge-tree checks against exact cache and security candidates are static, not evidence that a combined SDK 2 build ran. Native Windows, a full suite, merged runtime and real transport were not independently tested for this change. Behavior for malformed handwritten Links sections remains the existing stripper's contract.
+
+A later inspection found that the original stripper also suppressed handwritten prose under a Links heading, while the notice depended on counting dash-prefixed lines: a prose-only section could disappear without notice. Amendment 0a042491ce32fce9dc1995b95c9f54a57c569532 announces any suppressed Links section in area and project reads, points first to linked notes for direction and stored descriptions, and adds a notice for prose-only sections in default pzk_get_note reads. Full note reads retain the section; the original list-only and no-section note output is unchanged in the tested cases. The amended behavior does not change the underlying stripper's handling of malformed or fenced headings.
+
+The archivist inspected the amendment diff and ran three focused Linux/Python 3.13 tests (3 passed), including real-service container coverage with mocked MCP registration. The independent reviewer reports 128 related tests passed and a previous-candidate control in which the two new prose-only tests failed but the exact-output compatibility test passed. Static merge-tree checks are not merged-runtime evidence. The reviewer did not independently run the full suite, Windows, real transport, bulk-output comparison or merged SDK 2 runtime; builder suite claims remain builder-attributed. These findings are for the named candidate, not a claim of deployment.
+
+Sources: <shared-docs>/readable-containers-review.md; <shared-docs>/readable-amend-review.md; src/parazettel_mcp/server/mcp_server.py and tests at the stated commits. Intakes: parazettel-readable-containers-review-1c4b529; parazettel-readable-amend-review-0a04249.
+"""
+
+_FENCED_CONTENT = (
+    "# Fenced\n\nEdit links like this:\n\n```\n## Links\n- related [[000]]\n```\n\n"
+    "After the fence.\n"
+)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "The generated ## Links section is now hidden in reads.",
+        "Intro.\n\n## Links to read later\n\nSome prose.",
+        "Use `## Links` to edit links by hand.",
+        _PROSE_MENTION_CONTENT,
+        _FENCED_CONTENT,
+    ],
+    ids=[
+        "prose-mention",
+        "longer-heading",
+        "code-span",
+        "archivist-verbatim",
+        "fenced",
+    ],
+)
+def test_links_text_that_is_not_a_heading_keeps_links(zettel_service, content):
+    """Only a real ## Links heading line edits links; any other "## Links" text is
+    prose, and every written link keeps its type and description."""
+    area = zettel_service.create_area_note(title="Area", content="a")
+    a = zettel_service.create_note(title="Source", content="a", area_id=area.id)
+    b = zettel_service.create_note(title="Related", content="b")
+    c = zettel_service.create_note(title="Supported", content="c")
+    zettel_service.create_link(a.id, b.id, LinkType.RELATED, "why A relates to B")
+    zettel_service.create_link(a.id, c.id, LinkType.SUPPORTS)
+
+    zettel_service.update_note(a.id, content=content)
+
+    note = zettel_service.get_note(a.id)
+    written = {
+        (link.target_id, link.link_type, link.description)
+        for link in note.links
+        if link.target_id != area.id  # the area's routing links
+    }
+    assert written == {
+        (b.id, LinkType.RELATED, "why A relates to B"),
+        (c.id, LinkType.SUPPORTS, None),
+    }
+    assert {n.id for n in zettel_service.get_linked_notes(a.id, "outgoing")} >= {
+        b.id,
+        c.id,
+    }
+    if content is _FENCED_CONTENT:
+        # The fenced example stays in the body and is not parsed as a link.
+        assert "After the fence." in note.content
+        assert "- related [[000]]" in note.content
+        assert "000" not in {link.target_id for link in note.links}
+
+
+def test_inline_refs_to_some_linked_notes_keep_all_links(zettel_service):
+    a = zettel_service.create_note(title="Inline Source", content="a")
+    b = zettel_service.create_note(title="Cited Inline", content="b")
+    c = zettel_service.create_note(title="Not Cited", content="c")
+    zettel_service.create_link(a.id, b.id, LinkType.RELATED, "kept")
+    zettel_service.create_link(a.id, c.id, LinkType.SUPPORTS)
+
+    zettel_service.update_note(a.id, content=f"New body citing [[{b.id}]] only.")
+
+    targets = {link.target_id for link in zettel_service.get_note(a.id).links}
+    assert {b.id, c.id} <= targets
+
+
+@pytest.mark.parametrize("heading", ["## Links", "## links", "  ##  Links  "])
+def test_real_links_heading_still_reconciles(zettel_service, heading):
+    """A real heading (any case or spacing) is the Links section: its entries are
+    the note's links, and an empty one clears them (routing links stay)."""
+    area = zettel_service.create_area_note(title="Area", content="a")
+    a = zettel_service.create_note(title="Edited", content="a", area_id=area.id)
+    b = zettel_service.create_note(title="Old Target", content="b")
+    d = zettel_service.create_note(title="New Target", content="d")
+    zettel_service.create_link(a.id, b.id, LinkType.RELATED)
+
+    zettel_service.update_note(
+        a.id, content=f"Body.\n\n{heading}\n- supports [[{d.id}]] added\n"
+    )
+    note = zettel_service.get_note(a.id)
+    targets = {link.target_id for link in note.links}
+    assert d.id in targets and b.id not in targets
+    assert note.content.count("## Links") == 1  # one rendered section, no duplicate
+
+    zettel_service.update_note(a.id, content=f"Body.\n\n{heading}\n")
+    targets = {link.target_id for link in zettel_service.get_note(a.id).links}
+    assert targets == {area.id}  # only the routing links remain
+
+
+def test_unclosed_fence_does_not_hide_the_links_section(zettel_service):
+    a = zettel_service.create_note(title="Stray Fence", content="a")
+    b = zettel_service.create_note(title="Target", content="b")
+    zettel_service.create_link(a.id, b.id, LinkType.RELATED, "survives")
+
+    zettel_service.update_note(
+        a.id, content="Body with a stray fence:\n```\nnot closed"
+    )
+    zettel_service.rebuild_index()
+
+    note = zettel_service.get_note(a.id)
+    assert b.id in {link.target_id for link in note.links}
+    assert note.content.count("## Links") == 1
+
+
 # ---------------------------------------------------------------------------
 # Provenance + verification fields
 # ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ from parazettel_mcp.storage.file_lock import file_lock
 from parazettel_mcp.storage.note_repository import (
     WIKI_TARGET_SUFFIX,
     NoteRepository,
+    has_links_heading,
 )
 
 logger = logging.getLogger(__name__)
@@ -525,7 +526,9 @@ class ZettelService:
         unlinked, lines added are linked. Links that survive keep their original
         ``created_at``/description. When the new content has NO ``## Links``
         heading the existing links are kept unchanged (so passing just a new
-        body never wipes the link graph).
+        body never wipes the link graph). Only a real heading line counts: the
+        text "## Links" in prose, a code span or fenced code, or a longer heading
+        such as "## Links to read", is not a Links section (``has_links_heading``).
 
         Routing-derived links (area ``reference``/``part_of``) are NOT free-form
         — they are generated from the note's frontmatter routing — so they are
@@ -534,7 +537,7 @@ class ZettelService:
         area/project (the later routing sync only repairs links when
         ``area_id``/``project_id`` themselves change).
         """
-        if "## Links" not in content:
+        if not has_links_heading(content):
             return
         parsed = self.repository.parse_links_in_content(note.id, content)
         existing_by_key = {

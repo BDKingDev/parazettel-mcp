@@ -272,6 +272,42 @@ def _db_dict_to_note(
     )
 
 
+def _links_section_lines(content: str) -> Iterator[Tuple[str, bool]]:
+    """Yield ``(line, in_links_section)`` for each line of *content*.
+
+    The Links section starts at a line that is exactly ``## Links`` (ignoring
+    case and surrounding or repeated spaces) outside fenced code, and runs to
+    the next ``## `` heading. A
+    mention in prose, a code span, a fenced example or a longer heading such as
+    ``## Links to read`` is ordinary text. The parser, the writer and the update
+    reconciler all use this one rule, so they agree on what the section is.
+
+    A trailing fence with no closing line is ignored, so a stray ``` in a body
+    can't hide the generated section that follows it at the end of the file.
+    """
+    lines = content.split("\n")
+    fences = [i for i, line in enumerate(lines) if line.strip().startswith("```")]
+    if len(fences) % 2:
+        fences.pop()
+    fence_lines = set(fences)
+    in_fence = in_links = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if index in fence_lines:
+            in_fence = not in_fence
+        elif not in_fence:
+            if " ".join(stripped.split()).lower() == "## links":
+                in_links = True
+            elif in_links and stripped.startswith("## "):
+                in_links = False
+        yield line, in_links
+
+
+def has_links_heading(content: str) -> bool:
+    """Whether *content* has a real ``## Links`` section heading (see above)."""
+    return any(in_links for _, in_links in _links_section_lines(content))
+
+
 class NoteRepository(Repository[Note]):
     """Repository for note storage and retrieval.
 
@@ -937,16 +973,9 @@ class NoteRepository(Repository[Note]):
         """
         links: List[Link] = []
         seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        links_section = False
-        for line in content.split("\n"):
-            line = line.strip()
-            if line.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and line.startswith("## "):
-                links_section = False
-                continue
-            if links_section and line.startswith("- "):
+        for raw_line, in_links_section in _links_section_lines(content):
+            line = raw_line.strip()
+            if in_links_section and line.startswith("- "):
                 try:
                     line_content = line.strip()
                     if "[[" in line_content and "]]" in line_content:
@@ -1082,16 +1111,12 @@ class NoteRepository(Repository[Note]):
             metadata["last_verified"] = note.last_verified.isoformat()
         metadata.update(note.metadata)
 
-        content_parts = []
-        skip_section = False
-        for line in note.content.split("\n"):
-            if line.strip() == "## Links":
-                skip_section = True
-                continue
-            elif skip_section and line.startswith("## "):
-                skip_section = False
-            if not skip_section:
-                content_parts.append(line)
+        # Drop the old Links section; it is re-rendered from note.links below.
+        content_parts = [
+            line
+            for line, in_links_section in _links_section_lines(note.content)
+            if not in_links_section
+        ]
 
         content = "\n".join(content_parts).rstrip()
         content = self._ensure_title_heading(content, note.title)
