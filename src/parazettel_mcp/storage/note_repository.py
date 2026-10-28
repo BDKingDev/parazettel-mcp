@@ -1113,7 +1113,9 @@ class NoteRepository(Repository[Note]):
                 target_ref = self._format_wiki_link_target(link.target_id, title_map)
                 # Persist creation time as a markdown comment (invisible in
                 # Obsidian preview) so link provenance survives index rebuilds.
-                created = f" <!-- created: {link.created_at.isoformat(timespec='seconds')} -->"
+                # Full precision, like the frontmatter timestamps: the index
+                # stores the exact value, so a rebuild must parse it back.
+                created = f" <!-- created: {link.created_at.isoformat()} -->"
                 content += (
                     f"- {link.link_type.value} [[{target_ref}]]{desc}{created}\n"
                 )

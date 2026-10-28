@@ -204,6 +204,22 @@ def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
     ]
 
 
+def test_created_link_timestamp_matches_file_and_survives_rebuild(zettel_service):
+    """A created link's timestamp is the same in the file, the index, and after a rebuild."""
+    a = zettel_service.create_note(title="Kept A", content="a")
+    b = zettel_service.create_note(title="Kept B", content="b")
+    zettel_service.create_link(a.id, b.id, LinkType.SUPPORTS)
+
+    [indexed] = index_helpers.edge_created_at(zettel_service, a.id, b.id)
+    file_link = next(
+        lk for lk in zettel_service.get_note(a.id).links if lk.target_id == b.id
+    )
+    assert file_link.created_at == indexed
+
+    zettel_service.rebuild_index()
+    assert index_helpers.edge_created_at(zettel_service, a.id, b.id) == [indexed]
+
+
 def test_hand_edited_frontmatter_routing_propagates(zettel_service):
     """Editing area_id in frontmatter re-routes the note in the graph after a rebuild."""
     area1 = zettel_service.create_area_note(title="Area One", content="a1")
