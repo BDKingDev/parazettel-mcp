@@ -327,6 +327,39 @@ class TestIntegration:
         )
         assert "Member 07" in full and len(area_out) < len(full) / 3
 
+    def test_container_reads_announce_a_prose_only_links_section(self):
+        """A hand-edited ## Links section with no list lines is still hidden, and
+        the response says so; sections after it are kept verbatim."""
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Prose area", content="Placeholder.")
+        project = svc.create_project_note(
+            title="Prose project", content="x", area_id=area.id
+        )
+        prose = "I link these by hand when a lane gets crowded."
+        cadence = "## Review cadence\n\nMonthly, first Sunday.\n"
+        for note in (area, project):
+            path = svc.repository.notes_dir / f"{note.id}.md"
+            head, _, _ = path.read_text(encoding="utf-8").partition("## Links")
+            path.write_text(f"{head}## Links\n\n{prose}\n\n{cadence}", encoding="utf-8")
+
+        area_out = self.registered_tools["pzk_get_area"](area_id=area.id)
+        project_out = self.registered_tools["pzk_get_project"](project_id=project.id)
+        for out, note in ((area_out, area), (project_out, project)):
+            assert prose not in out
+            assert (
+                f"[Hidden: Links section — see pzk_get_linked_notes('{note.id}')" in out
+            )
+            assert cadence in out
+
+        # The full section is still one call away, and pzk_get_note's default read
+        # announces the hidden section too.
+        full = self.registered_tools["pzk_get_note"](
+            identifier=area.id, include_links=True
+        )
+        assert prose in full and cadence in full
+        default = self.registered_tools["pzk_get_note"](identifier=area.id)
+        assert prose not in default and "[Links section hidden" in default
+
     def test_rebuild_index_flow(self):
         """Test the rebuild index functionality with direct file modifications."""
         # Create a note through the service

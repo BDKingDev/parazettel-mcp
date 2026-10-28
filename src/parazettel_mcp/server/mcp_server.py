@@ -97,19 +97,27 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
     return stripped, hidden
 
 
+def _has_links_section(content: str) -> bool:
+    """Whether *content* has the ``## Links`` heading _strip_links_section removes."""
+    return any(line.strip().lower() == "## links" for line in content.splitlines())
+
+
 def _container_body(note_id: str, content: str) -> str:
     """Area/project body for display, with ``## Links`` hidden as pzk_get_note does.
 
     A container's ``## Links`` holds one line per member, so for a busy area it
-    is nearly all of the note. These tools have no include_links flag, so the
+    is nearly all of the note. Whatever the section holds — list lines or prose —
+    its removal is announced. These tools have no include_links flag, so the
     notice points at pzk_get_note for the full section.
     """
     body, hidden = _strip_links_section(content)
-    if hidden:
+    if _has_links_section(content):
+        what = f"{hidden} link(s) hidden with the" if hidden else "Hidden:"
         body += (
-            f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
-            f"pzk_get_neighborhood, or pzk_get_note('{note_id}', "
-            "include_links=true)]\n"
+            f"\n[{what} Links section — see pzk_get_linked_notes('{note_id}') "
+            "for direction and stored descriptions, or "
+            f"pzk_get_note('{note_id}', include_links=true) for the full "
+            "section]\n"
         )
     return body
 
@@ -625,6 +633,12 @@ class ZettelkastenMcpServer:
             result += (
                 f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
                 "pzk_get_neighborhood, or re-fetch with include_links=true]\n"
+            )
+        elif not include_links and _has_links_section(note.content):
+            # A hand-written section with no list lines: still say it was hidden.
+            result += (
+                "\n[Links section hidden — explore with pzk_get_linked_notes, "
+                "or re-fetch with include_links=true]\n"
             )
         return result
 
