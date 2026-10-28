@@ -1386,6 +1386,24 @@ class NoteRepository(Repository[Note]):
             logger.warning("Vector search failed: %s", exc)
             return {}
 
+    def prewarm_embeddings(self) -> None:
+        """Load the embedding model now, on the calling (startup) thread.
+
+        Same reason as ``FastEmbedReranker.prewarm``: fastembed's first import
+        can deadlock on the Windows loader lock when it runs on a worker thread
+        of a running MCP facade. Never raises; on failure the model lazy-loads
+        on first use as before.
+        """
+        if self._embedding_provider is None:
+            return
+        try:
+            self._embedding_provider.embed_query("warmup")
+        except Exception as exc:
+            logger.warning(
+                "Embedding model pre-warm failed (%s); it will load on first use",
+                exc,
+            )
+
     def vector_search(self, text: str, limit: int = 50) -> List[Tuple[str, float]]:
         """Nearest notes to *text* as (note_id, distance) pairs, closest first.
 

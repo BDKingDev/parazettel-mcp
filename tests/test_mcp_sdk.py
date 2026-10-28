@@ -6,6 +6,7 @@ initialize, list tools, call tools and read the results as a client would.
 """
 
 import re
+import threading
 
 import anyio
 import pytest
@@ -13,6 +14,7 @@ from mcp import Client
 
 from parazettel_mcp.config import config
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
+from parazettel_mcp.services.embedding_provider import HashEmbeddingProvider
 
 
 @pytest.fixture
@@ -101,3 +103,45 @@ def test_missing_required_argument_is_a_tool_error(server):
     result = anyio.run(scenario)
     assert result.is_error
     assert "identifier" in _text_unchecked(result)
+
+
+class _ThreadRecordingProvider(HashEmbeddingProvider):
+    """Records which thread each embed runs on (the lazy model load site)."""
+
+    def __init__(self) -> None:
+        super().__init__(dim=8)
+        self.threads: list[threading.Thread] = []
+
+    def embed_documents(self, texts):
+        self.threads.append(threading.current_thread())
+        return super().embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        self.threads.append(threading.current_thread())
+        return super().embed_query(text)
+
+
+def test_direct_mode_loads_embedding_model_on_startup_thread(test_config, monkeypatch):
+    """MCP 2 runs sync tools on worker threads; the first embed (which imports
+    fastembed for real providers) must still happen on the startup thread."""
+    provider = _ThreadRecordingProvider()
+    monkeypatch.setattr(
+        "parazettel_mcp.storage.note_repository.build_embedding_provider",
+        lambda _config: provider,
+    )
+    server = ZettelkastenMcpServer()
+    try:
+
+        async def scenario():
+            async with Client(server.mcp) as client:
+                await client.call_tool(
+                    "pzk_create_area", {"title": "Embedded area", "content": "x"}
+                )
+
+        anyio.run(scenario)
+    finally:
+        server.close()
+
+    assert provider.threads[0] is threading.main_thread()
+    # The tool call itself embedded on a worker thread: why the pre-warm matters.
+    assert provider.threads[-1] is not threading.main_thread()

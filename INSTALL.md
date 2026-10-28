@@ -4,7 +4,7 @@ Step-by-step installation for Parazettel MCP, including both direct usage and th
 
 ## Prerequisites
 
-- Python 3.13+ whose bundled SQLite includes FTS5 (true of uv-managed and most standard builds)
+- Python 3.11+ whose bundled SQLite includes FTS5 (true of uv-managed and most standard builds); the setup below uses 3.13
 - [uv](https://github.com/astral-sh/uv) recommended
 - Claude Code or another MCP client
 - Git

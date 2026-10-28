@@ -150,6 +150,9 @@ class DirectBackendBundle:
     def initialize(self) -> None:
         self.zettel_service.initialize()
         self.search_service.initialize()
+        # MCP 2 runs sync tool handlers on worker threads, so the first embed
+        # would otherwise import fastembed there; load it on this thread instead.
+        self.zettel_service.repository.prewarm_embeddings()
 
     def close(self) -> None:
         self.zettel_service.close()
