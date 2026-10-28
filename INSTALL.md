@@ -163,7 +163,7 @@ to convert, recover the script from history (this finds the commit that deleted
 it, so it works whatever the commit hashes are):
 
 ```bash
-git show "$(git rev-list -n 1 HEAD -- scripts/migrate_kuzu_to_sqlite.py)^:scripts/migrate_kuzu_to_sqlite.py" > migrate_kuzu_to_sqlite.py
+git show "$(git rev-list --full-history -n 1 HEAD -- scripts/migrate_kuzu_to_sqlite.py)^:scripts/migrate_kuzu_to_sqlite.py" > migrate_kuzu_to_sqlite.py
 pip install "kuzu>=0.11.3,<0.12"
 ```
 
