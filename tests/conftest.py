@@ -13,6 +13,7 @@ from parazettel_mcp.storage.note_repository import NoteRepository
 
 _DEFAULT_PATH_FIELDS = (
     "notes_dir",
+    "index_db_path",
     "graph_db_path",
     "database_path",
     "daemon_runtime_dir",
@@ -25,15 +26,17 @@ def _isolate_default_paths(tmp_path_factory):
 
     Their defaults are the cwd-relative vault (``data/...``) and the shared
     ``<tempdir>/parazettel-daemon`` runtime dir a real daemon uses for its PID
-    file, start lock and logs. A test that never sets its own paths would
-    otherwise create or lock those. Tests that do set paths (``test_config``)
-    still override these per test.
+    file, start lock and logs, and ``PARAZETTEL_*`` variables (including the
+    repo's ``.env``) can point them at a real vault. A test that never sets its
+    own paths would otherwise create or lock those. Tests that do set paths
+    (``test_config``) still override these per test.
     """
     root = tmp_path_factory.mktemp("default-paths")
     originals = {name: getattr(config, name) for name in _DEFAULT_PATH_FIELDS}
     config.notes_dir = root / "notes"
-    # index_db_path stays unset, so the index derives from graph_db_path as it
-    # does by default.
+    # Unset, as by default, so the index derives from graph_db_path below; a
+    # PARAZETTEL_INDEX_DB_PATH from the environment would otherwise win.
+    config.index_db_path = None
     config.graph_db_path = root / "db" / "graph.kuzu"
     config.database_path = root / "db" / "parazettel.db"
     config.daemon_runtime_dir = root / "runtime"
