@@ -287,10 +287,14 @@ The archivist inspected the amendment diff and ran three focused Linux/Python 3.
 Sources: <shared-docs>/readable-containers-review.md; <shared-docs>/readable-amend-review.md; src/parazettel_mcp/server/mcp_server.py and tests at the stated commits. Intakes: parazettel-readable-containers-review-1c4b529; parazettel-readable-amend-review-0a04249.
 """
 
-_FENCED_CONTENT = (
-    "# Fenced\n\nEdit links like this:\n\n```\n## Links\n- related [[000]]\n```\n\n"
-    "After the fence.\n"
-)
+_EXAMPLE = "## Links\n- related [[000]]\n"
+_FENCED_CONTENTS = {
+    "fenced-backticks": f"# Fenced\n\nEdit links like this:\n\n```\n{_EXAMPLE}```\n\n",
+    "fenced-tildes": f"# Fenced\n\nExample:\n~~~markdown\n{_EXAMPLE}~~~\n",
+    # A longer fence can show a shorter one; the inner ``` doesn't close it.
+    "fenced-nested": f"# Fenced\n\n````\n```\n{_EXAMPLE}```\n````\n",
+}
+_FENCED_CONTENTS = {k: v + "After the fence.\n" for k, v in _FENCED_CONTENTS.items()}
 
 
 @pytest.mark.parametrize(
@@ -300,14 +304,14 @@ _FENCED_CONTENT = (
         "Intro.\n\n## Links to read later\n\nSome prose.",
         "Use `## Links` to edit links by hand.",
         _PROSE_MENTION_CONTENT,
-        _FENCED_CONTENT,
+        *_FENCED_CONTENTS.values(),
     ],
     ids=[
         "prose-mention",
         "longer-heading",
         "code-span",
         "archivist-verbatim",
-        "fenced",
+        *_FENCED_CONTENTS,
     ],
 )
 def test_links_text_that_is_not_a_heading_keeps_links(zettel_service, content):
@@ -336,7 +340,7 @@ def test_links_text_that_is_not_a_heading_keeps_links(zettel_service, content):
         b.id,
         c.id,
     }
-    if content is _FENCED_CONTENT:
+    if content in _FENCED_CONTENTS.values():
         # The fenced example stays in the body and is not parsed as a link.
         assert "After the fence." in note.content
         assert "- related [[000]]" in note.content
@@ -377,6 +381,19 @@ def test_real_links_heading_still_reconciles(zettel_service, heading):
     zettel_service.update_note(a.id, content=f"Body.\n\n{heading}\n")
     targets = {link.target_id for link in zettel_service.get_note(a.id).links}
     assert targets == {area.id}  # only the routing links remain
+
+
+def test_links_heading_detection_follows_fence_rules():
+    from parazettel_mcp.storage.note_repository import has_links_heading
+
+    assert has_links_heading("Body.\n\n## Links\n- related [[x]]")
+    # A one-line ```x``` is a code span, not an opening fence.
+    assert has_links_heading("Use ```x``` inline.\n\n## Links\n- related [[x]]")
+    # An opener that never closes is plain text, not a fence.
+    assert has_links_heading("Stray:\n~~~\n\n## Links\n- related [[x]]")
+    # Inside a closed fence of either kind, the heading is an example.
+    assert not has_links_heading("~~~\n## Links\n~~~\n")
+    assert not has_links_heading("````\n```\n## Links\n```\n````\n")
 
 
 def test_unclosed_fence_does_not_hide_the_links_section(zettel_service):

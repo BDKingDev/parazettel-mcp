@@ -272,30 +272,55 @@ def _db_dict_to_note(
     )
 
 
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _fenced_lines(lines: List[str]) -> List[bool]:
+    """Mark each line that is a fence or inside fenced code.
+
+    A fence opens on three or more backticks or tildes and closes on a line of
+    only the same character, at least as long (so a ```` fence can show ```).
+    An opener that never closes is treated as plain text, so a stray fence
+    can't hide what follows it, such as the generated Links section.
+    """
+    fenced = [False] * len(lines)
+    i = 0
+    while i < len(lines):
+        opener = _FENCE_OPEN_RE.match(lines[i])
+        # A backtick fence's info string can't hold a backtick (```x``` is a span).
+        if not opener or (
+            opener.group(1)[0] == "`" and "`" in lines[i][opener.end() :]
+        ):
+            i += 1
+            continue
+        fence = opener.group(1)
+        close = re.compile(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$")
+        end = next((j for j in range(i + 1, len(lines)) if close.match(lines[j])), None)
+        if end is None:
+            i += 1  # unclosed: not a fence
+            continue
+        for j in range(i, end + 1):
+            fenced[j] = True
+        i = end + 1
+    return fenced
+
+
 def _links_section_lines(content: str) -> Iterator[Tuple[str, bool]]:
     """Yield ``(line, in_links_section)`` for each line of *content*.
 
     The Links section starts at a line that is exactly ``## Links`` (ignoring
     case and surrounding or repeated spaces) outside fenced code, and runs to
-    the next ``## `` heading. A
-    mention in prose, a code span, a fenced example or a longer heading such as
-    ``## Links to read`` is ordinary text. The parser, the writer and the update
-    reconciler all use this one rule, so they agree on what the section is.
-
-    A trailing fence with no closing line is ignored, so a stray ``` in a body
-    can't hide the generated section that follows it at the end of the file.
+    the next ``## `` heading. A mention in prose, a code span, a fenced example
+    or a longer heading such as ``## Links to read`` is ordinary text. The
+    parser, the writer and the update reconciler all use this one rule, so they
+    agree on what the section is.
     """
     lines = content.split("\n")
-    fences = [i for i, line in enumerate(lines) if line.strip().startswith("```")]
-    if len(fences) % 2:
-        fences.pop()
-    fence_lines = set(fences)
-    in_fence = in_links = False
-    for index, line in enumerate(lines):
+    fenced = _fenced_lines(lines)
+    in_links = False
+    for line, is_fenced in zip(lines, fenced):
         stripped = line.strip()
-        if index in fence_lines:
-            in_fence = not in_fence
-        elif not in_fence:
+        if not is_fenced:
             if " ".join(stripped.split()).lower() == "## links":
                 in_links = True
             elif in_links and stripped.startswith("## "):
