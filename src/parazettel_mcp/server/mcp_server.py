@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import (
     DaemonRpcClient,
@@ -204,12 +204,10 @@ class ZettelkastenMcpServer:
 
     def __init__(self):
         """Initialize the MCP server."""
-        self.mcp = FastMCP(
+        self.mcp = MCPServer(
             config.server_name,
             instructions=_SERVER_INSTRUCTIONS,
             version=config.server_version,
-            host=config.server_host,
-            port=config.server_port,
         )
         self.backend = self._build_backend()
         self.zettel_service = self.backend.zettel_service
@@ -3282,4 +3280,9 @@ class ZettelkastenMcpServer:
 
     def run(self, transport: str = "stdio") -> None:
         """Run the MCP server."""
-        self.mcp.run(transport=transport)
+        if transport == "sse":
+            self.mcp.run(
+                transport="sse", host=config.server_host, port=config.server_port
+            )
+        else:
+            self.mcp.run(transport=transport)

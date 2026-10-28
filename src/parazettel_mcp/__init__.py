@@ -1,12 +1,8 @@
 """Parazettel MCP package metadata."""
 
+import tomllib
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    import tomli as tomllib  # type: ignore[no-redef]
 
 PACKAGE_NAME = "parazettel-mcp"
 
