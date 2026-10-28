@@ -743,19 +743,44 @@ class ZettelkastenMcpServer:
         return notice + ")\n"
 
     @staticmethod
-    def _describe_relation(node: Note, neighbor: Note) -> str:
-        """Short label for how *neighbor* connects to *node* (direction + type)."""
-        for link in node.links:
-            if link.target_id == neighbor.id:
-                return f"-> {link.link_type.value}"
-        for link in neighbor.links:
-            if link.target_id == node.id:
-                return f"<- {link.link_type.value}"
-        if neighbor.id in getattr(node, "inline_refs", []):
-            return "-> inline"
-        if node.id in getattr(neighbor, "inline_refs", []):
-            return "<- inline"
-        return "linked"
+    def _neighbor_edges(
+        node: Note, neighbor: Note
+    ) -> List[Tuple[str, str, Optional[str], bool]]:
+        """Every edge between *node* and *neighbor* as (arrow, type, description,
+        is_routing): outgoing first in *node*'s link order, then incoming.
+
+        Notes read from the index carry inline edges in ``links``; notes read from
+        a file only in ``inline_refs``, so those are added when not already seen.
+        """
+        edges: List[Tuple[str, str, Optional[str], bool]] = []
+        for arrow, src, dst in (("->", node, neighbor), ("<-", neighbor, node)):
+            has_inline = False
+            for link in src.links:
+                if link.target_id != dst.id:
+                    continue
+                has_inline = has_inline or link.link_type == LinkType.INLINE
+                edges.append(
+                    (
+                        arrow,
+                        link.link_type.value,
+                        link.description,
+                        ZettelService.is_routing_link(src, link),
+                    )
+                )
+            if not has_inline and dst.id in getattr(src, "inline_refs", []):
+                edges.append((arrow, LinkType.INLINE.value, None, False))
+        return edges
+
+    @staticmethod
+    def _format_edges(edges: List[Tuple[str, str, Optional[str], bool]]) -> str:
+        """``-> refines: "why"; <- part_of (routing)`` — descriptions only when stored."""
+        parts = []
+        for arrow, kind, description, routing in edges:
+            part = f"{arrow} {kind}" + (" (routing)" if routing else "")
+            if description:
+                part += f': "{description}"'
+            parts.append(part)
+        return "; ".join(parts) or "linked"
 
     def _suggested_links_message(self, note_id: str) -> str:
         """Propose link candidates for a freshly created note (best-effort).
@@ -2802,17 +2827,33 @@ class ZettelkastenMcpServer:
 
         @self.mcp.tool(name="pzk_get_neighborhood")
         def pzk_get_neighborhood(
-            note_id: str, depth: int = 2, max_nodes: int = 25
+            note_id: str,
+            depth: int = 2,
+            max_nodes: int = 25,
+            include_routing: bool = False,
         ) -> str:
-            """Map the linked neighborhood around a note, grouped by hop distance.
+            """Map the knowledge-link neighborhood around a note, grouped by hop.
 
             Use for synthesis ('what do I know around X?') instead of chaining
-            pzk_get_linked_notes calls. Includes inline prose references.
+            pzk_get_linked_notes calls. Follows written links and inline prose
+            references. Each entry names the note it was reached from (via) and
+            every edge between the two, with the link's stored description when
+            it has one. Neighbors are visited in note-ID order, so the map is
+            stable.
+
+            PARA routing links (part_of/has_part/blocks and a note's plain
+            reference to its own area) are not traversed, because an area links
+            to every note filed under it. The center's own routing neighbors —
+            its area/project, or a container's members — are listed once under
+            "Routing" without being expanded.
 
             Args:
                 note_id: ID or title of the center note
                 depth: How many hops to traverse (1-3)
-                max_nodes: Cap on total notes returned (default 25)
+                max_nodes: Cap on traversed notes, center included (default 25);
+                    the Routing list is capped at the same number
+                include_routing: Also traverse routing links (an area hub then
+                    pulls in its members)
             """
             try:
                 if not 1 <= depth <= 3:
@@ -2826,11 +2867,16 @@ class ZettelkastenMcpServer:
                 visited: Dict[str, Note] = {center.id: center}
                 hop_of: Dict[str, int] = {center.id: 0}
                 relation: Dict[str, str] = {}
+                via: Dict[str, str] = {}
+                routing: List[Tuple[Note, str]] = []
+                skipped_routing = False
+                capped = False
                 frontier: List[Note] = [center]
                 for hop in range(1, depth + 1):
                     next_frontier: List[Note] = []
                     for node in frontier:
-                        if len(visited) >= max_nodes:
+                        if len(visited) >= max_nodes and node is not center:
+                            capped = True
                             break
                         try:
                             neighbors = self.zettel_service.get_linked_notes(
@@ -2841,20 +2887,37 @@ class ZettelkastenMcpServer:
                                 "Could not read neighbors for %s: %s", node.id, exc
                             )
                             continue
-                        for neighbor in neighbors:
+                        for neighbor in sorted(neighbors, key=lambda n: n.id):
                             if neighbor.id in visited:
                                 continue
+                            edges = self._neighbor_edges(node, neighbor)
+                            if (
+                                not include_routing
+                                and edges
+                                and all(edge[3] for edge in edges)
+                            ):
+                                skipped_routing = True
+                                if node is center:
+                                    routing.append(
+                                        (neighbor, self._format_edges(edges))
+                                    )
+                                continue
                             if len(visited) >= max_nodes:
+                                capped = True
+                                # Keep scanning the center so its routing
+                                # neighbors are still listed.
+                                if node is center:
+                                    continue
                                 break
                             visited[neighbor.id] = neighbor
                             hop_of[neighbor.id] = hop
-                            relation[neighbor.id] = self._describe_relation(
-                                node, neighbor
-                            )
+                            relation[neighbor.id] = self._format_edges(edges)
+                            via[neighbor.id] = node.id
                             next_frontier.append(neighbor)
                     frontier = next_frontier
                     if not frontier:
                         break
+                routing = [(n, label) for n, label in routing if n.id not in visited]
 
                 out = (
                     f"Neighborhood of '{center.title}' (ID: {center.id}) — "
@@ -2870,21 +2933,41 @@ class ZettelkastenMcpServer:
                         continue
                     out += f"\nHop {hop}:\n"
                     for note in at_hop:
-                        preview = note.content[:120].replace("\n", " ").strip()
+                        body, _ = _strip_links_section(note.content)
+                        preview = body[:120].replace("\n", " ").strip()
                         if len(preview) > 100:
                             preview = preview[:100] + "..."
                         out += (
                             f"- {note.title} (ID: {note.id}, "
-                            f"{note.note_type.value}) [{relation.get(note.id, 'linked')}]\n"
+                            f"{note.note_type.value}) "
+                            f"[via {via[note.id]}: {relation[note.id]}]\n"
                         )
                         if preview:
                             out += f"  {preview}\n"
-                if len(visited) - 1 == 0:
+                if routing:
+                    out += "\nRouting (not expanded):\n"
+                    for note, label in routing[:max_nodes]:
+                        out += (
+                            f"- {note.title} (ID: {note.id}, "
+                            f"{note.note_type.value}) [{label}]\n"
+                        )
+                    if len(routing) > max_nodes:
+                        out += (
+                            f"- … {len(routing) - max_nodes} more; list them with "
+                            "pzk_search_notes (area_id/project_id) or "
+                            "pzk_get_linked_notes\n"
+                        )
+                if len(visited) - 1 == 0 and not routing:
                     out += "\n(No links yet — consider pzk_find_similar_notes to find candidates.)"
-                elif len(visited) >= max_nodes:
+                elif capped:
                     out += (
                         f"\n(Capped at {max_nodes} notes; raise max_nodes for "
                         "a wider map.)"
+                    )
+                if skipped_routing:
+                    out += (
+                        "\n(Routing links were not traversed; pass "
+                        "include_routing=true to follow them.)"
                     )
                 return out
             except Exception as e:

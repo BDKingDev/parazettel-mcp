@@ -1276,6 +1276,21 @@ class ZettelService:
     )
 
     @classmethod
+    def is_routing_link(cls, note: Note, link: Link) -> bool:
+        """True for a PARA/GTD routing edge rather than a written connection:
+        part_of/has_part/blocks*, or the plain reference *note* carries to its
+        own area. Any other link type to the area (supports, extends, ...) is
+        still knowledge.
+        """
+        if link.link_type in cls._ROUTING_LINK_TYPES:
+            return True
+        return (
+            link.link_type == LinkType.REFERENCE
+            and bool(note.area_id)
+            and link.target_id == note.area_id
+        )
+
+    @classmethod
     def _knowledge_link_targets(cls, note: Note) -> Set[str]:
         """Return target ids of a note's genuine knowledge links.
 

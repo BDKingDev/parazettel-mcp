@@ -415,3 +415,108 @@ class TestIntegration:
         # Drop the only tag; the tool output must drop with it.
         self.zettel_service.update_note(note.id, tags=[])
         assert "live-tag" not in {t.name for t in self.zettel_service.get_all_tags()}
+
+    def _neighborhood_graph(self):
+        """An area with 30 unrelated siblings and a described knowledge thread.
+
+        C -refines-> K1 -extends-> K3; K2 -supports-> C; K4 -contradicts-> K2;
+        K1 -supports-> C as well (two edges on one pair); map M -supports-> C
+        with no description; C mentions K5 inline in its prose.
+        """
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Hub area", content="Area hub.")
+
+        def note(title, content="x", **kwargs):
+            return svc.create_note(
+                title=title, content=content, area_id=area.id, **kwargs
+            )
+
+        for i in range(30):
+            note(f"Sibling {i:02d}")
+        k5 = note("K5 mentioned inline")
+        c = note("Center claim", content=f"Builds on [[{k5.id}]].")
+        k1, k2, k3, k4 = (note(f"K{i}") for i in range(1, 5))
+        m = note("Map M", note_type=NoteType.STRUCTURE)
+        svc.create_link(c.id, k1.id, LinkType.REFINES, "K1 adds the keep-or-skip test")
+        svc.create_link(k1.id, c.id, LinkType.SUPPORTS)
+        svc.create_link(k2.id, c.id, LinkType.SUPPORTS, "K2 is the worked evidence")
+        svc.create_link(k1.id, k3.id, LinkType.EXTENDS, "K3 applies K1 to maps")
+        svc.create_link(k4.id, k2.id, LinkType.CONTRADICTS, "K4 disputes K2's sample")
+        svc.create_link(m.id, c.id, LinkType.SUPPORTS)
+        return dict(area=area, c=c, k1=k1, k2=k2, k3=k3, k4=k4, k5=k5, m=m)
+
+    @staticmethod
+    def _entry(out, note):
+        """The output line for *note*, or None."""
+        return next((ln for ln in out.splitlines() if f"(ID: {note.id}," in ln), None)
+
+    def test_neighborhood_follows_knowledge_links_not_area_routing(self):
+        g = self._neighborhood_graph()
+        out = self.registered_tools["pzk_get_neighborhood"](note_id=g["c"].id)
+        hops, routing = out.split("Routing (not expanded):")
+
+        assert "Sibling" not in out
+        for key in ("k1", "k2", "k5", "m"):
+            assert f"[via {g['c'].id}:" in self._entry(hops, g[key])
+        assert f"[via {g['k1'].id}: -> extends: \"K3 applies K1 to maps\"]" in hops
+        assert (
+            f"[via {g['k2'].id}: <- contradicts: \"K4 disputes K2's sample\"]" in hops
+        )
+        # Both edges on the C-K1 pair, each with only its own stored description.
+        assert '-> refines: "K1 adds the keep-or-skip test"; <- supports]' in hops
+        assert self._entry(hops, g["m"]).endswith(f"[via {g['c'].id}: <- supports]")
+        assert self._entry(hops, g["k5"]).endswith("-> inline]")
+        # The area is listed once, as routing, and not expanded.
+        assert out.count(f"(ID: {g['area'].id},") == 1
+        assert self._entry(routing, g["area"]).endswith(
+            "[-> reference (routing); -> part_of (routing); <- has_part (routing)]"
+        )
+        assert "include_routing=true" in out
+
+    def test_neighborhood_order_does_not_depend_on_neighbor_order(self):
+        g = self._neighborhood_graph()
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        first = tool(note_id=g["c"].id)
+        real = self.server.zettel_service.get_linked_notes
+        with patch.object(
+            self.server.zettel_service,
+            "get_linked_notes",
+            side_effect=lambda nid, d: list(reversed(real(nid, d))),
+        ):
+            assert tool(note_id=g["c"].id) == first
+
+    def test_neighborhood_cap_and_include_routing(self):
+        g = self._neighborhood_graph()
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        capped = tool(note_id=g["c"].id, max_nodes=3)
+        assert "Capped at 3 notes" in capped
+        assert self._entry(capped, g["area"])  # routing still listed past the cap
+        assert len([ln for ln in capped.splitlines() if "[via " in ln]) == 2
+
+        old = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
+        assert "Routing (not expanded)" not in old
+        assert f"[via {g['area'].id}: -> has_part (routing);" in old  # siblings
+
+    def test_neighborhood_container_seed_lists_members_and_keeps_knowledge_edges(self):
+        g = self._neighborhood_graph()
+        svc = self.server.zettel_service
+        # Curated areas point at their entry notes with explicit links (an inline
+        # [[id]] to a member is not stored: the member already has has_part).
+        svc.create_link(g["area"].id, g["c"].id, LinkType.REFERENCE, "Entry note")
+        tool = self.registered_tools["pzk_get_neighborhood"]
+
+        out = tool(note_id=g["area"].id, depth=1, max_nodes=10)
+        hops, routing = out.split("Routing (not expanded):")
+        # The written link is knowledge, so C is traversed...
+        assert '-> reference: "Entry note"' in self._entry(hops, g["c"])
+        # ...and the other members are listed, capped, never left empty.
+        assert "Sibling 00" in routing and "more; list them with" in routing
+
+        # A written link to the area makes the pair traversable from the note,
+        # and the area then expands through its knowledge edges only.
+        svc.create_link(g["k3"].id, g["area"].id, LinkType.SUPPORTS)
+        from_k3 = tool(note_id=g["k3"].id, depth=2)
+        area_entry = self._entry(from_k3, g["area"])
+        assert "[via " in area_entry and "-> supports" in area_entry
+        entries = [ln for ln in from_k3.splitlines() if ln.startswith("- ")]
+        assert entries and not any("Sibling" in ln for ln in entries)
