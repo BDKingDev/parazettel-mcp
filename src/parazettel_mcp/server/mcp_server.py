@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple
 
 from mcp.server.fastmcp import FastMCP
 from parazettel_mcp.config import config
@@ -17,6 +17,7 @@ from parazettel_mcp.daemon.client import (
     RemoteServiceProxy,
 )
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.note_repository import NoteRepository
 from parazettel_mcp.models.schema import (
     LinkType,
     Note,
@@ -744,21 +745,20 @@ class ZettelkastenMcpServer:
 
     @staticmethod
     def _neighbor_edges(
-        node: Note, neighbor: Note
+        node: Note, neighbor: Note, inline_of: Callable[[Note], Set[str]]
     ) -> List[Tuple[str, str, Optional[str], bool]]:
         """Every edge between *node* and *neighbor* as (arrow, type, description,
         is_routing): outgoing first in *node*'s link order, then incoming.
 
-        Notes read from the index carry inline edges in ``links``; notes read from
-        a file only in ``inline_refs``, so those are added when not already seen.
+        Inline edges come from the prose (*inline_of*), not the stored graph: the
+        graph skips an inline ref whose target is also linked explicitly, so an
+        area's lane-map link to its own member would otherwise look like routing.
         """
         edges: List[Tuple[str, str, Optional[str], bool]] = []
         for arrow, src, dst in (("->", node, neighbor), ("<-", neighbor, node)):
-            has_inline = False
             for link in src.links:
-                if link.target_id != dst.id:
+                if link.target_id != dst.id or link.link_type == LinkType.INLINE:
                     continue
-                has_inline = has_inline or link.link_type == LinkType.INLINE
                 edges.append(
                     (
                         arrow,
@@ -767,7 +767,7 @@ class ZettelkastenMcpServer:
                         ZettelService.is_routing_link(src, link),
                     )
                 )
-            if not has_inline and dst.id in getattr(src, "inline_refs", []):
+            if dst.id in inline_of(src):
                 edges.append((arrow, LinkType.INLINE.value, None, False))
         return edges
 
@@ -2850,8 +2850,9 @@ class ZettelkastenMcpServer:
             Args:
                 note_id: ID or title of the center note
                 depth: How many hops to traverse (1-3)
-                max_nodes: Cap on traversed notes, center included (default 25);
-                    the Routing list is capped at the same number
+                max_nodes: Cap on notes shown, center and Routing entries
+                    included (default 25). Linked notes fill it first; routing
+                    neighbors get what is left
                 include_routing: Also traverse routing links (an area hub then
                     pulls in its members)
             """
@@ -2871,6 +2872,13 @@ class ZettelkastenMcpServer:
                 routing: List[Tuple[Note, str]] = []
                 skipped_routing = False
                 capped = False
+                inline_cache: Dict[str, Set[str]] = {}
+
+                def inline_of(note: Note) -> Set[str]:
+                    if note.id not in inline_cache:
+                        inline_cache[note.id] = set(NoteRepository.inline_targets(note))
+                    return inline_cache[note.id]
+
                 frontier: List[Note] = [center]
                 for hop in range(1, depth + 1):
                     next_frontier: List[Note] = []
@@ -2890,7 +2898,7 @@ class ZettelkastenMcpServer:
                         for neighbor in sorted(neighbors, key=lambda n: n.id):
                             if neighbor.id in visited:
                                 continue
-                            edges = self._neighbor_edges(node, neighbor)
+                            edges = self._neighbor_edges(node, neighbor, inline_of)
                             if (
                                 not include_routing
                                 and edges
@@ -2945,15 +2953,18 @@ class ZettelkastenMcpServer:
                         if preview:
                             out += f"  {preview}\n"
                 if routing:
+                    # Routing entries share the max_nodes budget with the map.
+                    shown = routing[: max(0, max_nodes - len(visited))]
                     out += "\nRouting (not expanded):\n"
-                    for note, label in routing[:max_nodes]:
+                    for note, label in shown:
                         out += (
                             f"- {note.title} (ID: {note.id}, "
                             f"{note.note_type.value}) [{label}]\n"
                         )
-                    if len(routing) > max_nodes:
+                    if len(routing) > len(shown):
+                        capped = True
                         out += (
-                            f"- … {len(routing) - max_nodes} more; list them with "
+                            f"- … {len(routing) - len(shown)} more; list them with "
                             "pzk_search_notes (area_id/project_id) or "
                             "pzk_get_linked_notes\n"
                         )

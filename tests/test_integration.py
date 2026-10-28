@@ -488,10 +488,19 @@ class TestIntegration:
     def test_neighborhood_cap_and_include_routing(self):
         g = self._neighborhood_graph()
         tool = self.registered_tools["pzk_get_neighborhood"]
+        # max_nodes counts every note shown: center, linked notes, routing entries.
         capped = tool(note_id=g["c"].id, max_nodes=3)
         assert "Capped at 3 notes" in capped
-        assert self._entry(capped, g["area"])  # routing still listed past the cap
         assert len([ln for ln in capped.splitlines() if "[via " in ln]) == 2
+        assert self._entry(capped, g["area"]) is None
+        assert "- … 1 more; list them with" in capped  # the area, not dropped silently
+        alone = tool(note_id=g["c"].id, max_nodes=1)
+        assert "— 0 connected note(s)" in alone and "Capped at 1 notes" in alone
+        assert not [
+            ln for ln in alone.splitlines() if ln.startswith("- ") and "(ID: " in ln
+        ]
+        roomy = tool(note_id=g["c"].id, max_nodes=8)
+        assert "Routing (not expanded)" in roomy and self._entry(roomy, g["area"])
 
         old = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
         assert "Routing (not expanded)" not in old
@@ -500,17 +509,21 @@ class TestIntegration:
     def test_neighborhood_container_seed_lists_members_and_keeps_knowledge_edges(self):
         g = self._neighborhood_graph()
         svc = self.server.zettel_service
-        # Curated areas point at their entry notes with explicit links (an inline
-        # [[id]] to a member is not stored: the member already has has_part).
-        svc.create_link(g["area"].id, g["c"].id, LinkType.REFERENCE, "Entry note")
+        # The lane map links its own member C inline. The graph doesn't store that
+        # edge (C already has has_part), but it is still a written connection.
+        svc.update_note(g["area"].id, content=f"Lanes:\n- [[{g['c'].id}]]")
         tool = self.registered_tools["pzk_get_neighborhood"]
 
-        out = tool(note_id=g["area"].id, depth=1, max_nodes=10)
+        out = tool(note_id=g["area"].id, depth=2, max_nodes=14)
         hops, routing = out.split("Routing (not expanded):")
-        # The written link is knowledge, so C is traversed...
-        assert '-> reference: "Entry note"' in self._entry(hops, g["c"])
-        # ...and the other members are listed, capped, never left empty.
+        # C is traversed through the inline edge and expanded from there...
+        c_entry = self._entry(hops, g["c"])
+        assert f"[via {g['area'].id}:" in c_entry and "-> inline" in c_entry
+        assert f"[via {g['c'].id}: -> refines:" in self._entry(hops, g["k1"])
+        # ...and the other members fill the rest of the budget, never left empty.
         assert "Sibling 00" in routing and "more; list them with" in routing
+        shown = [ln for ln in out.splitlines() if ln.startswith("- ") and "(ID: " in ln]
+        assert len(shown) == 14 - 1  # every listed note counts toward max_nodes
 
         # A written link to the area makes the pair traversable from the note,
         # and the area then expands through its knowledge edges only.

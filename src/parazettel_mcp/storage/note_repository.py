@@ -999,6 +999,14 @@ class NoteRepository(Repository[Note]):
         return links
 
     @staticmethod
+    def inline_targets(note: Note) -> List[str]:
+        """Every note ID ``[[linked]]`` in *note*'s prose, including targets it
+        also links explicitly — which ``inline_refs`` leaves out to avoid a
+        duplicate graph edge (e.g. an area's lane map naming its own members).
+        """
+        return NoteRepository._parse_inline_refs(note.id, note.content, [])
+
+    @staticmethod
     def _parse_inline_refs(
         note_id: str, content: str, links: List[Link]
     ) -> List[str]:
