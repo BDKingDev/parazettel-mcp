@@ -4,6 +4,8 @@ import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
 
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
@@ -1194,6 +1196,54 @@ class TestMcpServer:
         assert "has_part: aaa" in out_with
         assert "link(s) hidden" not in out_with
 
+    def _get_note_output(self, content, note_type=NoteType.AREA, **kwargs):
+        note = MagicMock()
+        note.id = "n1"
+        note.content = content
+        note.note_type = note_type
+        note.project_id = None
+        note.area_id = None
+        note.created_at.isoformat.return_value = "2026-01-01T00:00:00"
+        note.updated_at.isoformat.return_value = "2026-01-02T00:00:00"
+        note.tags = []
+        self.mock_zettel_service.get_note.return_value = note
+        return self.registered_tools["pzk_get_note"](identifier="n1", **kwargs)
+
+    _NOTE_HEADER = (
+        "ID: n1\nType: {type}\nCreated: 2026-01-01T00:00:00\n"
+        "Updated: 2026-01-02T00:00:00\n"
+    )
+
+    def test_get_note_announces_a_prose_only_links_section(self):
+        content = "# Area X\n\nBody.\n\n## Links\n\nI curate these by hand.\n"
+        out = self._get_note_output(content)
+        assert "I curate these by hand." not in out
+        assert out.endswith(
+            "\n[Links section hidden — explore with pzk_get_linked_notes, "
+            "or re-fetch with include_links=true]\n"
+        )
+        assert "I curate these by hand." in self._get_note_output(
+            content, include_links=True
+        )
+
+    def test_get_note_output_unchanged_for_list_links_and_no_links(self):
+        """Pinned to the exact pre-amendment output (also passes on 1c4b529)."""
+        listed = self._get_note_output(
+            "# Area X\n\nThe area body.\n\n## Links\n- has_part: aaa\n"
+        )
+        assert listed == (
+            self._NOTE_HEADER.format(type="area")
+            + "\n# Area X\n\nThe area body.\n\n"
+            + "\n[1 link(s) hidden — explore with pzk_get_linked_notes / "
+            "pzk_get_neighborhood, or re-fetch with include_links=true]\n"
+        )
+        plain = self._get_note_output(
+            "# Note\n\nJust prose.\n", note_type=NoteType.PERMANENT
+        )
+        assert plain == (
+            self._NOTE_HEADER.format(type="permanent") + "\n# Note\n\nJust prose.\n\n"
+        )
+
     def test_suggest_tags_formats_ranked_results(self):
         """pzk_suggest_tags renders the ranked (tag, similarity) pairs."""
         self.mock_zettel_service.suggest_tags.return_value = [
@@ -2337,3 +2387,27 @@ class TestMcpServer:
         general_error = Exception("Something went wrong")
         result = self.server.format_error_response(general_error)
         assert "An unexpected error occurred. Error ID:" in result
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Scope.\n\n## Links\n- has_part [[20260101T000000000000000]]\n",
+        "Scope.\n\n## Links\nProse only.\n",
+        "Scope with no section at all.\n",
+        "The text ## Links in a sentence.\n",
+        "Scope.\n\n## links\n- https://example.com reading\n",
+        "Scope.\n\n~~~\n## Links\n- related [[x]]\n~~~\n\nAfter.\n",
+    ],
+    ids=["entries", "prose-only", "none", "prose-mention", "lowercase", "fenced"],
+)
+def test_container_notice_matches_what_was_hidden(content):
+    """The hidden-section notice appears exactly when the stripper hid something,
+    whichever heading rule the stripper applies."""
+    from parazettel_mcp.server.mcp_server import _container_body, _strip_links_section
+
+    shown, _ = _strip_links_section(content)
+    hid_something = shown.rstrip() != content.rstrip()
+    body = _container_body("20260101T000000000000001", content)
+    assert ("Links section — see pzk_get_linked_notes" in body) is hid_something
+    assert body.startswith(shown)

@@ -96,6 +96,36 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
         stripped += "\n"
     return stripped, hidden
 
+
+def _has_links_section(content: str) -> bool:
+    """Whether _strip_links_section removes a ``## Links`` section from *content*.
+
+    Asks the stripper itself rather than matching the heading separately, so
+    the hidden-section notice can never disagree with what was hidden.
+    """
+    shown, _ = _strip_links_section(content)
+    return shown.rstrip() != "\n".join(content.splitlines()).rstrip()
+
+
+def _container_body(note_id: str, content: str) -> str:
+    """Area/project body for display, with ``## Links`` hidden as pzk_get_note does.
+
+    A container's ``## Links`` holds one line per member, so for a busy area it
+    is nearly all of the note. Whatever the section holds — list lines or prose —
+    its removal is announced. These tools have no include_links flag, so the
+    notice points at pzk_get_note for the full section.
+    """
+    body, hidden = _strip_links_section(content)
+    if _has_links_section(content):
+        what = f"{hidden} link(s) hidden with the" if hidden else "Hidden:"
+        body += (
+            f"\n[{what} Links section — see pzk_get_linked_notes('{note_id}') "
+            "for direction and stored descriptions, or "
+            f"pzk_get_note('{note_id}', include_links=true) for the full "
+            "section]\n"
+        )
+    return body
+
 # Operating manual injected into every MCP client session. This is the one
 # piece of documentation the calling model is guaranteed to see, so the
 # empirically-derived usage rules live here rather than only in the README.
@@ -608,6 +638,12 @@ class ZettelkastenMcpServer:
             result += (
                 f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
                 "pzk_get_neighborhood, or re-fetch with include_links=true]\n"
+            )
+        elif not include_links and _has_links_section(note.content):
+            # A hand-written section with no list lines: still say it was hidden.
+            result += (
+                "\n[Links section hidden — explore with pzk_get_linked_notes, "
+                "or re-fetch with include_links=true]\n"
             )
         return result
 
@@ -2501,7 +2537,7 @@ class ZettelkastenMcpServer:
                         )
                 else:
                     out += "- None\n"
-                out += f"\n\n{project.content}\n"
+                out += f"\n\n{_container_body(project.id, project.content)}\n"
                 return out
             except Exception as e:
                 return self.format_error_response(e)
@@ -2672,7 +2708,7 @@ class ZettelkastenMcpServer:
                 if cadence:
                     out += f"Cadence: {cadence}\n"
                 out += f"Projects: {len(projects)}\n"
-                out += f"\n{area.content}\n"
+                out += f"\n{_container_body(area.id, area.content)}\n"
                 if projects:
                     out += "\n## Projects\n"
                     for p in projects:
