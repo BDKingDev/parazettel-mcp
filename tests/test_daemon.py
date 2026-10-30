@@ -863,7 +863,7 @@ def test_mcp_server_uses_daemon_backend_when_configured(
     config.daemon_port = port
     config.server_transport = "stdio"
 
-    with patch("parazettel_mcp.server.mcp_server.FastMCP", return_value=mock_mcp):
+    with patch("parazettel_mcp.server.mcp_server.MCPServer", return_value=mock_mcp):
         server = ZettelkastenMcpServer()
         try:
             area = daemon_server.zettel_service.create_area_note(
@@ -921,7 +921,7 @@ def test_mcp_server_uses_short_health_timeout_and_longer_rpc_timeout(monkeypatch
     config.daemon_rpc_timeout_seconds = 123.0
 
     monkeypatch.setattr(
-        "parazettel_mcp.server.mcp_server.FastMCP",
+        "parazettel_mcp.server.mcp_server.MCPServer",
         lambda *args, **kwargs: mock_mcp,
     )
     monkeypatch.setattr("parazettel_mcp.server.mcp_server.DaemonRpcClient", FakeClient)

@@ -67,7 +67,7 @@ class TestIntegration:
         mock_mcp = type("MockMCP", (), {})()
         mock_mcp.tool = mock_tool_decorator
 
-        with patch("parazettel_mcp.server.mcp_server.FastMCP", return_value=mock_mcp):
+        with patch("parazettel_mcp.server.mcp_server.MCPServer", return_value=mock_mcp):
             self.server = ZettelkastenMcpServer()
 
         yield

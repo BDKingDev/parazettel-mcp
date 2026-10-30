@@ -4,10 +4,10 @@ setup(
     version="0.4.0",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
-    python_requires=">=3.10",
+    python_requires=">=3.11",
     include_package_data=True,
     install_requires=[
-        "mcp[cli]>=1.2.0",
+        "mcp[cli]>=2.3.0,<3",
         "sqlalchemy>=2.0.0",
         "pydantic>=2.0.0",
         "python-frontmatter>=1.0.0",
