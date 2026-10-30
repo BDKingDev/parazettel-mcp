@@ -126,9 +126,9 @@ _NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
 # Hidden in Obsidian preview; lets link created_at survive rebuilds.
 _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 
-# Matches an actual "## Links" heading line (not the literal text in prose), so
-# splitting a note body on it can't be tripped by an in-prose mention.
-_LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
+# The Links heading exactly as the writer emits it, with up to three leading
+# spaces (four or more makes the line indented code) and trailing whitespace.
+_LINKS_HEADING_LINE_RE = re.compile(r" {0,3}## Links\s*")
 
 def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
     key = (path_str, mtime_ns)
@@ -270,6 +270,84 @@ def _db_dict_to_note(
             else None
         ),
     )
+
+
+_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+
+def _fenced_lines(lines: List[str]) -> List[bool]:
+    """Mark each line that is a fence or inside fenced code.
+
+    A fence opens on three or more backticks or tildes and closes on a line of
+    only the same character, at least as long (so a ```` fence can show ```).
+    An opener that never closes is treated as plain text, so a stray fence
+    can't hide what follows it, such as the generated Links section.
+    """
+    fenced = [False] * len(lines)
+    i = 0
+    while i < len(lines):
+        opener = _FENCE_OPEN_RE.match(lines[i])
+        # A backtick fence's info string can't hold a backtick (```x``` is a span).
+        if not opener or (
+            opener.group(1)[0] == "`" and "`" in lines[i][opener.end() :]
+        ):
+            i += 1
+            continue
+        fence = opener.group(1)
+        close = re.compile(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$")
+        end = next((j for j in range(i + 1, len(lines)) if close.match(lines[j])), None)
+        if end is None:
+            i += 1  # unclosed: not a fence
+            continue
+        for j in range(i, end + 1):
+            fenced[j] = True
+        i = end + 1
+    return fenced
+
+
+def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
+    """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
+
+    The Links section starts at the heading the writer emits, ``## Links``:
+    case-sensitive, one space, up to three leading spaces and any trailing
+    whitespace, outside fenced code. It runs to the next ``## `` heading. A
+    mention in prose, a code span, a fenced example, a longer heading such as
+    ``## Links to read`` and a variant such as ``## links`` are the person's own
+    text, and so is a heading line indented four or more columns (indented
+    code), which neither starts nor ends the section. Indented ``- `` lines
+    inside the section are still entries, since after a list item that indent
+    is a nested item. The
+    parser, the writer and the update reconciler all use this one rule, so they
+    agree on what the section is. A fenced block inside the section is part of
+    it, but its lines are examples, never link entries.
+    """
+    lines = content.split("\n")
+    fenced = _fenced_lines(lines)
+    in_links = False
+    for line, is_fenced in zip(lines, fenced):
+        stripped = line.strip()
+        indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+        if not is_fenced and indent < 4:
+            if _LINKS_HEADING_LINE_RE.fullmatch(line):
+                in_links = True
+            elif in_links and stripped.startswith("## "):
+                in_links = False
+        yield line, in_links, is_fenced
+
+
+def has_links_heading(content: str) -> bool:
+    """Whether *content* has a real ``## Links`` section heading (see above)."""
+    return any(in_links for _, in_links, _ in links_section_lines(content))
+
+
+def text_before_links_section(content: str) -> str:
+    """*content* up to its real ``## Links`` heading, or all of it without one."""
+    lines: List[str] = []
+    for line, in_links, _ in links_section_lines(content):
+        if in_links:
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class NoteRepository(Repository[Note]):
@@ -574,17 +652,21 @@ class NoteRepository(Repository[Note]):
             # id-shaped target no longer exists on disk. Informational — these
             # don't affect file/index sync, but each is a broken thread in the
             # knowledge graph.
-            for match in _WIKI_LINK_RE.finditer(file_body):
-                target_id = _normalize_wiki_target(match.group(1))
-                if (
-                    _NOTE_ID_RE.match(target_id)
-                    and target_id != note_id
-                    and target_id not in file_stems
-                ):
-                    entry = f"{note_id} -> {target_id}"
-                    if entry not in seen_dangling:
-                        seen_dangling.add(entry)
-                        dangling_refs.append(entry)
+            # Fenced code is an example, not a reference.
+            for line, _, is_fenced in links_section_lines(file_body):
+                if is_fenced:
+                    continue
+                for match in _WIKI_LINK_RE.finditer(line):
+                    target_id = _normalize_wiki_target(match.group(1))
+                    if (
+                        _NOTE_ID_RE.match(target_id)
+                        and target_id != note_id
+                        and target_id not in file_stems
+                    ):
+                        entry = f"{note_id} -> {target_id}"
+                        if entry not in seen_dangling:
+                            seen_dangling.add(entry)
+                            dangling_refs.append(entry)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
         return {
@@ -937,16 +1019,9 @@ class NoteRepository(Repository[Note]):
         """
         links: List[Link] = []
         seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        links_section = False
-        for line in content.split("\n"):
-            line = line.strip()
-            if line.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and line.startswith("## "):
-                links_section = False
-                continue
-            if links_section and line.startswith("- "):
+        for raw_line, in_links_section, is_fenced in links_section_lines(content):
+            line = raw_line.strip()
+            if in_links_section and not is_fenced and line.startswith("- "):
                 try:
                     line_content = line.strip()
                     if "[[" in line_content and "]]" in line_content:
@@ -1007,7 +1082,8 @@ class NoteRepository(Repository[Note]):
         Only id-shaped targets count — a ``[[Some Title]]`` style link is not a
         managed reference. Targets already covered by an explicit ## Links entry
         are skipped so the graph doesn't grow a duplicate edge. Fenced code
-        blocks are ignored.
+        blocks are ignored, by the same fence and heading rules as the Links
+        section parser.
         """
         # Exclude INLINE links: a graph-sourced Note carries its inline edges in
         # ``links`` too, and treating those as "explicit" would suppress
@@ -1018,21 +1094,8 @@ class NoteRepository(Repository[Note]):
         }
         refs: List[str] = []
         seen: Set[str] = set()
-        links_section = False
-        in_code_fence = False
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
-                continue
-            if in_code_fence:
-                continue
-            if stripped.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and stripped.startswith("## "):
-                links_section = False
-            if links_section:
+        for line, in_links_section, is_fenced in links_section_lines(content):
+            if in_links_section or is_fenced:
                 continue
             for match in _WIKI_LINK_RE.finditer(line):
                 target_id = _normalize_wiki_target(match.group(1))
@@ -1082,16 +1145,12 @@ class NoteRepository(Repository[Note]):
             metadata["last_verified"] = note.last_verified.isoformat()
         metadata.update(note.metadata)
 
-        content_parts = []
-        skip_section = False
-        for line in note.content.split("\n"):
-            if line.strip() == "## Links":
-                skip_section = True
-                continue
-            elif skip_section and line.startswith("## "):
-                skip_section = False
-            if not skip_section:
-                content_parts.append(line)
+        # Drop the old Links section; it is re-rendered from note.links below.
+        content_parts = [
+            line
+            for line, in_links_section, _ in links_section_lines(note.content)
+            if not in_links_section
+        ]
 
         content = "\n".join(content_parts).rstrip()
         content = self._ensure_title_heading(content, note.title)
@@ -1214,10 +1273,11 @@ class NoteRepository(Repository[Note]):
         lines are IDs and titles of OTHER notes, so they dilute the vector —
         and a container note (an area lists every direct member as a has_part
         line) would otherwise embed as a soup of member titles instead of its
-        own meaning. Only an actual ``## Links`` heading line is matched, so the
-        literal text appearing in prose never truncates the body.
+        own meaning. Only a real ``## Links`` heading counts (see
+        ``links_section_lines``), so the text in prose or a fenced example
+        never truncates the body.
         """
-        body = _LINKS_HEADING_RE.split(note.content or "", maxsplit=1)[0]
+        body = text_before_links_section(note.content or "")
         return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod

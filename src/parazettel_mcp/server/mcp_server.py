@@ -27,6 +27,7 @@ from parazettel_mcp.models.schema import (
 from parazettel_mcp.services.reranker import RerankerError, reranker_enabled
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
+from parazettel_mcp.storage.note_repository import links_section_lines
 
 logger = logging.getLogger(__name__)
 
@@ -68,29 +69,26 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
     lines that bloat context every time the note is read. This drops that section
     (heading through the next ``## `` heading or EOF) and returns
     ``(stripped_content, hidden_link_count)``. Inline ``[[id]]`` references in
-    prose are left untouched — only the structured section is removed.
+    prose are left untouched — only the structured section is removed. The
+    section is found by the same rule storage uses, so a fenced example of a
+    ``## Links`` heading stays visible.
     """
-    lines = content.splitlines()
     out: List[str] = []
     hidden = 0
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        if line.strip().lower() == "## links":
-            j = i + 1
-            while j < n and not lines[j].lstrip().startswith("## "):
-                if lines[j].strip().startswith("- "):
-                    hidden += 1
-                j += 1
+    in_section = False
+    for line, in_links, is_fenced in links_section_lines(
+        "\n".join(content.splitlines())
+    ):
+        if in_links and not in_section:
             # Drop any blank lines we already emitted just before the heading so
             # the body doesn't end with a dangling gap.
             while out and out[-1].strip() == "":
                 out.pop()
-            i = j
-            continue
-        out.append(line)
-        i += 1
+        in_section = in_links
+        if not in_links:
+            out.append(line)
+        elif not is_fenced and line.strip().startswith("- "):
+            hidden += 1
     stripped = "\n".join(out).rstrip()
     if stripped:
         stripped += "\n"
