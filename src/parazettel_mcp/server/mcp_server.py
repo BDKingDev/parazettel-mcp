@@ -758,9 +758,10 @@ class ZettelkastenMcpServer:
         link order, from a per-request index (a container has one link per
         member, so rescanning them per neighbor would be quadratic). Inline
         edges come from the prose (*inline_of*), not the stored graph, which
-        skips an inline ref whose target is also linked explicitly; a
-        container's inline ref to its own member is routing
-        (``ZettelService.is_routing_inline_ref``), but stays in the label.
+        skips an inline ref whose target is also linked explicitly; an inline
+        ref between a container and its own member, in either direction, is
+        routing (``ZettelService.is_routing_inline_ref``), but stays in the
+        label.
         """
         edges: List[Tuple[str, str, Optional[str], bool]] = []
         for arrow, src, dst in (("->", node, neighbor), ("<-", neighbor, node)):
@@ -2851,11 +2852,12 @@ class ZettelkastenMcpServer:
             stable.
 
             PARA routing links (part_of/has_part/blocks, a note's plain
-            reference to its own area, and an area's or project's inline
-            [[id]] to a note filed under it, such as a lane map) are not
-            traversed, because an area links to every note filed under it. The
-            center's own routing neighbors — its area/project, or a container's
-            members — are listed once under "Routing" without being expanded.
+            reference to its own area, a note's inline [[id]] to its own area
+            or project, and an area's or project's inline [[id]] to a note
+            filed under it, such as a lane map) are not traversed, because an
+            area links to every note filed under it. The center's own routing
+            neighbors — its area/project, or a container's members — are
+            listed once under "Routing" without being expanded.
 
             Args:
                 note_id: ID or title of the center note

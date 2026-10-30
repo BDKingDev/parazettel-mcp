@@ -1292,21 +1292,25 @@ class ZettelService:
 
     @staticmethod
     def is_routing_inline_ref(source: Note, target: Note) -> bool:
-        """True when *source* is an area or project and its inline ``[[id]]`` ref
-        points at a note filed under it: a lane map naming its own members.
+        """True when an inline ``[[id]]`` ref only says where a note is filed:
+        an area or project naming a note filed under it (a lane map naming its
+        own members), or a note naming its own area or project in its prose.
 
         This mirrors the member's plain reference to its own area in
-        ``is_routing_link``: both say "this note is filed here", not "these two
-        ideas connect", so a container doesn't become expandable through its
-        own lane map. ``_knowledge_link_targets`` is broader on purpose (it
-        drops every link type to the note's own area, for similarity scoring);
-        the two rules answer different questions, so don't unify them.
+        ``is_routing_link``: each says "this note is filed here", not "these two
+        ideas connect", so no sibling is reached only through the container.
+        ``_knowledge_link_targets`` is broader on purpose (it drops every link
+        type to the note's own area, for similarity scoring); the two rules
+        answer different questions, so don't unify them.
         """
-        return (
-            source.note_type in (NoteType.AREA, NoteType.PROJECT)
-            and target.id != source.id
-            and source.id in (target.area_id, target.project_id)
-        )
+        if target.id == source.id:
+            return False
+        if target.id in (source.area_id, source.project_id):
+            return True
+        return source.note_type in (
+            NoteType.AREA,
+            NoteType.PROJECT,
+        ) and source.id in (target.area_id, target.project_id)
 
     @classmethod
     def _knowledge_link_targets(cls, note: Note) -> Set[str]:

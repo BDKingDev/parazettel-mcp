@@ -561,3 +561,12 @@ class TestIntegration:
         assert "[via " in area_entry and "-> supports" in area_entry
         entries = [ln for ln in from_k3.splitlines() if ln.startswith("- ")]
         assert entries and not any("Sibling" in ln for ln in entries)
+
+        # The mirror: a member naming its own area in prose is filing too, so
+        # it isn't reached through the area from K3 or "connected" to the area.
+        s0 = next(n for n in svc.get_all_notes() if n.title == "Sibling 00")
+        svc.update_note(s0.id, content=f"Filed under [[{g['area'].id}]].")
+        assert self._entry(tool(note_id=g["k3"].id, depth=2), s0) is None
+        from_area = tool(note_id=g["area"].id, depth=2, max_nodes=60)
+        s0_entry = self._entry(from_area.split("Routing (not expanded):")[1], s0)
+        assert "<- inline (routing)" in s0_entry and "[via " not in s0_entry
