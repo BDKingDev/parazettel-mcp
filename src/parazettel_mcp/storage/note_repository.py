@@ -126,9 +126,9 @@ _NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
 # Hidden in Obsidian preview; lets link created_at survive rebuilds.
 _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 
-# Matches an actual "## Links" heading line (not the literal text in prose), so
-# splitting a note body on it can't be tripped by an in-prose mention.
-_LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
+# The Links heading exactly as the writer emits it, with up to three leading
+# spaces (four or more makes the line indented code) and trailing whitespace.
+_LINKS_HEADING_LINE_RE = re.compile(r" {0,3}## Links\s*")
 
 def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
     key = (path_str, mtime_ns)
@@ -308,13 +308,15 @@ def _fenced_lines(lines: List[str]) -> List[bool]:
 def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
     """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
 
-    The Links section starts at a line that is exactly ``## Links`` (ignoring
-    case and repeated or surrounding spaces) outside fenced code, and runs to
-    the next ``## `` heading. A mention in prose, a code span, a fenced example
-    or a longer heading such as ``## Links to read`` is ordinary text, and so is
-    a heading line indented four or more columns (indented code), which neither
-    starts nor ends the section. Indented ``- `` lines inside the section are
-    still entries, since after a list item that indent is a nested item. The
+    The Links section starts at the heading the writer emits, ``## Links``:
+    case-sensitive, one space, up to three leading spaces and any trailing
+    whitespace, outside fenced code. It runs to the next ``## `` heading. A
+    mention in prose, a code span, a fenced example, a longer heading such as
+    ``## Links to read`` and a variant such as ``## links`` are the person's own
+    text, and so is a heading line indented four or more columns (indented
+    code), which neither starts nor ends the section. Indented ``- `` lines
+    inside the section are still entries, since after a list item that indent
+    is a nested item. The
     parser, the writer and the update reconciler all use this one rule, so they
     agree on what the section is. A fenced block inside the section is part of
     it, but its lines are examples, never link entries.
@@ -326,7 +328,7 @@ def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
         stripped = line.strip()
         indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
         if not is_fenced and indent < 4:
-            if " ".join(stripped.split()).lower() == "## links":
+            if _LINKS_HEADING_LINE_RE.fullmatch(line):
                 in_links = True
             elif in_links and stripped.startswith("## "):
                 in_links = False

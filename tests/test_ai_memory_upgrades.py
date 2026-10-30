@@ -376,6 +376,31 @@ def test_links_text_that_is_not_a_heading_keeps_links(zettel_service, content):
         assert "000" not in {link.target_id for link in note.links}
 
 
+@pytest.mark.parametrize("heading", ["## links", "## LINKS", "##  Links"])
+def test_heading_variant_is_kept_as_the_persons_own_section(zettel_service, heading):
+    """A section headed like Links but not exactly is prose: the writer keeps it
+    on create and on a title-only update, and the written links stay."""
+    target = zettel_service.create_note(title="Target", content="t")
+    section = f"{heading}\n- https://example.com is useful\n- my reading list"
+    note = zettel_service.create_note(
+        title="Own Section", content=f"Body.\n\n{section}\n"
+    )
+    zettel_service.create_link(note.id, target.id, LinkType.SUPPORTS, "why")
+
+    def check():
+        current = zettel_service.get_note(note.id)
+        assert section in current.content
+        links = current.links
+        written = {(link.link_type, link.target_id, link.description) for link in links}
+        assert written == {(LinkType.SUPPORTS, target.id, "why")}
+
+    check()
+    zettel_service.update_note(note.id, title="Own Section Renamed")
+    check()
+    zettel_service.rebuild_index()
+    check()
+
+
 def test_inline_refs_to_some_linked_notes_keep_all_links(zettel_service):
     a = zettel_service.create_note(title="Inline Source", content="a")
     b = zettel_service.create_note(title="Cited Inline", content="b")
@@ -389,10 +414,11 @@ def test_inline_refs_to_some_linked_notes_keep_all_links(zettel_service):
     assert {b.id, c.id} <= targets
 
 
-@pytest.mark.parametrize("heading", ["## Links", "## links", "  ##  Links  "])
+@pytest.mark.parametrize("heading", ["## Links", "   ## Links", "## Links  "])
 def test_real_links_heading_still_reconciles(zettel_service, heading):
-    """A real heading (any case or spacing) is the Links section: its entries are
-    the note's links, and an empty one clears them (routing links stay)."""
+    """The heading as the writer emits it (up to three leading spaces, trailing
+    spaces) is the Links section: its entries are the note's links, and an
+    empty one clears them (routing links stay)."""
     area = zettel_service.create_area_note(title="Area", content="a")
     a = zettel_service.create_note(title="Edited", content="a", area_id=area.id)
     b = zettel_service.create_note(title="Old Target", content="b")
@@ -423,6 +449,9 @@ def test_links_heading_detection_follows_fence_rules():
     # Inside a closed fence of either kind, the heading is an example.
     assert not has_links_heading("~~~\n## Links\n~~~\n")
     assert not has_links_heading("````\n```\n## Links\n```\n````\n")
+    # Only the exact heading counts; variants are the person's own sections.
+    for variant in ("## links", "## LINKS", "##  Links", "## Links:"):
+        assert not has_links_heading(f"Body.\n\n{variant}\n- related [[x]]")
     # Up to three spaces of indent is still a heading; four is indented code.
     assert has_links_heading("Body.\n\n   ## Links\n- related [[x]]")
     assert not has_links_heading("Example:\n\n    ## Links\n    - related [[x]]")
