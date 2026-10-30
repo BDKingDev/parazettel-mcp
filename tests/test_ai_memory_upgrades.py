@@ -92,6 +92,31 @@ def test_inline_ref_is_indexed_as_graph_edge(zettel_service):
     )[1]
 
 
+@pytest.mark.parametrize(
+    "template, indexed",
+    [
+        ("~~~\nexample [[{id}]]\n~~~\n", False),
+        ("````\n```\nexample [[{id}]]\n```\n````\n", False),
+        ("Use ```x``` inline, then see [[{id}]].\n", True),
+        ("## Links to read later\n- [[{id}]]\n", True),
+    ],
+    ids=["tilde-fence", "long-fence", "code-span", "longer-heading"],
+)
+def test_inline_refs_follow_fence_and_heading_rules(zettel_service, template, indexed):
+    """Inline refs use the Links section's rules: fenced examples are not refs,
+    while a code span or a heading that only starts with "Links" is prose."""
+    target = zettel_service.create_note(title="Inline Target", content="T.")
+    source = zettel_service.create_note(
+        title="Inline Source", content="Body.\n\n" + template.format(id=target.id)
+    )
+
+    outgoing = zettel_service.get_linked_notes(source.id, "outgoing")
+    assert (target.id in {n.id for n in outgoing}) is indexed
+    zettel_service.rebuild_index()
+    outgoing = zettel_service.get_linked_notes(source.id, "outgoing")
+    assert (target.id in {n.id for n in outgoing}) is indexed
+
+
 def test_inline_ref_scrubbed_on_delete(zettel_service):
     """Inline prose refs to a deleted note are scrubbed, leaving readable alias/title text."""
     target = zettel_service.create_note(title="Doomed Note", content="T.")

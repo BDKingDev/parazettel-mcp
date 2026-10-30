@@ -1062,7 +1062,8 @@ class NoteRepository(Repository[Note]):
         Only id-shaped targets count — a ``[[Some Title]]`` style link is not a
         managed reference. Targets already covered by an explicit ## Links entry
         are skipped so the graph doesn't grow a duplicate edge. Fenced code
-        blocks are ignored.
+        blocks are ignored, by the same fence and heading rules as the Links
+        section parser.
         """
         # Exclude INLINE links: a graph-sourced Note carries its inline edges in
         # ``links`` too, and treating those as "explicit" would suppress
@@ -1073,21 +1074,8 @@ class NoteRepository(Repository[Note]):
         }
         refs: List[str] = []
         seen: Set[str] = set()
-        links_section = False
-        in_code_fence = False
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
-                continue
-            if in_code_fence:
-                continue
-            if stripped.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and stripped.startswith("## "):
-                links_section = False
-            if links_section:
+        for line, in_links_section, is_fenced in _links_section_lines(content):
+            if in_links_section or is_fenced:
                 continue
             for match in _WIKI_LINK_RE.finditer(line):
                 target_id = _normalize_wiki_target(match.group(1))
