@@ -496,6 +496,41 @@ def test_deleting_project_clears_member_associations_both_layers(para):
     assert "edited" in service.update_note(sub.id, content="edited").content
 
 
+@pytest.mark.parametrize("same_area", [True, False], ids=["same-area", "other-area"])
+def test_reassigning_task_after_project_delete_moves_containment(para, same_area):
+    """A task whose project was deleted moves out of its area when reassigned."""
+    service, area, project = para
+    task = service.create_task(title="Moving Task", content="t", project_id=project.id)
+    other_area = service.create_area_note(title="Other Area", content="oa")
+    target = service.create_project_note(
+        title="Target", content="p", area_id=area.id if same_area else other_area.id
+    )
+    new_area = area if same_area else other_area
+    service.delete_note(project.id)
+    # Priority-only edits keep the projectless task in its area.
+    service.update_task(task.id, priority=2)
+    assert edge_types(service, task.id, area.id) == {"part_of", "reference"}
+
+    service.update_task(task.id, project_id=target.id)
+
+    def assert_moved():
+        assert service.get_note(task.id).area_id == new_area.id
+        section = links_section(service, task.id)
+        assert f"part_of [[{target.id}" in section
+        assert f"part_of [[{area.id}" not in section
+        assert edge_types(service, task.id, target.id) == {"part_of"}
+        assert edge_types(service, target.id, task.id) == {"has_part"}
+        assert edge_types(service, area.id, task.id) == set()
+        assert f"has_part [[{task.id}" not in links_section(service, area.id)
+        assert edge_types(service, task.id, new_area.id) == {"reference"}
+        if not same_area:
+            assert edge_types(service, task.id, area.id) == set()
+
+    assert_moved()
+    service.rebuild_index()
+    assert_moved()
+
+
 def test_deleting_project_skips_unreadable_member(para, caplog):
     """A member corrupted after indexing is left untouched and doesn't block the delete."""
     service, area, project = para

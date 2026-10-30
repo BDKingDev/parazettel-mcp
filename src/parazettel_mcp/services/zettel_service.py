@@ -1513,6 +1513,7 @@ class ZettelService:
             )
 
         previous_project_id = task.project_id
+        previous_area_id = task.area_id
         if project_id is not _UNSET:
             if not project_id:
                 raise ValueError(
@@ -1551,8 +1552,16 @@ class ZettelService:
         if any(value is not _UNSET for value in pending_updates.values()):
             task.updated_at = datetime.datetime.now()
             task = self.repository.update(task)
+            if previous_area_id != task.area_id:
+                task = self._sync_area_reference_link(
+                    task.id, previous_area_id, task.area_id
+                )
+            # Like _update_note_locked, PART_OF follows the effective container:
+            # the project, or the area for a task whose project was deleted.
             task = self._sync_part_of_link(
-                task.id, previous_project_id, task.project_id
+                task.id,
+                previous_project_id or previous_area_id,
+                task.project_id or task.area_id,
             )
 
         if status is not _UNSET:
