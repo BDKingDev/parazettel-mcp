@@ -309,10 +309,12 @@ def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
     """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
 
     The Links section starts at a line that is exactly ``## Links`` (ignoring
-    case and repeated or surrounding spaces, but indented less than four columns,
-    as deeper indentation makes it indented code) outside fenced code, and runs to
+    case and repeated or surrounding spaces) outside fenced code, and runs to
     the next ``## `` heading. A mention in prose, a code span, a fenced example
-    or a longer heading such as ``## Links to read`` is ordinary text. The
+    or a longer heading such as ``## Links to read`` is ordinary text, and so is
+    a heading line indented four or more columns (indented code), which neither
+    starts nor ends the section. Indented ``- `` lines inside the section are
+    still entries, since after a list item that indent is a nested item. The
     parser, the writer and the update reconciler all use this one rule, so they
     agree on what the section is. A fenced block inside the section is part of
     it, but its lines are examples, never link entries.
@@ -323,8 +325,8 @@ def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
     for line, is_fenced in zip(lines, fenced):
         stripped = line.strip()
         indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
-        if not is_fenced:
-            if indent < 4 and " ".join(stripped.split()).lower() == "## links":
+        if not is_fenced and indent < 4:
+            if " ".join(stripped.split()).lower() == "## links":
                 in_links = True
             elif in_links and stripped.startswith("## "):
                 in_links = False

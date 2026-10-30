@@ -454,6 +454,30 @@ def test_fenced_example_inside_links_section_is_not_a_link(zettel_service, fence
     assert _link_pairs(zettel_service, a.id) == {(LinkType.RELATED, b.id)}
 
 
+def test_indented_code_heading_does_not_end_links_section(zettel_service):
+    """An indented "## Example" is code, so the entries after it stay links."""
+    a = zettel_service.create_note(title="Edited", content="a")
+    b = zettel_service.create_note(title="First Target", content="b")
+    c = zettel_service.create_note(title="Second Target", content="c")
+
+    zettel_service.update_note(
+        a.id,
+        content=(
+            f"Body.\n\n## Links\n- related [[{b.id}]] first\n\n"
+            f"    ## Example\n\n- supports [[{c.id}]] second\n"
+        ),
+    )
+    expected = {(LinkType.RELATED, b.id, "first"), (LinkType.SUPPORTS, c.id, "second")}
+
+    def written():
+        links = zettel_service.get_note(a.id).links
+        return {(link.link_type, link.target_id, link.description) for link in links}
+
+    assert written() == expected
+    zettel_service.rebuild_index()
+    assert written() == expected
+
+
 def test_unclosed_fence_does_not_hide_the_links_section(zettel_service):
     a = zettel_service.create_note(title="Stray Fence", content="a")
     b = zettel_service.create_note(title="Target", content="b")
