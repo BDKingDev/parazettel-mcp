@@ -495,7 +495,8 @@ class TestIntegration:
         assert self._entry(capped, g["area"]) is None
         assert "- … 1 more; list them with" in capped  # the area, not dropped silently
         alone = tool(note_id=g["c"].id, max_nodes=1)
-        assert "— 0 connected note(s)" in alone and "Capped at 1 notes" in alone
+        assert "— 0 connected, 1 routing note(s)" in alone
+        assert "Capped at 1 notes" in alone
         assert not [
             ln for ln in alone.splitlines() if ln.startswith("- ") and "(ID: " in ln
         ]
@@ -506,24 +507,51 @@ class TestIntegration:
         assert "Routing (not expanded)" not in old
         assert f"[via {g['area'].id}: -> has_part (routing);" in old  # siblings
 
+    def test_neighborhood_member_seed_does_not_expand_a_lane_mapped_area(self):
+        """A lane map naming its members doesn't reopen the sibling flood from a
+        member seed: the area is listed once under Routing and not expanded."""
+        g = self._neighborhood_graph()
+        svc = self.server.zettel_service
+        siblings = [
+            n for n in svc.get_all_notes() if n.title.startswith("Sibling")
+        ]
+        lanes = "\n".join(f"- [[{n.id}]]" for n in [g["c"], *siblings])
+        svc.update_note(g["area"].id, content=f"Lanes:\n{lanes}")
+        tool = self.registered_tools["pzk_get_neighborhood"]
+
+        out = tool(note_id=g["c"].id, depth=2)
+        assert "Sibling" not in out
+        assert out.count(f"(ID: {g['area'].id},") == 1
+        routing = out.split("Routing (not expanded):")[1]
+        area_entry = self._entry(routing, g["area"])
+        assert "<- inline" in area_entry and "[via " not in area_entry
+        assert f"[via {g['c'].id}: -> refines:" in self._entry(out, g["k1"])
+
+        # include_routing still opens the area and its members.
+        wide = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
+        assert f"[via {g['area'].id}:" in wide and "Sibling" in wide
+
     def test_neighborhood_container_seed_lists_members_and_keeps_knowledge_edges(self):
         g = self._neighborhood_graph()
         svc = self.server.zettel_service
-        # The lane map links its own member C inline. The graph doesn't store that
-        # edge (C already has has_part), but it is still a written connection.
+        # The lane map links its own member C inline. Naming a member in the
+        # container's prose is filing, like the member's reference to its area,
+        # so it is routing; the inline edge stays visible in the label.
         svc.update_note(g["area"].id, content=f"Lanes:\n- [[{g['c'].id}]]")
         tool = self.registered_tools["pzk_get_neighborhood"]
 
         out = tool(note_id=g["area"].id, depth=2, max_nodes=14)
-        hops, routing = out.split("Routing (not expanded):")
-        # C is traversed through the inline edge and expanded from there...
-        c_entry = self._entry(hops, g["c"])
-        assert f"[via {g['area'].id}:" in c_entry and "-> inline" in c_entry
-        assert f"[via {g['c'].id}: -> refines:" in self._entry(hops, g["k1"])
-        # ...and the other members fill the rest of the budget, never left empty.
+        assert "Hop 1:" not in out  # the area has no knowledge links of its own
+        routing = out.split("Routing (not expanded):")[1]
+        everyone = tool(note_id=g["area"].id, depth=2, max_nodes=60)
+        c_entry = self._entry(everyone.split("Routing (not expanded):")[1], g["c"])
+        assert "-> inline" in c_entry and "[via " not in c_entry
+        assert f"[via {g['c'].id}:" not in everyone  # C is not expanded
+        # The members fill the budget, never left empty.
         assert "Sibling 00" in routing and "more; list them with" in routing
         shown = [ln for ln in out.splitlines() if ln.startswith("- ") and "(ID: " in ln]
         assert len(shown) == 14 - 1  # every listed note counts toward max_nodes
+        assert "— 0 connected, " in out and " routing note(s)" in out
 
         # A written link to the area makes the pair traversable from the note,
         # and the area then expands through its knowledge edges only.

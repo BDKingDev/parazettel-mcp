@@ -19,6 +19,7 @@ from parazettel_mcp.daemon.client import (
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.storage.note_repository import NoteRepository
 from parazettel_mcp.models.schema import (
+    Link,
     LinkType,
     Note,
     NoteSource,
@@ -745,19 +746,26 @@ class ZettelkastenMcpServer:
 
     @staticmethod
     def _neighbor_edges(
-        node: Note, neighbor: Note, inline_of: Callable[[Note], Set[str]]
+        node: Note,
+        neighbor: Note,
+        inline_of: Callable[[Note], Set[str]],
+        links_to: Callable[[Note, str], List[Link]],
     ) -> List[Tuple[str, str, Optional[str], bool]]:
         """Every edge between *node* and *neighbor* as (arrow, type, description,
         is_routing): outgoing first in *node*'s link order, then incoming.
 
-        Inline edges come from the prose (*inline_of*), not the stored graph: the
-        graph skips an inline ref whose target is also linked explicitly, so an
-        area's lane-map link to its own member would otherwise look like routing.
+        *links_to(note, target_id)* returns note's stored links to the target, in
+        link order, from a per-request index (a container has one link per
+        member, so rescanning them per neighbor would be quadratic). Inline
+        edges come from the prose (*inline_of*), not the stored graph, which
+        skips an inline ref whose target is also linked explicitly; a
+        container's inline ref to its own member is routing
+        (``ZettelService.is_routing_inline_ref``), but stays in the label.
         """
         edges: List[Tuple[str, str, Optional[str], bool]] = []
         for arrow, src, dst in (("->", node, neighbor), ("<-", neighbor, node)):
-            for link in src.links:
-                if link.target_id != dst.id or link.link_type == LinkType.INLINE:
+            for link in links_to(src, dst.id):
+                if link.link_type == LinkType.INLINE:
                     continue
                 edges.append(
                     (
@@ -768,7 +776,8 @@ class ZettelkastenMcpServer:
                     )
                 )
             if dst.id in inline_of(src):
-                edges.append((arrow, LinkType.INLINE.value, None, False))
+                routing = ZettelService.is_routing_inline_ref(src, dst)
+                edges.append((arrow, LinkType.INLINE.value, None, routing))
         return edges
 
     @staticmethod
@@ -2841,11 +2850,12 @@ class ZettelkastenMcpServer:
             it has one. Neighbors are visited in note-ID order, so the map is
             stable.
 
-            PARA routing links (part_of/has_part/blocks and a note's plain
-            reference to its own area) are not traversed, because an area links
-            to every note filed under it. The center's own routing neighbors —
-            its area/project, or a container's members — are listed once under
-            "Routing" without being expanded.
+            PARA routing links (part_of/has_part/blocks, a note's plain
+            reference to its own area, and an area's or project's inline
+            [[id]] to a note filed under it, such as a lane map) are not
+            traversed, because an area links to every note filed under it. The
+            center's own routing neighbors — its area/project, or a container's
+            members — are listed once under "Routing" without being expanded.
 
             Args:
                 note_id: ID or title of the center note
@@ -2879,6 +2889,16 @@ class ZettelkastenMcpServer:
                         inline_cache[note.id] = set(NoteRepository.inline_targets(note))
                     return inline_cache[note.id]
 
+                links_cache: Dict[str, Dict[str, List[Link]]] = {}
+
+                def links_to(note: Note, target_id: str) -> List[Link]:
+                    if note.id not in links_cache:
+                        by_target: Dict[str, List[Link]] = {}
+                        for link in note.links:
+                            by_target.setdefault(link.target_id, []).append(link)
+                        links_cache[note.id] = by_target
+                    return links_cache[note.id].get(target_id, [])
+
                 frontier: List[Note] = [center]
                 for hop in range(1, depth + 1):
                     next_frontier: List[Note] = []
@@ -2898,7 +2918,9 @@ class ZettelkastenMcpServer:
                         for neighbor in sorted(neighbors, key=lambda n: n.id):
                             if neighbor.id in visited:
                                 continue
-                            edges = self._neighbor_edges(node, neighbor, inline_of)
+                            edges = self._neighbor_edges(
+                                node, neighbor, inline_of, links_to
+                            )
                             if (
                                 not include_routing
                                 and edges
@@ -2929,7 +2951,8 @@ class ZettelkastenMcpServer:
 
                 out = (
                     f"Neighborhood of '{center.title}' (ID: {center.id}) — "
-                    f"{len(visited) - 1} connected note(s) within {depth} hop(s):\n"
+                    f"{len(visited) - 1} connected, {len(routing)} routing "
+                    f"note(s) within {depth} hop(s):\n"
                 )
                 for hop in range(1, depth + 1):
                     at_hop = [
