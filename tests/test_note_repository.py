@@ -1,5 +1,6 @@
 """Tests for the NoteRepository class."""
 
+import os
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -552,11 +553,15 @@ def test_delete_preserves_aliases_for_remaining_links(note_repository):
         "Target content.\n",
         encoding="utf-8",
     )
+    # Explicit timestamps: without them every parse falls back to now(), so
+    # there would be no stored updated_at for the delete to preserve.
     source_path.write_text(
         "---\n"
         "id: delete-keep-source\n"
         "title: Delete Keep Source\n"
         "type: permanent\n"
+        "created: '2025-01-02T03:04:05'\n"
+        "updated: '2025-01-02T03:04:05'\n"
         "---\n"
         "# Delete Keep Source\n\n"
         "Source content.\n\n"
@@ -1274,3 +1279,130 @@ def test_rebuild_invalidates_cached_vectors_even_without_embeddings(note_reposit
     note_repository.rebuild_index()
     with note_repository._connection() as conn:
         assert get_counter(conn, EMBEDDING_GENERATION_KEY) > before
+
+
+@pytest.mark.parametrize("edit", ["in_place", "replace"])
+def test_get_sees_external_edit_with_same_size_and_timestamp(note_repository, edit):
+    """An external edit within one timestamp tick, keeping the size, is still read.
+
+    Restoring the original mtime makes the edit invisible to size and mtime
+    checks alike, so only the file's bytes can tell the notes apart.
+    """
+    note = note_repository.create(
+        Note(title="Fresh read", content="state alpha", note_type=NoteType.PERMANENT)
+    )
+    path = note_repository.notes_dir / f"{note.id}.md"
+    assert "state alpha" in note_repository.get(note.id).content
+
+    before = path.stat()
+    edited = path.read_text(encoding="utf-8").replace("state alpha", "state omega")
+    if edit == "in_place":
+        path.write_text(edited, encoding="utf-8")
+    else:
+        replacement = path.with_suffix(".tmp")
+        replacement.write_text(edited, encoding="utf-8")
+        os.replace(replacement, path)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+    assert "state omega" in note_repository.get(note.id).content
+
+
+def test_update_after_same_tick_external_edit_keeps_the_edit(note_repository):
+    """A read-modify-write that starts after an external edit must build on it.
+
+    With a stale read the update would rewrite the old body over the edit.
+    This covers reads that start after the edit; an edit landing between the
+    read and the write is a separate race that a read path can't close.
+    """
+    note = note_repository.create(
+        Note(
+            title="Edit then update",
+            content="state alpha",
+            note_type=NoteType.PERMANENT,
+        )
+    )
+    path = note_repository.notes_dir / f"{note.id}.md"
+    note_repository.get(note.id)
+    before = path.stat()
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("state alpha", "state omega"),
+        encoding="utf-8",
+    )
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+
+    current = note_repository.get(note.id)
+    current.tags.append(Tag(name="touched"))
+    note_repository.update(current)
+
+    on_disk = path.read_text(encoding="utf-8")
+    assert "state omega" in on_disk and "state alpha" not in on_disk
+    assert "touched" in on_disk
+
+
+def _write_external_note(note_repository, note_id, frontmatter_extra=""):
+    path = note_repository.notes_dir / f"{note_id}.md"
+    path.write_text(
+        f"---\nid: {note_id}\ntitle: External {note_id}\ntype: permanent\n"
+        f"{frontmatter_extra}---\n# External {note_id}\n\nBody.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_missing_timestamps_fall_back_to_the_file_mtime(note_repository):
+    """Without created/updated, every read and the index use the file's mtime,
+    so repeated reads of an unchanged file agree with each other and the index."""
+    import datetime
+
+    path = _write_external_note(note_repository, "20260101T000000000000001")
+    stamp = datetime.datetime(2026, 1, 2, 3, 4, 5)
+    os.utime(path, (stamp.timestamp(), stamp.timestamp()))
+    note_repository.rebuild_index()
+
+    first = note_repository.get("20260101T000000000000001")
+    second = note_repository.get("20260101T000000000000001")
+    assert first.created_at == second.created_at == stamp
+    assert first.updated_at == second.updated_at == stamp
+    indexed = next(
+        n for n in note_repository.get_all() if n.id == "20260101T000000000000001"
+    )
+    assert (indexed.created_at, indexed.updated_at) == (stamp, stamp)
+
+
+def test_explicit_timestamps_ignore_the_file_mtime(note_repository):
+    import datetime
+
+    path = _write_external_note(
+        note_repository,
+        "20260101T000000000000002",
+        "created: '2025-05-05T05:05:05'\nupdated: '2025-06-06T06:06:06'\n",
+    )
+    os.utime(path, (1_800_000_000, 1_800_000_000))
+    note = note_repository.get("20260101T000000000000002")
+    assert note.created_at == datetime.datetime(2025, 5, 5, 5, 5, 5)
+    assert note.updated_at == datetime.datetime(2025, 6, 6, 6, 6, 6)
+
+
+def test_get_refuses_a_file_whose_frontmatter_id_names_another_note(note_repository):
+    """A.md whose frontmatter says id B must not be returned as B: an update would
+    write it over B.md. The read fails and B.md stays byte-identical."""
+    a = note_repository.create(
+        Note(title="Alpha note", content="alpha body", note_type=NoteType.PERMANENT)
+    )
+    b = note_repository.create(
+        Note(title="Bravo note", content="bravo body", note_type=NoteType.PERMANENT)
+    )
+    path_a = note_repository.notes_dir / f"{a.id}.md"
+    path_b = note_repository.notes_dir / f"{b.id}.md"
+    path_a.write_text(
+        path_a.read_text(encoding="utf-8").replace(f"id: {a.id}", f"id: {b.id}", 1),
+        encoding="utf-8",
+    )
+    b_bytes = path_b.read_bytes()
+
+    with pytest.raises(IOError, match="frontmatter id"):
+        note_repository.get(a.id)
+    assert path_b.read_bytes() == b_bytes
+    assert note_repository.get(b.id).content.count("bravo body") == 1

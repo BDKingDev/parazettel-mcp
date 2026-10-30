@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
@@ -63,12 +63,6 @@ from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level LRU cache  {(path_str, mtime_ns): Note}
-# ---------------------------------------------------------------------------
-_NOTE_CACHE: OrderedDict = OrderedDict()
-_NOTE_CACHE_LOCK = threading.Lock()
-_NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
@@ -130,25 +124,6 @@ _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 # splitting a note body on it can't be tripped by an in-prose mention.
 _LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
 
-def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        note = _NOTE_CACHE.get(key)
-        if note is not None:
-            _NOTE_CACHE.move_to_end(key)
-            return note.model_copy(deep=True)
-    return None
-
-
-def _cache_put(path_str: str, mtime_ns: int, note: Note) -> None:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        _NOTE_CACHE[key] = note
-        _NOTE_CACHE.move_to_end(key)
-        while len(_NOTE_CACHE) > _NOTE_CACHE_MAX:
-            _NOTE_CACHE.popitem(last=False)
-
-
 def _dedupe_preserve_order(values: List[str]) -> List[str]:
     """Return values without duplicates while preserving first-seen order."""
     seen: Set[str] = set()
@@ -159,14 +134,6 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
-
-
-def _cache_evict(path_str: str) -> None:
-    """Remove all cache entries for a given file path (any mtime)."""
-    with _NOTE_CACHE_LOCK:
-        stale = [k for k in _NOTE_CACHE if k[0] == path_str]
-        for k in stale:
-            del _NOTE_CACHE[k]
 
 
 def _json_default(obj: Any) -> Any:
@@ -197,6 +164,14 @@ _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
 # Public (no underscore) because the service layer builds the rename pattern
 # from the same fragment — keeping one source of truth for the wiki-link grammar.
 WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
+
+
+def _read_note_file(file_path: Path) -> Tuple[str, datetime.datetime]:
+    """A note file's text and the modification time of those same bytes."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        modified = datetime.datetime.fromtimestamp(os.fstat(f.fileno()).st_mtime)
+    return content, modified
 
 
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
@@ -552,10 +527,7 @@ class NoteRepository(Repository[Note]):
         for note_id in sorted(common):
             file_path = self.notes_dir / f"{note_id}.md"
             try:
-                # Read the file directly, bypassing the mtime-keyed note cache: a
-                # consistency check must see the true on-disk bytes, not a cached
-                # copy that may predate an external edit landing in the same
-                # coarse mtime tick.
+                # Only the body is compared, so parse just the frontmatter split.
                 with open(file_path, "r", encoding="utf-8") as f:
                     file_body = frontmatter.loads(f.read()).content
             except Exception:
@@ -638,9 +610,8 @@ class NoteRepository(Repository[Note]):
     def _parse_rebuild_note(self, file_path: Path) -> Optional[Note]:
         """Parse one markdown file for rebuild, logging and skipping failures."""
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_note_from_markdown(content)
+            content, modified = _read_note_file(file_path)
+            return self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             logger.error("Error processing file %s: %s", file_path, e)
             return None
@@ -812,8 +783,15 @@ class NoteRepository(Repository[Note]):
             )
         return rows
 
-    def _parse_note_from_markdown(self, content: str) -> Note:
-        """Parse a note from markdown content."""
+    def _parse_note_from_markdown(
+        self, content: str, fallback_time: Optional[datetime.datetime] = None
+    ) -> Note:
+        """Parse a note from markdown content.
+
+        *fallback_time* stands in for a missing ``created`` (and so ``updated``)
+        field. Callers reading a file pass its modification time, so repeated
+        reads and the index agree; without one it is now().
+        """
         post = frontmatter.loads(content)
         metadata = post.metadata
 
@@ -849,7 +827,9 @@ class NoteRepository(Repository[Note]):
         links = self.parse_links_in_content(note_id, post.content)
         inline_refs = self._parse_inline_refs(note_id, post.content, links)
 
-        created_at = _coerce_datetime(metadata.get("created"), datetime.datetime.now())
+        created_at = _coerce_datetime(
+            metadata.get("created"), fallback_time or datetime.datetime.now()
+        )
         updated_at = _coerce_datetime(metadata.get("updated"), created_at)
 
         _action_keys = {
@@ -1834,23 +1814,29 @@ class NoteRepository(Repository[Note]):
         return note
 
     def get(self, id: str) -> Optional[Note]:
-        """Get a note by ID (reads the markdown file; uses an LRU cache)."""
+        """Get a note by ID, read and parsed from its markdown file.
+
+        Not cached: the file is the source of truth and can be edited outside
+        this process, and no stat signal (mtime, size, inode) proves the bytes
+        unchanged. The old cache was faster for repeat reads of small notes
+        (about 3x at 1 KB) but slower on a miss, and service writes don't
+        notice the difference.
+        """
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             return None
         try:
-            path_str = str(file_path)
-            mtime_ns = file_path.stat().st_mtime_ns
-            cached = _cache_get(path_str, mtime_ns)
-            if cached is not None:
-                return cached
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            note = self._parse_note_from_markdown(content)
-            _cache_put(path_str, mtime_ns, note)
-            return note.model_copy(deep=True)
+            content, modified = _read_note_file(file_path)
+            note = self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             raise IOError(f"Failed to read note {id}: {e}") from e
+        if note.id != id:
+            # Writes go to the file named by note.id, so returning this note
+            # would let an update overwrite a different note's file.
+            raise IOError(
+                f"Failed to read note {id}: its frontmatter id is {note.id!r}"
+            )
+        return note
 
     def get_by_title(self, title: str) -> Optional[Note]:
         """Get a note by exact title (indexed lookup)."""
@@ -1941,7 +1927,6 @@ class NoteRepository(Repository[Note]):
         markdown = self._note_to_markdown(note)
         file_path = self.notes_dir / f"{note.id}.md"
         self._write_markdown_atomically(file_path, markdown)
-        _cache_evict(str(file_path))
 
         rendered_body = frontmatter.loads(markdown).content
         # Re-derive inline prose refs from the body actually written, so edits
@@ -1985,7 +1970,6 @@ class NoteRepository(Repository[Note]):
 
         with self.file_lock:
             os.remove(file_path)
-        _cache_evict(str(file_path))
 
         # Match every inline form that normalizes to this id — bare, aliased,
         # and with a ".md"/"#fragment" suffix — so none dangle after delete.
