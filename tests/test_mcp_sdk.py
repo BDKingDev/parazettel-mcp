@@ -150,17 +150,25 @@ def test_direct_mode_loads_embedding_model_on_startup_thread(test_config, monkey
 class _FailingFirstQueryProvider(_ThreadRecordingProvider):
     """Fails the startup pre-warm (first query embed), then works."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.later_query_successes = 0
+
     def embed_query(self, text: str) -> list[float]:
         first = not self.threads
         result = super().embed_query(text)
         if first:
             raise RuntimeError("model download failed")
+        self.later_query_successes += 1
         return result
 
 
 def test_direct_mode_survives_failed_embedding_prewarm(
     test_config, monkeypatch, caplog
 ):
+    """A failed pre-warm leaves embeddings working: a later semantic query
+    embeds successfully and finds the note created after the failure."""
+    monkeypatch.setattr(config, "embedding_enabled", True)
     provider = _FailingFirstQueryProvider()
     monkeypatch.setattr(
         "parazettel_mcp.storage.note_repository.build_embedding_provider",
@@ -171,16 +179,26 @@ def test_direct_mode_survives_failed_embedding_prewarm(
 
         async def scenario():
             async with Client(server.mcp) as client:
-                return await client.call_tool(
+                created = await client.call_tool(
                     "pzk_create_area", {"title": "After failed warmup", "content": "x"}
                 )
+                before_query = provider.later_query_successes
+                found = await client.call_tool(
+                    "pzk_find_similar_to_text",
+                    {"text": "After failed warmup", "threshold": 0.0},
+                )
+                return created, found, before_query
 
-        result = anyio.run(scenario)
+        created, found, before_query = anyio.run(scenario)
     finally:
         server.close()
 
     assert "Embedding model pre-warm failed" in caplog.text
-    assert "Area created successfully" in _text(result)
+    assert "Area created successfully" in _text(created)
+    # The query was embedded (the error is swallowed in vector search, so the
+    # count is what proves it) and its results include the new area.
+    assert provider.later_query_successes > before_query
+    assert "After failed warmup" in _text(found)
 
 
 def test_direct_mode_prewarm_is_a_no_op_without_embeddings(test_config, monkeypatch):
