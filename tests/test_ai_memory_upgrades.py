@@ -526,6 +526,55 @@ def test_embedding_text_keeps_prose_mention_of_links_heading(zettel_service):
     assert "zebracorn" in embed_text
 
 
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_derived_text_keeps_body_after_fenced_links_example(zettel_service, fence):
+    """Embedding text, dedup tokens and the read-side view all use the shared
+    Links rule, so a fenced ``## Links`` example doesn't cut the body."""
+    from parazettel_mcp.server.mcp_server import _strip_links_section
+
+    content = (
+        f"Intro.\n\n{fence}\n## Links\n- related [[x]] example\n{fence}\n\n"
+        "After the example, zebracorn.\n"
+    )
+    note = zettel_service.create_note(title="Fence Example", content=content)
+    note = zettel_service.get_note(note.id)
+
+    assert "zebracorn" in zettel_service.repository._embedding_text(note)
+    assert "zebracorn" in zettel_service._content_tokens(note)
+    shown, hidden = _strip_links_section(note.content)
+    assert "zebracorn" in shown and hidden == 0
+
+
+def test_embedding_text_unchanged_for_a_written_note(zettel_service):
+    """Notes the writer produces embed exactly as before the shared rule, so
+    the change doesn't invalidate stored embeddings."""
+    import re
+
+    area = zettel_service.create_area_note(title="Embed Area", content="About X.")
+    other = zettel_service.create_note(title="Other", content="o")
+    note = zettel_service.create_note(
+        title="Written", content="Line one.\n\n## Notes\nMore.", area_id=area.id
+    )
+    zettel_service.create_link(note.id, other.id, LinkType.SUPPORTS, "because")
+    for current in (zettel_service.get_note(note.id), zettel_service.get_note(area.id)):
+        body = re.split(r"(?m)^\s*##\s+Links\s*$", current.content, maxsplit=1)[0]
+        expected = f"{current.title}\n\n{body}".strip()
+        assert zettel_service.repository._embedding_text(current) == expected
+
+
+def test_consistency_ignores_fenced_dangling_refs(zettel_service):
+    """A wiki ref inside fenced code is an example, not a broken reference."""
+    shown_id = "20990101T000000000000000"
+    fenced_id = "20990101T000000000000001"
+    note = zettel_service.create_note(
+        title="Dangler",
+        content=f"Mentions [[{shown_id}]].\n\n~~~\nexample [[{fenced_id}]]\n~~~\n",
+    )
+    report = zettel_service.check_consistency()
+    assert f"{note.id} -> {shown_id}" in report["dangling_refs"]
+    assert f"{note.id} -> {fenced_id}" not in report["dangling_refs"]
+
+
 def test_to_markdown_excludes_inline_links():
     """Note.to_markdown (used by export) must not render derived INLINE links
     into the ## Links section."""

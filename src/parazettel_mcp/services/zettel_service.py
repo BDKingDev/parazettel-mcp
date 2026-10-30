@@ -26,6 +26,7 @@ from parazettel_mcp.storage.note_repository import (
     WIKI_TARGET_SUFFIX,
     NoteRepository,
     has_links_heading,
+    text_before_links_section,
 )
 
 logger = logging.getLogger(__name__)
@@ -1355,8 +1356,8 @@ class ZettelService:
         title = note.title or ""
         body = note.content or ""
         # Drop the generated ## Links section so link IDs don't dominate overlap.
-        # Match only an actual heading line, never the literal text in prose.
-        body = re.split(r"(?m)^\s*##\s+Links\s*$", body, maxsplit=1)[0]
+        # Only a real heading counts, never the text in prose or a fenced example.
+        body = text_before_links_section(body)
         text = f"{title} {body}".lower()
         tokens = re.findall(r"[a-z0-9]+", text)
         return {

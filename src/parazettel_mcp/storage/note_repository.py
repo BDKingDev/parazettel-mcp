@@ -305,7 +305,7 @@ def _fenced_lines(lines: List[str]) -> List[bool]:
     return fenced
 
 
-def _links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
+def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
     """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
 
     The Links section starts at a line that is exactly ``## Links`` (ignoring
@@ -331,7 +331,17 @@ def _links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
 
 def has_links_heading(content: str) -> bool:
     """Whether *content* has a real ``## Links`` section heading (see above)."""
-    return any(in_links for _, in_links, _ in _links_section_lines(content))
+    return any(in_links for _, in_links, _ in links_section_lines(content))
+
+
+def text_before_links_section(content: str) -> str:
+    """*content* up to its real ``## Links`` heading, or all of it without one."""
+    lines: List[str] = []
+    for line, in_links, _ in links_section_lines(content):
+        if in_links:
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class NoteRepository(Repository[Note]):
@@ -636,17 +646,21 @@ class NoteRepository(Repository[Note]):
             # id-shaped target no longer exists on disk. Informational — these
             # don't affect file/index sync, but each is a broken thread in the
             # knowledge graph.
-            for match in _WIKI_LINK_RE.finditer(file_body):
-                target_id = _normalize_wiki_target(match.group(1))
-                if (
-                    _NOTE_ID_RE.match(target_id)
-                    and target_id != note_id
-                    and target_id not in file_stems
-                ):
-                    entry = f"{note_id} -> {target_id}"
-                    if entry not in seen_dangling:
-                        seen_dangling.add(entry)
-                        dangling_refs.append(entry)
+            # Fenced code is an example, not a reference.
+            for line, _, is_fenced in links_section_lines(file_body):
+                if is_fenced:
+                    continue
+                for match in _WIKI_LINK_RE.finditer(line):
+                    target_id = _normalize_wiki_target(match.group(1))
+                    if (
+                        _NOTE_ID_RE.match(target_id)
+                        and target_id != note_id
+                        and target_id not in file_stems
+                    ):
+                        entry = f"{note_id} -> {target_id}"
+                        if entry not in seen_dangling:
+                            seen_dangling.add(entry)
+                            dangling_refs.append(entry)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
         return {
@@ -999,7 +1013,7 @@ class NoteRepository(Repository[Note]):
         """
         links: List[Link] = []
         seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        for raw_line, in_links_section, is_fenced in _links_section_lines(content):
+        for raw_line, in_links_section, is_fenced in links_section_lines(content):
             line = raw_line.strip()
             if in_links_section and not is_fenced and line.startswith("- "):
                 try:
@@ -1074,7 +1088,7 @@ class NoteRepository(Repository[Note]):
         }
         refs: List[str] = []
         seen: Set[str] = set()
-        for line, in_links_section, is_fenced in _links_section_lines(content):
+        for line, in_links_section, is_fenced in links_section_lines(content):
             if in_links_section or is_fenced:
                 continue
             for match in _WIKI_LINK_RE.finditer(line):
@@ -1128,7 +1142,7 @@ class NoteRepository(Repository[Note]):
         # Drop the old Links section; it is re-rendered from note.links below.
         content_parts = [
             line
-            for line, in_links_section, _ in _links_section_lines(note.content)
+            for line, in_links_section, _ in links_section_lines(note.content)
             if not in_links_section
         ]
 
@@ -1253,10 +1267,11 @@ class NoteRepository(Repository[Note]):
         lines are IDs and titles of OTHER notes, so they dilute the vector —
         and a container note (an area lists every direct member as a has_part
         line) would otherwise embed as a soup of member titles instead of its
-        own meaning. Only an actual ``## Links`` heading line is matched, so the
-        literal text appearing in prose never truncates the body.
+        own meaning. Only a real ``## Links`` heading counts (see
+        ``links_section_lines``), so the text in prose or a fenced example
+        never truncates the body.
         """
-        body = _LINKS_HEADING_RE.split(note.content or "", maxsplit=1)[0]
+        body = text_before_links_section(note.content or "")
         return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod
