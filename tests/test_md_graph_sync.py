@@ -204,6 +204,22 @@ def test_hand_written_created_comment_sets_edge_timestamp(zettel_service):
     ]
 
 
+def test_created_link_timestamp_matches_file_and_survives_rebuild(zettel_service):
+    """A created link's timestamp is the same in the file, the index, and after a rebuild."""
+    a = zettel_service.create_note(title="Kept A", content="a")
+    b = zettel_service.create_note(title="Kept B", content="b")
+    zettel_service.create_link(a.id, b.id, LinkType.SUPPORTS)
+
+    [indexed] = index_helpers.edge_created_at(zettel_service, a.id, b.id)
+    file_link = next(
+        lk for lk in zettel_service.get_note(a.id).links if lk.target_id == b.id
+    )
+    assert file_link.created_at == indexed
+
+    zettel_service.rebuild_index()
+    assert index_helpers.edge_created_at(zettel_service, a.id, b.id) == [indexed]
+
+
 def test_hand_edited_frontmatter_routing_propagates(zettel_service):
     """Editing area_id in frontmatter re-routes the note in the graph after a rebuild."""
     area1 = zettel_service.create_area_note(title="Area One", content="a1")
@@ -437,6 +453,102 @@ def test_subproject_wires_parent_and_area_both_layers(para):
     assert f"has_part [[{sub.id}" in links_section(service, area.id)
     assert edge_types(service, parent.id, sub.id) == {"has_part"}
     assert edge_types(service, area.id, sub.id) == {"has_part"}
+
+
+def test_deleting_project_clears_member_associations_both_layers(para):
+    """Deleting a project keeps its members, re-routed to the area and editable."""
+    service, area, project = para
+    task = service.create_task(title="Orphan Task", content="t", project_id=project.id)
+    note = service.create_note(title="Orphan Note", content="n", project_id=project.id)
+    sub = service.create_project_note(
+        title="Orphan Sub", content="s", project_id=project.id
+    )
+    sub_task = service.create_task(title="Sub Task", content="st", project_id=sub.id)
+    other = service.create_project_note(title="Other", content="o", area_id=area.id)
+    other_task = service.create_task(
+        title="Other Task", content="ot", project_id=other.id
+    )
+
+    service.delete_note(project.id)
+
+    def assert_cleared():
+        for member in (task, note, sub):
+            current = service.get_note(member.id)
+            assert current.project_id is None
+            assert current.area_id == area.id
+            assert project.id not in md_text(service, member.id)
+            assert edge_types(service, member.id, area.id) >= {"part_of", "reference"}
+            assert f"has_part [[{member.id}" in links_section(service, area.id)
+            assert edge_types(service, area.id, member.id) == {"has_part"}
+        assert service.repository.search(project_id=project.id) == []
+        # The surviving subproject keeps its own task; unrelated routing is untouched.
+        assert service.get_note(sub_task.id).project_id == sub.id
+        assert edge_types(service, sub_task.id, sub.id) == {"part_of"}
+        assert service.get_note(other_task.id).project_id == other.id
+        assert edge_types(service, other_task.id, other.id) == {"part_of"}
+
+    assert_cleared()
+    service.rebuild_index()
+    assert_cleared()
+
+    # The members are editable again through the normal update path.
+    assert "edited" in service.update_note(task.id, content="edited").content
+    assert "edited" in service.update_note(sub.id, content="edited").content
+
+
+@pytest.mark.parametrize("same_area", [True, False], ids=["same-area", "other-area"])
+def test_reassigning_task_after_project_delete_moves_containment(para, same_area):
+    """A task whose project was deleted moves out of its area when reassigned."""
+    service, area, project = para
+    task = service.create_task(title="Moving Task", content="t", project_id=project.id)
+    other_area = service.create_area_note(title="Other Area", content="oa")
+    target = service.create_project_note(
+        title="Target", content="p", area_id=area.id if same_area else other_area.id
+    )
+    new_area = area if same_area else other_area
+    service.delete_note(project.id)
+    # Priority-only edits keep the projectless task in its area.
+    service.update_task(task.id, priority=2)
+    assert edge_types(service, task.id, area.id) == {"part_of", "reference"}
+
+    service.update_task(task.id, project_id=target.id)
+
+    def assert_moved():
+        assert service.get_note(task.id).area_id == new_area.id
+        section = links_section(service, task.id)
+        assert f"part_of [[{target.id}" in section
+        assert f"part_of [[{area.id}" not in section
+        assert edge_types(service, task.id, target.id) == {"part_of"}
+        assert edge_types(service, target.id, task.id) == {"has_part"}
+        assert edge_types(service, area.id, task.id) == set()
+        assert f"has_part [[{task.id}" not in links_section(service, area.id)
+        assert edge_types(service, task.id, new_area.id) == {"reference"}
+        if not same_area:
+            assert edge_types(service, task.id, area.id) == set()
+
+    assert_moved()
+    service.rebuild_index()
+    assert_moved()
+
+
+def test_deleting_project_skips_unreadable_member(para, caplog):
+    """A member corrupted after indexing is left untouched and doesn't block the delete."""
+    service, area, project = para
+    good = service.create_task(title="Good", content="g", project_id=project.id)
+    bad = service.create_task(title="Bad", content="b", project_id=project.id)
+    corrupt = "---\ntitle: [unclosed\n---\n"
+    write_md(service, bad.id, corrupt)
+
+    with caplog.at_level("WARNING"):
+        service.delete_note(project.id)
+
+    assert service.get_note(project.id) is None
+    assert service.get_note(good.id).project_id is None
+    assert md_text(service, bad.id) == corrupt
+    assert any(
+        "Could not clear project" in r.getMessage() and bad.id in r.getMessage()
+        for r in caplog.records
+    )
 
 
 # ---------------------------------------------------------------------------
