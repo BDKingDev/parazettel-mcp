@@ -1276,6 +1276,43 @@ class ZettelService:
     )
 
     @classmethod
+    def is_routing_link(cls, note: Note, link: Link) -> bool:
+        """True for a PARA/GTD routing edge rather than a written connection:
+        part_of/has_part/blocks*, or the plain reference *note* carries to its
+        own area. Any other link type to the area (supports, extends, ...) is
+        still knowledge.
+        """
+        if link.link_type in cls._ROUTING_LINK_TYPES:
+            return True
+        return (
+            link.link_type == LinkType.REFERENCE
+            and bool(note.area_id)
+            and link.target_id == note.area_id
+        )
+
+    @staticmethod
+    def is_routing_inline_ref(source: Note, target: Note) -> bool:
+        """True when an inline ``[[id]]`` ref only says where a note is filed:
+        an area or project naming a note filed under it (a lane map naming its
+        own members), or a note naming its own area or project in its prose.
+
+        This mirrors the member's plain reference to its own area in
+        ``is_routing_link``: each says "this note is filed here", not "these two
+        ideas connect", so no sibling is reached only through the container.
+        ``_knowledge_link_targets`` is broader on purpose (it drops every link
+        type to the note's own area, for similarity scoring); the two rules
+        answer different questions, so don't unify them.
+        """
+        if target.id == source.id:
+            return False
+        if target.id in (source.area_id, source.project_id):
+            return True
+        return source.note_type in (
+            NoteType.AREA,
+            NoteType.PROJECT,
+        ) and source.id in (target.area_id, target.project_id)
+
+    @classmethod
     def _knowledge_link_targets(cls, note: Note) -> Set[str]:
         """Return target ids of a note's genuine knowledge links.
 

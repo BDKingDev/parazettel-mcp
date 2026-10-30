@@ -1158,11 +1158,12 @@ Embeds arbitrary text (no existing note needed) and returns notes by calibrated 
 {
   "note_id": "{NOTE_ID}",
   "depth": 2,
-  "max_nodes": 25
+  "max_nodes": 25,
+  "include_routing": false
 }
 ```
 
-Maps the linked neighborhood around a note, grouped by hop distance (includes inline prose refs). Use for synthesis ("what do I know around X?") instead of chaining `pzk_get_linked_notes` calls.
+Maps the knowledge-link neighborhood around a note, grouped by hop distance (includes inline prose refs). Each entry names the note it was reached from (`via`) and every edge between the two, with the stored link description when there is one. Neighbors are visited in note-ID order, so the output is stable. PARA routing links (`part_of`/`has_part`/`blocks`, a note's plain reference to its own area, a note's inline `[[id]]` to its own area or project, and an area's or project's inline `[[id]]` to a note filed under it, such as a lane map naming its members) are not traversed; the center's own routing neighbors are listed once under "Routing (not expanded)", with an inline edge still shown in the label. A typed link to the area (`supports`, `extends`, ...) is knowledge and is followed. The header counts both: "N connected, M routing". Pass `include_routing: true` to traverse them too. Use for synthesis ("what do I know around X?") instead of chaining `pzk_get_linked_notes` calls.
 
 ### `pzk_find_tensions`
 
@@ -1236,6 +1237,6 @@ Creates many notes, links, and tasks in one call — links reference notes by po
 | `pzk_get_notes_by_tag` | tag | limit, detail |
 | `pzk_briefing` | — | — |
 | `pzk_find_similar_to_text` | text | threshold, limit |
-| `pzk_get_neighborhood` | note\_id | depth, max\_nodes |
+| `pzk_get_neighborhood` | note\_id | depth, max\_nodes, include\_routing |
 | `pzk_find_tensions` | note\_id | limit |
 | `pzk_ingest_batch` | one of notes/links/tasks | default\_project\_id, default\_area\_id, default\_source, on\_duplicate |
