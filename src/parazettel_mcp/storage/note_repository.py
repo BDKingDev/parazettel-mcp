@@ -166,6 +166,14 @@ _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
 WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
 
 
+def _read_note_file(file_path: Path) -> Tuple[str, datetime.datetime]:
+    """A note file's text and the modification time of those same bytes."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        modified = datetime.datetime.fromtimestamp(os.fstat(f.fileno()).st_mtime)
+    return content, modified
+
+
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
     """Accept YAML-parsed datetimes/dates as well as ISO timestamp strings."""
     if value is None or value == "":
@@ -602,9 +610,8 @@ class NoteRepository(Repository[Note]):
     def _parse_rebuild_note(self, file_path: Path) -> Optional[Note]:
         """Parse one markdown file for rebuild, logging and skipping failures."""
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_note_from_markdown(content)
+            content, modified = _read_note_file(file_path)
+            return self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             logger.error("Error processing file %s: %s", file_path, e)
             return None
@@ -776,8 +783,15 @@ class NoteRepository(Repository[Note]):
             )
         return rows
 
-    def _parse_note_from_markdown(self, content: str) -> Note:
-        """Parse a note from markdown content."""
+    def _parse_note_from_markdown(
+        self, content: str, fallback_time: Optional[datetime.datetime] = None
+    ) -> Note:
+        """Parse a note from markdown content.
+
+        *fallback_time* stands in for a missing ``created`` (and so ``updated``)
+        field. Callers reading a file pass its modification time, so repeated
+        reads and the index agree; without one it is now().
+        """
         post = frontmatter.loads(content)
         metadata = post.metadata
 
@@ -813,7 +827,9 @@ class NoteRepository(Repository[Note]):
         links = self.parse_links_in_content(note_id, post.content)
         inline_refs = self._parse_inline_refs(note_id, post.content, links)
 
-        created_at = _coerce_datetime(metadata.get("created"), datetime.datetime.now())
+        created_at = _coerce_datetime(
+            metadata.get("created"), fallback_time or datetime.datetime.now()
+        )
         updated_at = _coerce_datetime(metadata.get("updated"), created_at)
 
         _action_keys = {
@@ -1810,11 +1826,17 @@ class NoteRepository(Repository[Note]):
         if not file_path.exists():
             return None
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_note_from_markdown(content)
+            content, modified = _read_note_file(file_path)
+            note = self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             raise IOError(f"Failed to read note {id}: {e}") from e
+        if note.id != id:
+            # Writes go to the file named by note.id, so returning this note
+            # would let an update overwrite a different note's file.
+            raise IOError(
+                f"Failed to read note {id}: its frontmatter id is {note.id!r}"
+            )
+        return note
 
     def get_by_title(self, title: str) -> Optional[Note]:
         """Get a note by exact title (indexed lookup)."""
