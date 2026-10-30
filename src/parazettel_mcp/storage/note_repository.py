@@ -305,15 +305,16 @@ def _fenced_lines(lines: List[str]) -> List[bool]:
     return fenced
 
 
-def _links_section_lines(content: str) -> Iterator[Tuple[str, bool]]:
-    """Yield ``(line, in_links_section)`` for each line of *content*.
+def _links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
+    """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
 
     The Links section starts at a line that is exactly ``## Links`` (ignoring
     case and surrounding or repeated spaces) outside fenced code, and runs to
     the next ``## `` heading. A mention in prose, a code span, a fenced example
     or a longer heading such as ``## Links to read`` is ordinary text. The
     parser, the writer and the update reconciler all use this one rule, so they
-    agree on what the section is.
+    agree on what the section is. A fenced block inside the section is part of
+    it, but its lines are examples, never link entries.
     """
     lines = content.split("\n")
     fenced = _fenced_lines(lines)
@@ -325,12 +326,12 @@ def _links_section_lines(content: str) -> Iterator[Tuple[str, bool]]:
                 in_links = True
             elif in_links and stripped.startswith("## "):
                 in_links = False
-        yield line, in_links
+        yield line, in_links, is_fenced
 
 
 def has_links_heading(content: str) -> bool:
     """Whether *content* has a real ``## Links`` section heading (see above)."""
-    return any(in_links for _, in_links in _links_section_lines(content))
+    return any(in_links for _, in_links, _ in _links_section_lines(content))
 
 
 class NoteRepository(Repository[Note]):
@@ -998,9 +999,9 @@ class NoteRepository(Repository[Note]):
         """
         links: List[Link] = []
         seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        for raw_line, in_links_section in _links_section_lines(content):
+        for raw_line, in_links_section, is_fenced in _links_section_lines(content):
             line = raw_line.strip()
-            if in_links_section and line.startswith("- "):
+            if in_links_section and not is_fenced and line.startswith("- "):
                 try:
                     line_content = line.strip()
                     if "[[" in line_content and "]]" in line_content:
@@ -1139,7 +1140,7 @@ class NoteRepository(Repository[Note]):
         # Drop the old Links section; it is re-rendered from note.links below.
         content_parts = [
             line
-            for line, in_links_section in _links_section_lines(note.content)
+            for line, in_links_section, _ in _links_section_lines(note.content)
             if not in_links_section
         ]
 

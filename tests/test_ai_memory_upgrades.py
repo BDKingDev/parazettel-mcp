@@ -396,6 +396,31 @@ def test_links_heading_detection_follows_fence_rules():
     assert not has_links_heading("````\n```\n## Links\n```\n````\n")
 
 
+def _link_pairs(zettel_service, note_id):
+    note = zettel_service.get_note(note_id)
+    return {(link.link_type, link.target_id) for link in note.links}
+
+
+@pytest.mark.parametrize("fence", ["```", "~~~"])
+def test_fenced_example_inside_links_section_is_not_a_link(zettel_service, fence):
+    """A fenced block inside a real Links section is an example, not entries."""
+    a = zettel_service.create_note(title="Edited", content="a")
+    b = zettel_service.create_note(title="Real Target", content="b")
+    x = zettel_service.create_note(title="Example Target", content="x")
+
+    zettel_service.update_note(
+        a.id,
+        content=(
+            f"Body.\n\n## Links\n- related [[{b.id}]] real\n\n"
+            f"{fence}\n## Example\n- supports [[{x.id}]] example\n{fence}\n"
+        ),
+    )
+    assert _link_pairs(zettel_service, a.id) == {(LinkType.RELATED, b.id)}
+
+    zettel_service.rebuild_index()
+    assert _link_pairs(zettel_service, a.id) == {(LinkType.RELATED, b.id)}
+
+
 def test_unclosed_fence_does_not_hide_the_links_section(zettel_service):
     a = zettel_service.create_note(title="Stray Fence", content="a")
     b = zettel_service.create_note(title="Target", content="b")
