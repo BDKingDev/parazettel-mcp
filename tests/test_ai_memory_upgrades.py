@@ -318,6 +318,10 @@ _FENCED_CONTENTS = {
     "fenced-tildes": f"# Fenced\n\nExample:\n~~~markdown\n{_EXAMPLE}~~~\n",
     # A longer fence can show a shorter one; the inner ``` doesn't close it.
     "fenced-nested": f"# Fenced\n\n````\n```\n{_EXAMPLE}```\n````\n",
+    # Indented four spaces after a blank line, it's an indented code block.
+    "indented-code": "# Fenced\n\nExample:\n\n"
+    + "".join(f"    {line}\n" for line in _EXAMPLE.splitlines())
+    + "\n",
 }
 _FENCED_CONTENTS = {k: v + "After the fence.\n" for k, v in _FENCED_CONTENTS.items()}
 
@@ -419,6 +423,10 @@ def test_links_heading_detection_follows_fence_rules():
     # Inside a closed fence of either kind, the heading is an example.
     assert not has_links_heading("~~~\n## Links\n~~~\n")
     assert not has_links_heading("````\n```\n## Links\n```\n````\n")
+    # Up to three spaces of indent is still a heading; four is indented code.
+    assert has_links_heading("Body.\n\n   ## Links\n- related [[x]]")
+    assert not has_links_heading("Example:\n\n    ## Links\n    - related [[x]]")
+    assert not has_links_heading("Example:\n\n\t## Links\n")
 
 
 def _link_pairs(zettel_service, note_id):
