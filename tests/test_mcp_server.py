@@ -4,6 +4,8 @@ import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
 
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
@@ -2385,3 +2387,27 @@ class TestMcpServer:
         general_error = Exception("Something went wrong")
         result = self.server.format_error_response(general_error)
         assert "An unexpected error occurred. Error ID:" in result
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Scope.\n\n## Links\n- has_part [[20260101T000000000000000]]\n",
+        "Scope.\n\n## Links\nProse only.\n",
+        "Scope with no section at all.\n",
+        "The text ## Links in a sentence.\n",
+        "Scope.\n\n## links\n- https://example.com reading\n",
+        "Scope.\n\n~~~\n## Links\n- related [[x]]\n~~~\n\nAfter.\n",
+    ],
+    ids=["entries", "prose-only", "none", "prose-mention", "lowercase", "fenced"],
+)
+def test_container_notice_matches_what_was_hidden(content):
+    """The hidden-section notice appears exactly when the stripper hid something,
+    whichever heading rule the stripper applies."""
+    from parazettel_mcp.server.mcp_server import _container_body, _strip_links_section
+
+    shown, _ = _strip_links_section(content)
+    hid_something = shown.rstrip() != content.rstrip()
+    body = _container_body("20260101T000000000000001", content)
+    assert ("Links section — see pzk_get_linked_notes" in body) is hid_something
+    assert body.startswith(shown)

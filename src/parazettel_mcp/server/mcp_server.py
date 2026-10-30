@@ -98,8 +98,13 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
 
 
 def _has_links_section(content: str) -> bool:
-    """Whether *content* has the ``## Links`` heading _strip_links_section removes."""
-    return any(line.strip().lower() == "## links" for line in content.splitlines())
+    """Whether _strip_links_section removes a ``## Links`` section from *content*.
+
+    Asks the stripper itself rather than matching the heading separately, so
+    the hidden-section notice can never disagree with what was hidden.
+    """
+    shown, _ = _strip_links_section(content)
+    return shown.rstrip() != "\n".join(content.splitlines()).rstrip()
 
 
 def _container_body(note_id: str, content: str) -> str:
