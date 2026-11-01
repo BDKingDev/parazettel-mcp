@@ -16,6 +16,10 @@ from parazettel_mcp.storage.note_repository import (
     _normalize_wiki_target,
 )
 
+# Anchored to the repo, like conftest.temp_dirs, so a run from another cwd
+# doesn't leave a .tmp there.
+_REPO_TMP = Path(__file__).resolve().parents[1] / ".tmp"
+
 
 def test_create_note(note_repository):
     """Test creating a new note."""
@@ -724,7 +728,7 @@ def test_closed_repository_rejects_new_connections(note_repository):
 
 def test_repository_close_allows_reopen_same_graph_path():
     """Closing a repository should release the graph path for a fresh reopen."""
-    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    test_root = _REPO_TMP / "test-note-repository" / uuid4().hex
     notes_dir = test_root / "notes"
     graph_db_path = test_root / "db" / "test_graph.kuzu"
     notes_dir.mkdir(parents=True, exist_ok=True)
@@ -760,7 +764,7 @@ def test_repository_close_allows_reopen_same_graph_path():
 
 def test_multiple_repositories_share_same_graph_path():
     """Repositories for the same graph path should share the DB handle safely."""
-    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    test_root = _REPO_TMP / "test-note-repository" / uuid4().hex
     notes_dir = test_root / "notes"
     graph_db_path = test_root / "db" / "test_graph.kuzu"
     notes_dir.mkdir(parents=True, exist_ok=True)
@@ -818,7 +822,7 @@ def test_two_repositories_on_one_index_can_both_write(test_config):
 def test_create_uses_graph_db_without_creating_legacy_sqlite():
     """A legacy ``*.kuzu`` path maps to a sibling SQLite index; neither the Kuzu
     file nor the pre-Kuzu SQLAlchemy database is ever created."""
-    test_root = Path(".tmp") / "test-note-repository" / uuid4().hex
+    test_root = _REPO_TMP / "test-note-repository" / uuid4().hex
     notes_dir = test_root / "notes"
     graph_db_path = test_root / "db" / "test_graph.kuzu"
     legacy_db_path = test_root / "db" / "legacy-parazettel.db"
