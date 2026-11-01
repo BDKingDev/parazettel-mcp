@@ -804,7 +804,10 @@ class ZettelkastenMcpServer:
         "briefing, recall-hook injections and reads in Obsidian are not counted, "
         "so a low or missing count doesn't mean a note is unread. Citations are "
         "the links that exist now (a removed link leaves no trace), counted once "
-        "per citing note, excluding area/project routing."
+        "per citing note, excluding area/project routing and task dependencies "
+        "(blocks/blocked_by). A link written by hand into ## Links without its "
+        "created comment is dated when it was last indexed, so its date can be "
+        "the last rebuild."
     )
 
     @staticmethod
