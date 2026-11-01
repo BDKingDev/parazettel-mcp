@@ -730,13 +730,18 @@ class ZettelService:
     def delete_note(self, note_id: str) -> None:
         """Delete a note (serialized against all writers by the global write lock).
 
+        An area that still has members is refused: they'd be left filed under
+        a note that no longer exists.
+
         Deleting a project keeps its members: each note, task or subproject
         routed to it has its ``project_id`` cleared first, through the normal
         update path, so it falls back to its area's routing and stays editable.
+
+        A note whose file can't be parsed must still be deletable. It can't be
+        known to be a project, so it has no members to clear, but it gets the
+        area membership check, which reads the members, not the note.
         """
         with self._write_locked():
-            # An unparseable note must still be deletable; it can't be known to
-            # be a project, so it has no members to clear.
             try:
                 note = self.repository.get(note_id)
             except IOError:
@@ -761,6 +766,17 @@ class ZettelService:
                         )
                         continue
                     self._update_note_locked(member.id, project_id=None)
+            if note is None or note.note_type == NoteType.AREA:
+                members = [
+                    member
+                    for member in self.repository.search(area_id=note_id)
+                    if member.id != note_id
+                ]
+                if members:
+                    raise ValueError(
+                        f"Area {note_id} still has {len(members)} note(s) filed under it; "
+                        "reassign them to another area first, then delete it."
+                    )
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:

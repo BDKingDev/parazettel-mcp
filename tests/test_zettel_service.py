@@ -1,5 +1,8 @@
 """Tests for the ZettelService class."""
 
+import os
+
+import pytest
 
 from parazettel_mcp.models.schema import LinkType, NoteStatus, NoteType
 
@@ -348,6 +351,52 @@ def test_delete_note(zettel_service):
     # Verify note no longer exists
     deleted_note = zettel_service.get_note(note.id)
     assert deleted_note is None
+
+
+def test_delete_area_refused_while_it_has_members(zettel_service):
+    """An area with members can't be deleted (they'd lose their routing);
+    an empty one can."""
+    area = zettel_service.create_area_note(title="Busy Area", content="Has members.")
+    member = zettel_service.create_note(
+        title="Filed Note",
+        content="Filed under the area.",
+        note_type=NoteType.PERMANENT,
+        area_id=area.id,
+    )
+
+    with pytest.raises(ValueError, match=r"1 note.*[Rr]eassign"):
+        zettel_service.delete_note(area.id)
+
+    assert zettel_service.get_note(area.id) is not None
+    assert zettel_service.get_note(member.id).area_id == area.id
+
+    empty = zettel_service.create_area_note(title="Empty Area", content="No members.")
+    zettel_service.delete_note(empty.id)
+    assert zettel_service.get_note(empty.id) is None
+
+
+def test_delete_refused_for_an_unreadable_area_that_has_members(zettel_service):
+    """An area whose file no longer parses can't be known to be an area, but
+    its members still name it, so it is refused all the same."""
+    area = zettel_service.create_area_note(title="Corrupt Area", content="a")
+    member = zettel_service.create_note(
+        title="Filed Note", content="m", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    notes_dir = zettel_service.repository.notes_dir
+    area_file, member_file = notes_dir / f"{area.id}.md", notes_dir / f"{member.id}.md"
+    before = area_file.stat()
+    area_file.write_text("---\nid: [unclosed\ntitle: : :\n---\nGarbled.\n")
+    # Move the mtime so no cached copy of the readable area can match.
+    os.utime(area_file, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    with pytest.raises(IOError):
+        zettel_service.repository.get(area.id)
+
+    with pytest.raises(ValueError, match=r"1 note.*[Rr]eassign"):
+        zettel_service.delete_note(area.id)
+
+    assert area_file.exists() and member_file.exists()
+    indexed = zettel_service.repository.search(area_id=area.id)
+    assert [note.id for note in indexed if note.id != area.id] == [member.id]
 
 
 def test_create_link(zettel_service):
