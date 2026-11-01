@@ -798,6 +798,25 @@ class TestIntegration:
         wide = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
         assert f"[via {g['area'].id}:" in wide and "Sibling" in wide
 
+    def test_neighborhood_ignores_refs_inside_a_tilde_fence(self):
+        """A [[member]] inside an area's ~~~ example is not an inline ref, so the
+        member stays a plain routing entry with no inline edge."""
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Fenced area", content="a")
+        member = svc.create_note(title="Filed member", content="m", area_id=area.id)
+        svc.update_note(
+            area.id, content=f"Lane map example:\n\n~~~\n- [[{member.id}]]\n~~~\n"
+        )
+        tool = self.registered_tools["pzk_get_neighborhood"]
+
+        for _ in range(2):
+            out = tool(note_id=area.id, max_nodes=60)
+            routing = out.split("Routing (not expanded):")[1]
+            entry = self._entry(routing, member)
+            assert entry is not None and "[via " not in entry
+            assert "inline" not in entry
+            self.zettel_service.rebuild_index()
+
     def test_neighborhood_container_seed_lists_members_and_keeps_knowledge_edges(self):
         g = self._neighborhood_graph()
         svc = self.server.zettel_service
