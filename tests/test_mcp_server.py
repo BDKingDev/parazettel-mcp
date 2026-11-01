@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 
+from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
 from parazettel_mcp.models.schema import LinkType, NoteSource, NoteStatus, NoteType
@@ -19,7 +20,7 @@ class TestMcpServer:
         # Capture the tool decorator functions when registering
         self.registered_tools = {}
 
-        # Create a mock for FastMCP
+        # Create a mock for MCPServer
         self.mock_mcp = MagicMock()
 
         # Mock the tool decorator to capture registered functions BEFORE server creation
@@ -41,9 +42,9 @@ class TestMcpServer:
         # lexical-path tests below exercise only the BM25 candidate source.
         self.mock_zettel_service.find_similar_to_text.return_value = []
 
-        # Create patchers for FastMCP, ZettelService, and SearchService
+        # Create patchers for MCPServer, ZettelService, and SearchService
         self.mcp_patcher = patch(
-            "parazettel_mcp.server.mcp_server.FastMCP", return_value=self.mock_mcp
+            "parazettel_mcp.server.mcp_server.MCPServer", return_value=self.mock_mcp
         )
         self.zettel_patcher = patch(
             "parazettel_mcp.server.mcp_server.ZettelService",
@@ -78,11 +79,23 @@ class TestMcpServer:
         assert self.mock_zettel_service.initialize.called
         assert self.mock_search_service.initialize.called
 
-    def test_run_passes_transport_through_to_fastmcp(self):
-        """run() should pass the requested transport to FastMCP."""
-        self.server.run("sse")
+    def test_run_passes_stdio_transport_through(self):
+        """run() should pass the stdio transport to MCPServer unchanged."""
+        self.server.run("stdio")
 
-        self.mock_mcp.run.assert_called_once_with(transport="sse")
+        self.mock_mcp.run.assert_called_once_with(transport="stdio")
+
+    def test_run_passes_sse_bind_address_to_mcpserver(self):
+        """MCP 2 takes host/port at run() time, not in the constructor."""
+        with (
+            patch.object(config, "server_host", "127.0.0.9"),
+            patch.object(config, "server_port", 9123),
+        ):
+            self.server.run("sse")
+
+        self.mock_mcp.run.assert_called_once_with(
+            transport="sse", host="127.0.0.9", port=9123
+        )
 
     def test_find_similar_to_text_rejects_nonpositive_limit(self):
         """limit<=0 returns a clear validation message instead of delegating to

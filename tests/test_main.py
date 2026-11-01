@@ -1,6 +1,7 @@
 """Tests for the CLI entrypoint."""
 
 import argparse
+import itertools
 import shutil
 import sys
 from pathlib import Path
@@ -404,7 +405,9 @@ def test_main_exits_when_daemon_backend_cannot_start(
     daemon_client = MagicMock()
     daemon_client.health.side_effect = DaemonUnavailableError("down")
     spawn = MagicMock()
-    ticks = iter([0.0, 0.0, 11.0])
+    # Stays at 11.0 once past the deadline: on Python < 3.13, logging also calls
+    # time.time(), so a fixed-length iterator would run out (StopIteration).
+    ticks = itertools.chain([0.0, 0.0], itertools.repeat(11.0))
 
     monkeypatch.setattr(main_module, "parse_args", lambda: args)
     monkeypatch.setattr(main_module, "setup_logging", setup_logging)
