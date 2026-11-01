@@ -220,6 +220,7 @@ ALLOWED_SERVICE_METHODS: Dict[str, Set[str]] = {
         "rerank",
         "record_retrieval",
         "get_retrieval_signals",
+        "get_note_signals",
         "create_task",
         "update_task",
         "update_task_status",

@@ -4,6 +4,7 @@ import datetime
 import os
 import re
 import shutil
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -120,6 +121,157 @@ class TestIntegration:
             file_content = f.read()
             assert title in file_content
             assert content in file_content
+
+    def _hits(self, note):
+        signals = self.zettel_service.repository.get_retrieval_signals([note.id])
+        return signals.get(note.id, {}).get("hit_count", 0)
+
+    def test_note_signals_read_counters_without_counting_or_writing(self):
+        area = self.zettel_service.create_area_note(title="Area", content="a")
+        note = self.zettel_service.create_note(
+            title="Read me", content="x", area_id=area.id
+        )
+        self.registered_tools["pzk_get_note"](identifier=note.id)
+        self.registered_tools["pzk_get_note"](identifier=note.id)
+        note_file = self.notes_dir / f"{note.id}.md"
+        before = (note_file.read_bytes(), note_file.stat().st_mtime_ns)
+
+        signals = self.registered_tools["pzk_note_signals"]
+        first = signals(ids=[note.id])
+        assert signals(ids=[note.id]) == first
+        assert "- Recorded retrievals: 2, last " in first
+        assert self._hits(note) == 2
+        assert (note_file.read_bytes(), note_file.stat().st_mtime_ns) == before
+        assert "reads in Obsidian are not counted" in first
+
+        # Counters survive a rebuild for a note that still exists.
+        self.zettel_service.rebuild_index()
+        assert "- Recorded retrievals: 2, last " in signals(ids=[note.id])
+
+    def test_note_signals_tell_absent_from_unavailable(self):
+        area = self.zettel_service.create_area_note(title="Area", content="a")
+        note = self.zettel_service.create_note(
+            title="Never read", content="x", area_id=area.id
+        )
+        signals = self.registered_tools["pzk_note_signals"]
+        out = signals(ids=[note.id, "no-such-id"])
+        assert "- Recorded retrievals: none recorded" in out
+        assert "- Last verified: not recorded" in out
+        assert "- Citing notes: none now" in out
+        assert "Note not found: no-such-id" in out
+
+        repo = self.server.zettel_service.repository  # the tools' service
+        broken = sqlite3.OperationalError("database is locked")
+        with patch.object(repo, "get_retrieval_signals", side_effect=broken), \
+                patch.object(repo, "get_citation_signals", side_effect=broken):
+            out = signals(ids=[note.id])
+        assert "- Recorded retrievals: unavailable (database is locked)" in out
+        assert "- Citing notes: unavailable (database is locked)" in out
+
+        # A file that can't be read is reported without its path, which an OS
+        # read error would otherwise carry (here a directory in its place).
+        note_file = self.notes_dir / f"{note.id}.md"
+        note_file.unlink()
+        note_file.mkdir()
+        out = signals(ids=[note.id])
+        assert "(its file doesn't parse)" in out
+        assert "- Last verified: unavailable (its file couldn't be read)" in out
+        assert note_file.name not in out.replace(f"Note {note.id} ", "")
+        assert str(self.notes_dir) not in out
+
+    def test_listing_and_search_record_no_retrieval(self):
+        area = self.zettel_service.create_area_note(title="Area", content="a")
+        note = self.zettel_service.create_note(
+            title="Batch target", content="findable words", area_id=area.id
+        )
+        tools = self.registered_tools
+        tools["pzk_get_notes"](identifiers=[note.id], detail="summary")
+        tools["pzk_get_notes"](identifiers=[note.id], detail="ids")
+        tools["pzk_search_notes"](query="findable")
+        assert self._hits(note) == 0
+        tools["pzk_get_notes"](identifiers=[note.id], detail="full")
+        assert self._hits(note) == 1
+
+    def test_note_signals_count_current_citing_notes_without_routing(self):
+        svc = self.zettel_service
+        area = svc.create_area_note(title="Area", content="a")
+        target = svc.create_note(title="Target", content="t", area_id=area.id)
+        twice = svc.create_note(title="Twice", content="w", area_id=area.id)
+        svc.create_link(twice.id, target.id, LinkType.SUPPORTS)
+        svc.create_link(twice.id, target.id, LinkType.EXTENDS)
+        mention = svc.create_note(
+            title="Mention", content=f"See [[{target.id}]].", area_id=area.id
+        )
+        gone = svc.create_note(title="Gone", content="g", area_id=area.id)
+        svc.create_link(gone.id, target.id, LinkType.REFINES)
+        svc.remove_link(gone.id, target.id, LinkType.REFINES)
+        signals = self.registered_tools["pzk_note_signals"]
+
+        out = signals(ids=[target.id])
+        # Two links from one note count once; the removed link doesn't count.
+        assert "- Citing notes: 2 now; latest explicit link " in out
+        assert f"from {twice.id} (" in out
+        assert (
+            f"latest inline mention about " in out
+            and f"from {mention.id} (approximate: that note's last update)" in out
+        )
+        # Members' reference/part_of links to their area are routing, not citations.
+        assert "- Citing notes: none now" in signals(ids=[area.id])
+
+    def test_verification_record_round_trips_and_stays_opt_in(self):
+        svc = self.zettel_service
+        area = svc.create_area_note(title="Area", content="a")
+        note = svc.create_note(title="Claim", content="x", area_id=area.id)
+        update = self.registered_tools["pzk_update_note"]
+        signals = self.registered_tools["pzk_note_signals"]
+        assert "- Last verified: not recorded" in signals(ids=[note.id])
+        assert "mark_verified=true" in update(note_id=note.id, verified_basis="RFC")
+
+        def verify(**details):
+            """Mark verified; return the stored date, which is the day of the
+            call on either side of a midnight crossing."""
+            before = datetime.date.today().isoformat()
+            update(note_id=note.id, mark_verified=True, **details)
+            after = datetime.date.today().isoformat()
+            stored = svc.get_note(note.id).metadata["verification"]["date"]
+            assert stored in (before, after)
+            return stored
+
+        today = verify(
+            verified_basis="RFC 9110 section 9",
+            verified_scope="the caching claim",
+            verified_by="km-archivist",
+        )
+        record = {
+            "date": today,
+            "basis": "RFC 9110 section 9",
+            "scope": "the caching claim",
+            "verified_by": "km-archivist",
+        }
+        assert svc.get_note(note.id).metadata["verification"] == record
+        # An unrelated update and a rebuild leave the record exactly as written.
+        update(note_id=note.id, tags="kept")
+        svc.rebuild_index()
+        assert svc.get_note(note.id).metadata["verification"] == record
+        out = signals(ids=[note.id])
+        assert (
+            f"- Last verified: {today}; basis: RFC 9110 section 9; scope: the "
+            "caching claim; verifier (self-reported): km-archivist"
+        ) in out
+
+        # A later partial record replaces the whole one.
+        again = verify(verified_basis="re-read source")
+        assert svc.get_note(note.id).metadata["verification"] == {
+            "date": again,
+            "basis": "re-read source",
+        }
+        assert "scope: not recorded; verifier: not recorded" in signals(ids=[note.id])
+
+        update(note_id=note.id, mark_verified=False)
+        cleared = svc.get_note(note.id)
+        assert cleared.last_verified is None
+        assert "verification" not in cleared.metadata
+        assert "verification" not in (self.notes_dir / f"{note.id}.md").read_text()
 
     def test_delete_tool_removes_a_note_whose_file_no_longer_parses(self):
         """pzk_delete_note deletes a note whose file can't be parsed, whether or

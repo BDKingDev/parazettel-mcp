@@ -2353,6 +2353,77 @@ class NoteRepository(Repository[Note]):
             for row in rows
         }
 
+    def get_citation_signals(
+        self, note_ids: List[str], routing_link_values: Iterable[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return the current citations of each of *note_ids*, from surviving links.
+
+        Per id: ``citing_notes`` (distinct source notes), ``latest_explicit`` and
+        ``latest_inline`` ({at, source_id, link_type} or None) and
+        ``undated_explicit`` (explicit citations stored without a timestamp).
+        Routing is not a citation: the ``routing_link_values`` types, and a
+        ``reference`` or inline edge between a note and its own area or project
+        (every member references its area; a lane map names its members). An
+        inline edge's time is the citing note's ``updated_at``, which moves with
+        unrelated edits, so it is reported apart from explicit links. Ids with no
+        citation are absent from the result.
+        """
+        if not note_ids:
+            return {}
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT l.target_id, l.source_id, l.link_type, l.created_at "
+                "FROM links l "
+                "JOIN notes t ON t.id = l.target_id "
+                "JOIN notes s ON s.id = l.source_id "
+                "WHERE l.target_id IN (SELECT value FROM json_each(?)) "
+                "AND l.source_id <> l.target_id "
+                "AND l.link_type NOT IN (SELECT value FROM json_each(?)) "
+                "AND NOT (l.link_type IN (?, ?) AND (s.id IS t.area_id "
+                "OR s.id IS t.project_id OR t.id IS s.area_id "
+                "OR t.id IS s.project_id))",
+                (
+                    _json_ids(note_ids),
+                    _json_ids(routing_link_values),
+                    LinkType.REFERENCE.value,
+                    LinkType.INLINE.value,
+                ),
+            ).fetchall()
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            entry = result.setdefault(
+                row["target_id"],
+                {
+                    "sources": set(),
+                    "latest_explicit": None,
+                    "latest_inline": None,
+                    "undated_explicit": 0,
+                },
+            )
+            entry["sources"].add(row["source_id"])
+            kind = (
+                "latest_inline"
+                if row["link_type"] == LinkType.INLINE.value
+                else "latest_explicit"
+            )
+            if row["created_at"] is None:
+                if kind == "latest_explicit":
+                    entry["undated_explicit"] += 1
+                continue
+            latest = entry[kind]
+            if latest is None or row["created_at"] > latest["raw"]:
+                entry[kind] = {
+                    "raw": row["created_at"],
+                    "source_id": row["source_id"],
+                    "link_type": row["link_type"],
+                }
+        for entry in result.values():
+            entry["citing_notes"] = len(entry.pop("sources"))
+            for kind in ("latest_explicit", "latest_inline"):
+                if entry[kind] is not None:
+                    entry[kind]["at"] = ts_out(entry[kind].pop("raw"))
+        return result
+
     def find_orphaned_note_ids(self) -> List[str]:
         """Return IDs of notes that have no links in either direction."""
         with self._connection() as conn:

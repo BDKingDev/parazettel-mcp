@@ -866,6 +866,94 @@ class ZettelkastenMcpServer:
             normalized.append(value)
         return normalized
 
+    _NOTE_SIGNALS_COVERAGE = (
+        "Coverage: recorded retrievals count pzk_get_note and full-detail reads "
+        "by pzk_get_notes, pzk_get_notes_by_tag and pzk_get_project_notes; counts "
+        "recorded before pzk_get_notes was limited to full detail also include "
+        "its summary and id-list reads. Search, similarity, neighborhood, "
+        "briefing, recall-hook injections and reads in Obsidian are not counted, "
+        "so a low or missing count doesn't mean a note is unread. Citations are "
+        "the links that exist now (a removed link leaves no trace), counted once "
+        "per citing note, excluding area/project routing and task dependencies "
+        "(blocks/blocked_by). A link written by hand into ## Links without its "
+        "created comment is dated when it was last indexed, so its date can be "
+        "the last rebuild."
+    )
+
+    @staticmethod
+    def _format_note_signals(note_id: str, entry: Optional[Dict[str, Any]]) -> str:
+        """One note's block for pzk_note_signals."""
+
+        def when(value: Any) -> str:
+            return value.isoformat(sep=" ", timespec="minutes") if value else "unknown"
+
+        def failed(part: Dict[str, Any]) -> str:
+            return f"unavailable ({part.get('error', 'unknown error')})"
+
+        if not entry or entry.get("status") == "not_found":
+            return f"Note not found: {note_id}"
+        if entry["status"] == "unreadable":
+            lines = [f"Note {note_id} (its file doesn't parse)"]
+        else:
+            lines = [f"{entry['title']} (ID: {note_id})"]
+
+        retrievals = entry.get("retrievals", {})
+        if retrievals.get("status") == "recorded":
+            text = (
+                f"{retrievals['hit_count']}, last "
+                f"{when(retrievals.get('last_retrieved_at'))}"
+            )
+        elif retrievals.get("status") == "none":
+            text = "none recorded"
+        else:
+            text = failed(retrievals)
+        lines.append(f"- Recorded retrievals: {text}")
+
+        verification = entry.get("verification", {})
+        if verification.get("status") == "recorded":
+            record = verification.get("record") or {}
+            last = verification.get("last_verified")
+            text = last or "no date (a verification record without last_verified)"
+            if record.get("date") and record["date"] != last:
+                text += f"; the verification record is dated {record['date']}"
+            text += f"; basis: {record.get('basis', 'not recorded')}"
+            text += f"; scope: {record.get('scope', 'not recorded')}"
+            if record.get("verified_by"):
+                text += f"; verifier (self-reported): {record['verified_by']}"
+            else:
+                text += "; verifier: not recorded"
+            if "unrecognized" in record:
+                text += f"; unrecognized record: {record['unrecognized']}"
+        elif verification.get("status") == "none":
+            text = "not recorded"
+        else:
+            text = failed(verification)
+        lines.append(f"- Last verified: {text}")
+
+        citations = entry.get("citations", {})
+        if citations.get("status") == "recorded":
+            text = f"{citations['citing_notes']} now"
+            explicit = citations.get("latest_explicit")
+            if explicit:
+                text += (
+                    f"; latest explicit link {when(explicit['at'])} from "
+                    f"{explicit['source_id']} ({explicit['link_type']})"
+                )
+            if citations.get("undated_explicit"):
+                text += f"; {citations['undated_explicit']} explicit link(s) undated"
+            inline = citations.get("latest_inline")
+            if inline:
+                text += (
+                    f"; latest inline mention about {when(inline['at'])} from "
+                    f"{inline['source_id']} (approximate: that note's last update)"
+                )
+        elif citations.get("status") == "none":
+            text = "none now"
+        else:
+            text = failed(citations)
+        lines.append(f"- Citing notes: {text}")
+        return "\n".join(lines)
+
     @staticmethod
     def _get_project_preview_tasks(
         tasks: List[Note], limit: int = 5
@@ -1128,7 +1216,11 @@ class ZettelkastenMcpServer:
                         )
                     return out
 
-                self.zettel_service.record_retrieval([n.id for n in notes])
+                # Record retrieval only when full content is actually returned,
+                # as the tag and project tools do; a summary/ids batch is
+                # inspection, not a read.
+                if detail == "full":
+                    self.zettel_service.record_retrieval([n.id for n in notes])
                 out = f"Notes retrieved ({len(notes)}/{len(normalized)}):\n\n"
                 out += self._render_notes_with_detail(
                     notes, detail, bool(include_links)
@@ -1183,6 +1275,33 @@ class ZettelkastenMcpServer:
             except Exception as e:
                 return self.format_error_response(e)
 
+        @self.mcp.tool(name="pzk_note_signals")
+        def pzk_note_signals(ids: List[str]) -> str:
+            """Show how notes have been used and checked, without counting this look.
+
+            For each note id: recorded retrievals, when it was last verified and
+            on what basis, and how many notes currently cite it. Read-only: it
+            records no retrieval and writes no file, so looking doesn't change
+            what it reports. Ages and counts are evidence to weigh, not a verdict
+            that a note is stale or wrong.
+
+            Args:
+                ids: Exact note IDs (copied from earlier output; titles are not
+                    resolved here)
+            """
+            try:
+                normalized = self._normalize_identifier_list(ids)
+                if not normalized:
+                    return "Provide at least one note ID."
+                signals = self.zettel_service.get_note_signals(normalized)
+                blocks = [
+                    self._format_note_signals(note_id, signals.get(note_id))
+                    for note_id in normalized
+                ]
+                return "\n\n".join(blocks) + "\n\n" + self._NOTE_SIGNALS_COVERAGE
+            except Exception as e:
+                return self.format_error_response(e)
+
         # Update a note
         @self.mcp.tool(name="pzk_update_note")
         def pzk_update_note(
@@ -1197,6 +1316,9 @@ class ZettelkastenMcpServer:
             area_id: Optional[str] = None,
             origin: Optional[str] = None,
             mark_verified: Optional[bool] = None,
+            verified_basis: Optional[str] = None,
+            verified_scope: Optional[str] = None,
+            verified_by: Optional[str] = None,
         ) -> str:
             """Update an existing note.
 
@@ -1217,7 +1339,17 @@ class ZettelkastenMcpServer:
                 area_id: New area routing (optional). Pass empty string to clear it.
                 origin: New provenance string (URL, chat id, file). Pass empty string to clear it.
                 mark_verified: True records today as the date this note's claim
-                    was last confirmed still true (last_verified); False clears it.
+                    was last confirmed still true (last_verified), with a
+                    verification record of what was checked; False clears both.
+                    Only set it after actually checking the claim.
+                verified_basis: With mark_verified=true: what the claim was
+                    checked against (a source, URL, commit or revision).
+                verified_scope: With mark_verified=true: which part of the note
+                    was checked, if not all of it.
+                verified_by: With mark_verified=true: who checked it. Stored as
+                    given and shown as self-reported; the server can't verify it.
+                    Each is optional; a later mark_verified=true replaces the
+                    whole record.
             """
             try:
                 # Get the note
@@ -1279,11 +1411,30 @@ class ZettelkastenMcpServer:
                     update_kwargs["area_id"] = normalized_area_id or None
                 if origin is not None:
                     update_kwargs["origin"] = origin.strip() or None
+                details = {
+                    "basis": verified_basis,
+                    "scope": verified_scope,
+                    "verified_by": verified_by,
+                }
+                details = {
+                    key: str(value).strip()
+                    for key, value in details.items()
+                    if value is not None and str(value).strip()
+                }
+                if details and mark_verified is not True:
+                    return (
+                        "verified_basis, verified_scope and verified_by describe a "
+                        "verification; pass them with mark_verified=true."
+                    )
                 if mark_verified is not None:
                     import datetime as _dt
 
-                    update_kwargs["last_verified"] = (
-                        _dt.date.today() if mark_verified else None
+                    today = _dt.date.today()
+                    update_kwargs["last_verified"] = today if mark_verified else None
+                    update_kwargs["verification"] = (
+                        {"date": today.isoformat(), **details}
+                        if mark_verified
+                        else None
                     )
 
                 # Update the note

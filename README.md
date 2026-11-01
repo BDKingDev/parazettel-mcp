@@ -117,7 +117,8 @@ All tools are prefixed `pzk_`.
 | `pzk_get_note` | Retrieve a note by ID or title (omits the `## Links` section by default — huge for areas/hubs; pass `include_links=true` to inline it) |
 | `pzk_get_notes` | Retrieve multiple notes by ID or title in one call |
 | `pzk_get_notes_by_tag` | Retrieve multiple notes with an exact tag match in one call |
-| `pzk_update_note` | Update content, type, tags, and project/area routing |
+| `pzk_note_signals` | Show recorded retrievals, last verification (basis, scope, self-reported verifier) and current citing notes for explicit IDs; read-only, counts nothing |
+| `pzk_update_note` | Update content, type, tags, and project/area routing; `mark_verified` with optional `verified_basis`/`verified_scope`/`verified_by` records what was checked |
 | `pzk_delete_note` | Delete a note |
 | `pzk_create_link` | Create a typed link between notes |
 | `pzk_remove_link` | Remove a link |
