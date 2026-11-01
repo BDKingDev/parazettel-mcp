@@ -501,10 +501,16 @@ class ZettelService:
             try:
                 note = self.repository.get(note_id)
             except Exception as exc:
+                # The read error names the file's absolute path; keep it in
+                # the log, not in what the tool shows.
+                logger.warning("Could not read note %s for its signals: %s", note_id, exc)
                 result[note_id] = {
                     "status": "unreadable",
                     "title": None,
-                    "verification": {"status": "unavailable", "error": str(exc)},
+                    "verification": {
+                        "status": "unavailable",
+                        "error": "its file couldn't be read",
+                    },
                 }
                 continue
             if note is None:

@@ -168,6 +168,17 @@ class TestIntegration:
         assert "- Recorded retrievals: unavailable (database is locked)" in out
         assert "- Citing notes: unavailable (database is locked)" in out
 
+        # A file that can't be read is reported without its path, which an OS
+        # read error would otherwise carry (here a directory in its place).
+        note_file = self.notes_dir / f"{note.id}.md"
+        note_file.unlink()
+        note_file.mkdir()
+        out = signals(ids=[note.id])
+        assert "(its file doesn't parse)" in out
+        assert "- Last verified: unavailable (its file couldn't be read)" in out
+        assert note_file.name not in out.replace(f"Note {note.id} ", "")
+        assert str(self.notes_dir) not in out
+
     def test_listing_and_search_record_no_retrieval(self):
         area = self.zettel_service.create_area_note(title="Area", content="a")
         note = self.zettel_service.create_note(
@@ -216,14 +227,21 @@ class TestIntegration:
         assert "- Last verified: not recorded" in signals(ids=[note.id])
         assert "mark_verified=true" in update(note_id=note.id, verified_basis="RFC")
 
-        update(
-            note_id=note.id,
-            mark_verified=True,
+        def verify(**details):
+            """Mark verified; return the stored date, which is the day of the
+            call on either side of a midnight crossing."""
+            before = datetime.date.today().isoformat()
+            update(note_id=note.id, mark_verified=True, **details)
+            after = datetime.date.today().isoformat()
+            stored = svc.get_note(note.id).metadata["verification"]["date"]
+            assert stored in (before, after)
+            return stored
+
+        today = verify(
             verified_basis="RFC 9110 section 9",
             verified_scope="the caching claim",
             verified_by="km-archivist",
         )
-        today = datetime.date.today().isoformat()
         record = {
             "date": today,
             "basis": "RFC 9110 section 9",
@@ -242,9 +260,9 @@ class TestIntegration:
         ) in out
 
         # A later partial record replaces the whole one.
-        update(note_id=note.id, mark_verified=True, verified_basis="re-read source")
+        again = verify(verified_basis="re-read source")
         assert svc.get_note(note.id).metadata["verification"] == {
-            "date": today,
+            "date": again,
             "basis": "re-read source",
         }
         assert "scope: not recorded; verifier: not recorded" in signals(ids=[note.id])
