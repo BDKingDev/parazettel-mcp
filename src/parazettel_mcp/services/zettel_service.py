@@ -727,15 +727,41 @@ class ZettelService:
         """Delete a note (serialized against all writers by the global write lock).
 
         An area that still has members is refused: they'd be left filed under
-        a note that no longer exists. A note whose file can't be parsed must
-        still be deletable, so it gets the same membership check, which reads
-        the members, not the note.
+        a note that no longer exists.
+
+        Deleting a project keeps its members: each note, task or subproject
+        routed to it has its ``project_id`` cleared first, through the normal
+        update path, so it falls back to its area's routing and stays editable.
+
+        A note whose file can't be parsed must still be deletable. It can't be
+        known to be a project, so it has no members to clear, but it gets the
+        area membership check, which reads the members, not the note.
         """
         with self._write_locked():
             try:
                 note = self.repository.get(note_id)
-            except Exception:
+            except IOError:
                 note = None
+            if note and note.note_type == NoteType.PROJECT:
+                for member in self.repository.search(project_id=note_id):
+                    if member.id == note_id:
+                        continue
+                    # Best-effort, like the reference scrub in repository.delete:
+                    # an unreadable member is left byte-for-byte as it is rather
+                    # than blocking the delete. Only the read is guarded, so a
+                    # failed write still aborts.
+                    try:
+                        self.repository.get(member.id)
+                    except IOError as exc:
+                        logger.warning(
+                            "Could not clear project %s from member %s during "
+                            "delete: %s",
+                            note_id,
+                            member.id,
+                            exc,
+                        )
+                        continue
+                    self._update_note_locked(member.id, project_id=None)
             if note is None or note.note_type == NoteType.AREA:
                 members = [
                     member
@@ -1503,6 +1529,7 @@ class ZettelService:
             )
 
         previous_project_id = task.project_id
+        previous_area_id = task.area_id
         if project_id is not _UNSET:
             if not project_id:
                 raise ValueError(
@@ -1541,8 +1568,16 @@ class ZettelService:
         if any(value is not _UNSET for value in pending_updates.values()):
             task.updated_at = datetime.datetime.now()
             task = self.repository.update(task)
+            if previous_area_id != task.area_id:
+                task = self._sync_area_reference_link(
+                    task.id, previous_area_id, task.area_id
+                )
+            # Like _update_note_locked, PART_OF follows the effective container:
+            # the project, or the area for a task whose project was deleted.
             task = self._sync_part_of_link(
-                task.id, previous_project_id, task.project_id
+                task.id,
+                previous_project_id or previous_area_id,
+                task.project_id or task.area_id,
             )
 
         if status is not _UNSET:
