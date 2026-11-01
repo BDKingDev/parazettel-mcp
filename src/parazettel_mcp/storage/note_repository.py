@@ -272,7 +272,7 @@ def _db_dict_to_note(
     )
 
 
-_FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def _fenced_lines(lines: List[str]) -> List[bool]:
@@ -280,10 +280,18 @@ def _fenced_lines(lines: List[str]) -> List[bool]:
 
     A fence opens on three or more backticks or tildes and closes on a line of
     only the same character, at least as long (so a ```` fence can show ```).
-    An opener that never closes is treated as plain text, so a stray fence
-    can't hide what follows it, such as the generated Links section.
+    Opener and closer take at most three leading spaces, like the Links
+    heading: indented four or more, a marker is indented code, not a fence.
+    The scan is flat, not list-aware, so a fence nested in a list item and
+    indented four or more isn't recognized either; its lines are read as
+    ordinary lines. An opener that never closes is treated as plain text, so a
+    stray fence can't hide what follows it, such as the generated Links section.
     """
     fenced = [False] * len(lines)
+    # Shortest fence of each character already known not to close: the scan
+    # only moves forward, so no later opener of that character at least as
+    # long can close either, and isn't rescanned.
+    unclosed: Dict[str, int] = {}
     i = 0
     while i < len(lines):
         opener = _FENCE_OPEN_RE.match(lines[i])
@@ -294,9 +302,13 @@ def _fenced_lines(lines: List[str]) -> List[bool]:
             i += 1
             continue
         fence = opener.group(1)
-        close = re.compile(rf"^\s*{re.escape(fence[0])}{{{len(fence)},}}\s*$")
+        if len(fence) >= unclosed.get(fence[0], len(fence) + 1):
+            i += 1  # known unclosed: not a fence
+            continue
+        close = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*$")
         end = next((j for j in range(i + 1, len(lines)) if close.match(lines[j])), None)
         if end is None:
+            unclosed[fence[0]] = len(fence)
             i += 1  # unclosed: not a fence
             continue
         for j in range(i, end + 1):

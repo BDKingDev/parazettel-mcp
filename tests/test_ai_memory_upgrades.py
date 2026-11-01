@@ -522,6 +522,64 @@ def test_unclosed_fence_does_not_hide_the_links_section(zettel_service):
     assert note.content.count("## Links") == 1
 
 
+def test_four_space_fence_markers_are_indented_code_not_a_fence(zettel_service):
+    """Markers indented four spaces don't fence off a column-0 Links heading,
+    so its entry is stored and the file keeps one Links section."""
+    a = zettel_service.create_note(title="Indented Code", content="a")
+    b = zettel_service.create_note(title="Target", content="b")
+    zettel_service.update_note(
+        a.id,
+        content=(
+            "Indented code, not a fence:\n\n    ```\n    example\n\n"
+            f"## Links\n- supports [[{b.id}]]\n\n    ```\n"
+        ),
+    )
+    note_file = zettel_service.repository.notes_dir / f"{a.id}.md"
+    for _ in range(2):
+        assert (LinkType.SUPPORTS, b.id) in _link_pairs(zettel_service, a.id)
+        lines = note_file.read_text(encoding="utf-8").split("\n")
+        assert sum(line.strip() == "## Links" for line in lines) == 1
+        zettel_service.rebuild_index()
+
+
+def test_fence_nested_in_a_list_item_is_read_as_ordinary_lines(zettel_service):
+    """Pins the flat scanner's documented limit: a fence indented four spaces
+    under a list item isn't recognized, so an entry-shaped line in it is read as
+    a Links entry (nested list items keep that indent)."""
+    a = zettel_service.create_note(title="Nested Fence", content="a")
+    b = zettel_service.create_note(title="Real Target", content="b")
+    x = zettel_service.create_note(title="Nested Example", content="x")
+    zettel_service.update_note(
+        a.id,
+        content=(
+            f"Body.\n\n## Links\n- related [[{b.id}]] real\n\n"
+            f"    ```\n    - supports [[{x.id}]] example\n    ```\n"
+        ),
+    )
+    assert _link_pairs(zettel_service, a.id) == {
+        (LinkType.RELATED, b.id),
+        (LinkType.SUPPORTS, x.id),
+    }
+
+
+def test_fence_scan_memo_keeps_results():
+    from parazettel_mcp.storage.note_repository import _fenced_lines
+
+    # Three leading spaces still fence; four don't.
+    assert _fenced_lines(["   ```", "## Links", "   ```"]) == [True] * 3
+    assert _fenced_lines(["    ```", "## Links", "    ```"]) == [False] * 3
+    # A longer fence that never closes doesn't stop a shorter one from closing.
+    assert _fenced_lines(["````py", "x", "```", "y", "```"]) == [
+        False, False, True, True, True,
+    ]
+    # Once ``` can't close, no later ``` or ```` opener can either.
+    assert _fenced_lines(["```py", "x", "```py", "````py", "z"]) == [False] * 5
+    # ...but a closer of the same character still closes an earlier opener.
+    assert _fenced_lines(["```py", "x", "````"]) == [True] * 3
+    # The other character is tracked separately.
+    assert _fenced_lines(["```py", "~~~", "w", "~~~"]) == [False, True, True, True]
+
+
 # ---------------------------------------------------------------------------
 # Provenance + verification fields
 # ---------------------------------------------------------------------------
