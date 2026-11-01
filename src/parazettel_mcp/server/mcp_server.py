@@ -2905,8 +2905,9 @@ class ZettelkastenMcpServer:
                 for hop in range(1, depth + 1):
                     next_frontier: List[Note] = []
                     for node in frontier:
-                        if len(visited) >= max_nodes and node is not center:
-                            capped = True
+                        # A full budget alone isn't a cap: the per-neighbor
+                        # check below sets it when a note is actually left out.
+                        if capped and node is not center:
                             break
                         try:
                             neighbors = self.zettel_service.get_linked_notes(
@@ -2993,7 +2994,7 @@ class ZettelkastenMcpServer:
                             "pzk_search_notes (area_id/project_id) or "
                             "pzk_get_linked_notes\n"
                         )
-                if len(visited) - 1 == 0 and not routing:
+                if len(visited) - 1 == 0 and not routing and not capped:
                     out += "\n(No links yet — consider pzk_find_similar_notes to find candidates.)"
                 elif capped:
                     out += (

@@ -507,6 +507,29 @@ class TestIntegration:
         assert "Routing (not expanded)" not in old
         assert f"[via {g['area'].id}: -> has_part (routing);" in old  # siblings
 
+    def test_neighborhood_cap_notice_only_when_a_note_was_left_out(self):
+        """No area, so no routing entries share the budget."""
+        svc = self.server.zettel_service
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        c, x, y, z = (svc.create_note(title=t, content="x") for t in "CXYZ")
+        svc.create_link(c.id, x.id, LinkType.SUPPORTS)
+        svc.create_link(c.id, y.id, LinkType.EXTENDS)
+
+        # A note with links never reads "No links yet"; the cap says why.
+        alone = tool(note_id=c.id, max_nodes=1)
+        assert "No links yet" not in alone
+        assert "Capped at 1 notes" in alone
+
+        # The budget fills at hop 1, but hop 2 has nothing more to show.
+        full = tool(note_id=c.id, depth=2, max_nodes=3)
+        assert len([ln for ln in full.splitlines() if "[via " in ln]) == 2
+        assert "Capped" not in full
+
+        svc.create_link(y.id, z.id, LinkType.REFINES)
+        over = tool(note_id=c.id, depth=2, max_nodes=3)
+        assert self._entry(over, z) is None
+        assert "Capped at 3 notes" in over
+
     def test_neighborhood_member_seed_does_not_expand_a_lane_mapped_area(self):
         """A lane map naming its members doesn't reopen the sibling flood from a
         member seed: the area is listed once under Routing and not expanded."""
