@@ -1230,9 +1230,14 @@ class ZettelkastenMcpServer:
                 note_id: The ID of the note to delete
             """
             try:
-                # Check if note exists
-                note = self.zettel_service.get_note(note_id)
-                if not note:
+                # Check if note exists. A file that no longer parses still
+                # exists, and delete_note handles it, so only a missing note
+                # is not found.
+                try:
+                    exists = self.zettel_service.get_note(note_id) is not None
+                except OSError:
+                    exists = True
+                if not exists:
                     return self._not_found_message(note_id)
 
                 # Delete the note

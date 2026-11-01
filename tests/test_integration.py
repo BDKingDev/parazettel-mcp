@@ -1,6 +1,7 @@
 # tests/test_integration.py
 """Integration tests for the Zettelkasten MCP system."""
 import datetime
+import os
 import re
 import shutil
 from pathlib import Path
@@ -119,6 +120,25 @@ class TestIntegration:
             file_content = f.read()
             assert title in file_content
             assert content in file_content
+
+    def test_delete_tool_removes_a_note_whose_file_no_longer_parses(self):
+        """pzk_delete_note deletes a note whose file can't be parsed, whether or
+        not a cached copy is still around; a missing id is still not found."""
+        note = self.zettel_service.create_note(
+            title="Corrupt Me", content="x", note_type=NoteType.PERMANENT
+        )
+        note_file = self.notes_dir / f"{note.id}.md"
+        before = note_file.stat()
+        note_file.write_text("---\nid: [unclosed\ntitle: : :\n---\nGarbled.\n")
+        # Move the mtime so no cached copy of the readable note can match.
+        os.utime(note_file, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+        delete = self.registered_tools["pzk_delete_note"]
+        result = delete(note_id=note.id)
+
+        assert result.startswith(f"Note deleted successfully: {note.id}"), result
+        assert not note_file.exists()
+        assert "deleted successfully" not in delete(note_id=note.id)
 
     def test_knowledge_graph_flow(self):
         """Test creating a small knowledge graph with links and semantic relationships."""
