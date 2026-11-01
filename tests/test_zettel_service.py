@@ -1,5 +1,6 @@
 """Tests for the ZettelService class."""
 
+import pytest
 
 from parazettel_mcp.models.schema import LinkType, NoteStatus, NoteType
 
@@ -348,6 +349,28 @@ def test_delete_note(zettel_service):
     # Verify note no longer exists
     deleted_note = zettel_service.get_note(note.id)
     assert deleted_note is None
+
+
+def test_delete_area_refused_while_it_has_members(zettel_service):
+    """An area with members can't be deleted (they'd lose their routing);
+    an empty one can."""
+    area = zettel_service.create_area_note(title="Busy Area", content="Has members.")
+    member = zettel_service.create_note(
+        title="Filed Note",
+        content="Filed under the area.",
+        note_type=NoteType.PERMANENT,
+        area_id=area.id,
+    )
+
+    with pytest.raises(ValueError, match=r"1 note.*[Rr]eassign"):
+        zettel_service.delete_note(area.id)
+
+    assert zettel_service.get_note(area.id) is not None
+    assert zettel_service.get_note(member.id).area_id == area.id
+
+    empty = zettel_service.create_area_note(title="Empty Area", content="No members.")
+    zettel_service.delete_note(empty.id)
+    assert zettel_service.get_note(empty.id) is None
 
 
 def test_create_link(zettel_service):

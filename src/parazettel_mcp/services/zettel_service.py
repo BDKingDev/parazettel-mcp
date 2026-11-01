@@ -724,8 +724,29 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note (serialized against all writers by the global write lock)."""
+        """Delete a note (serialized against all writers by the global write lock).
+
+        An area that still has members is refused: they'd be left filed under
+        a note that no longer exists. A note whose file can't be parsed must
+        still be deletable, so it gets the same membership check, which reads
+        the members, not the note.
+        """
         with self._write_locked():
+            try:
+                note = self.repository.get(note_id)
+            except Exception:
+                note = None
+            if note is None or note.note_type == NoteType.AREA:
+                members = [
+                    member
+                    for member in self.repository.search(area_id=note_id)
+                    if member.id != note_id
+                ]
+                if members:
+                    raise ValueError(
+                        f"Area {note_id} still has {len(members)} note(s) filed under it; "
+                        "reassign them to another area first, then delete it."
+                    )
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
