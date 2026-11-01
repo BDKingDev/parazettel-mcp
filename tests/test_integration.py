@@ -1,6 +1,7 @@
 # tests/test_integration.py
 """Integration tests for the Zettelkasten MCP system."""
 import datetime
+import os
 import re
 import shutil
 import sqlite3
@@ -68,7 +69,7 @@ class TestIntegration:
         mock_mcp = type("MockMCP", (), {})()
         mock_mcp.tool = mock_tool_decorator
 
-        with patch("parazettel_mcp.server.mcp_server.FastMCP", return_value=mock_mcp):
+        with patch("parazettel_mcp.server.mcp_server.MCPServer", return_value=mock_mcp):
             self.server = ZettelkastenMcpServer()
 
         yield
@@ -254,6 +255,25 @@ class TestIntegration:
         assert "verification" not in cleared.metadata
         assert "verification" not in (self.notes_dir / f"{note.id}.md").read_text()
 
+    def test_delete_tool_removes_a_note_whose_file_no_longer_parses(self):
+        """pzk_delete_note deletes a note whose file can't be parsed, whether or
+        not a cached copy is still around; a missing id is still not found."""
+        note = self.zettel_service.create_note(
+            title="Corrupt Me", content="x", note_type=NoteType.PERMANENT
+        )
+        note_file = self.notes_dir / f"{note.id}.md"
+        before = note_file.stat()
+        note_file.write_text("---\nid: [unclosed\ntitle: : :\n---\nGarbled.\n")
+        # Move the mtime so no cached copy of the readable note can match.
+        os.utime(note_file, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+        delete = self.registered_tools["pzk_delete_note"]
+        result = delete(note_id=note.id)
+
+        assert result.startswith(f"Note deleted successfully: {note.id}"), result
+        assert not note_file.exists()
+        assert "deleted successfully" not in delete(note_id=note.id)
+
     def test_knowledge_graph_flow(self):
         """Test creating a small knowledge graph with links and semantic relationships."""
         # Create several notes to form a knowledge graph
@@ -422,6 +442,78 @@ class TestIntegration:
             "Write integration tests"
         )
 
+    def test_area_and_project_reads_hide_generated_links(self):
+        """pzk_get_area / pzk_get_project show the curated body, not one ## Links
+        line per member, and say how many links were hidden."""
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Busy area", content="Placeholder.")
+        lane = svc.create_note(title="Lane entry note", content="x", area_id=area.id)
+        for i in range(40):
+            svc.create_note(title=f"Member {i:02d}", content="x", area_id=area.id)
+        project = svc.create_project_note(
+            title="Busy project", content="Project goal.", area_id=area.id
+        )
+        for i in range(25):
+            svc.create_note(
+                title=f"Project note {i:02d}", content="x", project_id=project.id
+            )
+        lane_map = f"Main lanes:\n- **Entry**\n  - [[{lane.id}|Lane entry note]]"
+        svc.update_note(area.id, content=f"# Busy area\n\n{lane_map}")
+        area = svc.get_note(area.id)
+        project = svc.get_note(project.id)
+        assert len(area.links) >= 42 and len(project.links) >= 25
+
+        area_out = self.registered_tools["pzk_get_area"](area_id=area.id)
+        assert lane_map in area_out
+        assert "## Links" not in area_out
+        assert "Member 07" not in area_out
+        assert f"[{len(area.links)} link(s) hidden" in area_out
+        assert "Busy project (ID:" in area_out  # the ## Projects list still follows
+
+        project_out = self.registered_tools["pzk_get_project"](project_id=project.id)
+        assert "Project goal." in project_out
+        assert "## Links" not in project_out
+        assert f"[{len(project.links)} link(s) hidden" in project_out
+        assert "Project note 07 (ID:" in project_out  # from Notes:, not ## Links
+
+        full = self.registered_tools["pzk_get_note"](
+            identifier=area.id, include_links=True
+        )
+        assert "Member 07" in full and len(area_out) < len(full) / 3
+
+    def test_container_reads_announce_a_prose_only_links_section(self):
+        """A hand-edited ## Links section with no list lines is still hidden, and
+        the response says so; sections after it are kept verbatim."""
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Prose area", content="Placeholder.")
+        project = svc.create_project_note(
+            title="Prose project", content="x", area_id=area.id
+        )
+        prose = "I link these by hand when a lane gets crowded."
+        cadence = "## Review cadence\n\nMonthly, first Sunday.\n"
+        for note in (area, project):
+            path = svc.repository.notes_dir / f"{note.id}.md"
+            head, _, _ = path.read_text(encoding="utf-8").partition("## Links")
+            path.write_text(f"{head}## Links\n\n{prose}\n\n{cadence}", encoding="utf-8")
+
+        area_out = self.registered_tools["pzk_get_area"](area_id=area.id)
+        project_out = self.registered_tools["pzk_get_project"](project_id=project.id)
+        for out, note in ((area_out, area), (project_out, project)):
+            assert prose not in out
+            assert (
+                f"[Hidden: Links section — see pzk_get_linked_notes('{note.id}')" in out
+            )
+            assert cadence in out
+
+        # The full section is still one call away, and pzk_get_note's default read
+        # announces the hidden section too.
+        full = self.registered_tools["pzk_get_note"](
+            identifier=area.id, include_links=True
+        )
+        assert prose in full and cadence in full
+        default = self.registered_tools["pzk_get_note"](identifier=area.id)
+        assert prose not in default and "[Links section hidden" in default
+
     def test_rebuild_index_flow(self):
         """Test the rebuild index functionality with direct file modifications."""
         # Create a note through the service
@@ -549,3 +641,181 @@ class TestIntegration:
         # Drop the only tag; the tool output must drop with it.
         self.zettel_service.update_note(note.id, tags=[])
         assert "live-tag" not in {t.name for t in self.zettel_service.get_all_tags()}
+
+    def _neighborhood_graph(self):
+        """An area with 30 unrelated siblings and a described knowledge thread.
+
+        C -refines-> K1 -extends-> K3; K2 -supports-> C; K4 -contradicts-> K2;
+        K1 -supports-> C as well (two edges on one pair); map M -supports-> C
+        with no description; C mentions K5 inline in its prose.
+        """
+        svc = self.server.zettel_service
+        area = svc.create_area_note(title="Hub area", content="Area hub.")
+
+        def note(title, content="x", **kwargs):
+            return svc.create_note(
+                title=title, content=content, area_id=area.id, **kwargs
+            )
+
+        for i in range(30):
+            note(f"Sibling {i:02d}")
+        k5 = note("K5 mentioned inline")
+        c = note("Center claim", content=f"Builds on [[{k5.id}]].")
+        k1, k2, k3, k4 = (note(f"K{i}") for i in range(1, 5))
+        m = note("Map M", note_type=NoteType.STRUCTURE)
+        svc.create_link(c.id, k1.id, LinkType.REFINES, "K1 adds the keep-or-skip test")
+        svc.create_link(k1.id, c.id, LinkType.SUPPORTS)
+        svc.create_link(k2.id, c.id, LinkType.SUPPORTS, "K2 is the worked evidence")
+        svc.create_link(k1.id, k3.id, LinkType.EXTENDS, "K3 applies K1 to maps")
+        svc.create_link(k4.id, k2.id, LinkType.CONTRADICTS, "K4 disputes K2's sample")
+        svc.create_link(m.id, c.id, LinkType.SUPPORTS)
+        return dict(area=area, c=c, k1=k1, k2=k2, k3=k3, k4=k4, k5=k5, m=m)
+
+    @staticmethod
+    def _entry(out, note):
+        """The output line for *note*, or None."""
+        return next((ln for ln in out.splitlines() if f"(ID: {note.id}," in ln), None)
+
+    def test_neighborhood_follows_knowledge_links_not_area_routing(self):
+        g = self._neighborhood_graph()
+        out = self.registered_tools["pzk_get_neighborhood"](note_id=g["c"].id)
+        hops, routing = out.split("Routing (not expanded):")
+
+        assert "Sibling" not in out
+        for key in ("k1", "k2", "k5", "m"):
+            assert f"[via {g['c'].id}:" in self._entry(hops, g[key])
+        assert f"[via {g['k1'].id}: -> extends: \"K3 applies K1 to maps\"]" in hops
+        assert (
+            f"[via {g['k2'].id}: <- contradicts: \"K4 disputes K2's sample\"]" in hops
+        )
+        # Both edges on the C-K1 pair, each with only its own stored description.
+        assert '-> refines: "K1 adds the keep-or-skip test"; <- supports]' in hops
+        assert self._entry(hops, g["m"]).endswith(f"[via {g['c'].id}: <- supports]")
+        assert self._entry(hops, g["k5"]).endswith("-> inline]")
+        # The area is listed once, as routing, and not expanded.
+        assert out.count(f"(ID: {g['area'].id},") == 1
+        assert self._entry(routing, g["area"]).endswith(
+            "[-> reference (routing); -> part_of (routing); <- has_part (routing)]"
+        )
+        assert "include_routing=true" in out
+
+    def test_neighborhood_order_does_not_depend_on_neighbor_order(self):
+        g = self._neighborhood_graph()
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        first = tool(note_id=g["c"].id)
+        real = self.server.zettel_service.get_linked_notes
+        with patch.object(
+            self.server.zettel_service,
+            "get_linked_notes",
+            side_effect=lambda nid, d: list(reversed(real(nid, d))),
+        ):
+            assert tool(note_id=g["c"].id) == first
+
+    def test_neighborhood_cap_and_include_routing(self):
+        g = self._neighborhood_graph()
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        # max_nodes counts every note shown: center, linked notes, routing entries.
+        capped = tool(note_id=g["c"].id, max_nodes=3)
+        assert "Capped at 3 notes" in capped
+        assert len([ln for ln in capped.splitlines() if "[via " in ln]) == 2
+        assert self._entry(capped, g["area"]) is None
+        assert "- … 1 more; list them with" in capped  # the area, not dropped silently
+        alone = tool(note_id=g["c"].id, max_nodes=1)
+        assert "— 0 connected, 1 routing note(s)" in alone
+        assert "Capped at 1 notes" in alone
+        assert not [
+            ln for ln in alone.splitlines() if ln.startswith("- ") and "(ID: " in ln
+        ]
+        roomy = tool(note_id=g["c"].id, max_nodes=8)
+        assert "Routing (not expanded)" in roomy and self._entry(roomy, g["area"])
+
+        old = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
+        assert "Routing (not expanded)" not in old
+        assert f"[via {g['area'].id}: -> has_part (routing);" in old  # siblings
+
+    def test_neighborhood_cap_notice_only_when_a_note_was_left_out(self):
+        """No area, so no routing entries share the budget."""
+        svc = self.server.zettel_service
+        tool = self.registered_tools["pzk_get_neighborhood"]
+        c, x, y, z = (svc.create_note(title=t, content="x") for t in "CXYZ")
+        svc.create_link(c.id, x.id, LinkType.SUPPORTS)
+        svc.create_link(c.id, y.id, LinkType.EXTENDS)
+
+        # A note with links never reads "No links yet"; the cap says why.
+        alone = tool(note_id=c.id, max_nodes=1)
+        assert "No links yet" not in alone
+        assert "Capped at 1 notes" in alone
+
+        # The budget fills at hop 1, but hop 2 has nothing more to show.
+        full = tool(note_id=c.id, depth=2, max_nodes=3)
+        assert len([ln for ln in full.splitlines() if "[via " in ln]) == 2
+        assert "Capped" not in full
+
+        svc.create_link(y.id, z.id, LinkType.REFINES)
+        over = tool(note_id=c.id, depth=2, max_nodes=3)
+        assert self._entry(over, z) is None
+        assert "Capped at 3 notes" in over
+
+    def test_neighborhood_member_seed_does_not_expand_a_lane_mapped_area(self):
+        """A lane map naming its members doesn't reopen the sibling flood from a
+        member seed: the area is listed once under Routing and not expanded."""
+        g = self._neighborhood_graph()
+        svc = self.server.zettel_service
+        siblings = [
+            n for n in svc.get_all_notes() if n.title.startswith("Sibling")
+        ]
+        lanes = "\n".join(f"- [[{n.id}]]" for n in [g["c"], *siblings])
+        svc.update_note(g["area"].id, content=f"Lanes:\n{lanes}")
+        tool = self.registered_tools["pzk_get_neighborhood"]
+
+        out = tool(note_id=g["c"].id, depth=2)
+        assert "Sibling" not in out
+        assert out.count(f"(ID: {g['area'].id},") == 1
+        routing = out.split("Routing (not expanded):")[1]
+        area_entry = self._entry(routing, g["area"])
+        assert "<- inline" in area_entry and "[via " not in area_entry
+        assert f"[via {g['c'].id}: -> refines:" in self._entry(out, g["k1"])
+
+        # include_routing still opens the area and its members.
+        wide = tool(note_id=g["c"].id, include_routing=True, max_nodes=60)
+        assert f"[via {g['area'].id}:" in wide and "Sibling" in wide
+
+    def test_neighborhood_container_seed_lists_members_and_keeps_knowledge_edges(self):
+        g = self._neighborhood_graph()
+        svc = self.server.zettel_service
+        # The lane map links its own member C inline. Naming a member in the
+        # container's prose is filing, like the member's reference to its area,
+        # so it is routing; the inline edge stays visible in the label.
+        svc.update_note(g["area"].id, content=f"Lanes:\n- [[{g['c'].id}]]")
+        tool = self.registered_tools["pzk_get_neighborhood"]
+
+        out = tool(note_id=g["area"].id, depth=2, max_nodes=14)
+        assert "Hop 1:" not in out  # the area has no knowledge links of its own
+        routing = out.split("Routing (not expanded):")[1]
+        everyone = tool(note_id=g["area"].id, depth=2, max_nodes=60)
+        c_entry = self._entry(everyone.split("Routing (not expanded):")[1], g["c"])
+        assert "-> inline" in c_entry and "[via " not in c_entry
+        assert f"[via {g['c'].id}:" not in everyone  # C is not expanded
+        # The members fill the budget, never left empty.
+        assert "Sibling 00" in routing and "more; list them with" in routing
+        shown = [ln for ln in out.splitlines() if ln.startswith("- ") and "(ID: " in ln]
+        assert len(shown) == 14 - 1  # every listed note counts toward max_nodes
+        assert "— 0 connected, " in out and " routing note(s)" in out
+
+        # A written link to the area makes the pair traversable from the note,
+        # and the area then expands through its knowledge edges only.
+        svc.create_link(g["k3"].id, g["area"].id, LinkType.SUPPORTS)
+        from_k3 = tool(note_id=g["k3"].id, depth=2)
+        area_entry = self._entry(from_k3, g["area"])
+        assert "[via " in area_entry and "-> supports" in area_entry
+        entries = [ln for ln in from_k3.splitlines() if ln.startswith("- ")]
+        assert entries and not any("Sibling" in ln for ln in entries)
+
+        # The mirror: a member naming its own area in prose is filing too, so
+        # it isn't reached through the area from K3 or "connected" to the area.
+        s0 = next(n for n in svc.get_all_notes() if n.title == "Sibling 00")
+        svc.update_note(s0.id, content=f"Filed under [[{g['area'].id}]].")
+        assert self._entry(tool(note_id=g["k3"].id, depth=2), s0) is None
+        from_area = tool(note_id=g["area"].id, depth=2, max_nodes=60)
+        s0_entry = self._entry(from_area.split("Routing (not expanded):")[1], s0)
+        assert "<- inline (routing)" in s0_entry and "[via " not in s0_entry

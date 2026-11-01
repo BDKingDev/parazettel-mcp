@@ -25,6 +25,8 @@ from parazettel_mcp.storage.file_lock import file_lock
 from parazettel_mcp.storage.note_repository import (
     WIKI_TARGET_SUFFIX,
     NoteRepository,
+    has_links_heading,
+    text_before_links_section,
 )
 
 logger = logging.getLogger(__name__)
@@ -619,7 +621,9 @@ class ZettelService:
         unlinked, lines added are linked. Links that survive keep their original
         ``created_at``/description. When the new content has NO ``## Links``
         heading the existing links are kept unchanged (so passing just a new
-        body never wipes the link graph).
+        body never wipes the link graph). Only a real heading line counts: the
+        text "## Links" in prose, a code span or fenced code, or a longer heading
+        such as "## Links to read", is not a Links section (``has_links_heading``).
 
         Routing-derived links (area ``reference``/``part_of``) are NOT free-form
         — they are generated from the note's frontmatter routing — so they are
@@ -628,7 +632,7 @@ class ZettelService:
         area/project (the later routing sync only repairs links when
         ``area_id``/``project_id`` themselves change).
         """
-        if "## Links" not in content:
+        if not has_links_heading(content):
             return
         parsed = self.repository.parse_links_in_content(note.id, content)
         existing_by_key = {
@@ -827,8 +831,55 @@ class ZettelService:
             )
 
     def delete_note(self, note_id: str) -> None:
-        """Delete a note (serialized against all writers by the global write lock)."""
+        """Delete a note (serialized against all writers by the global write lock).
+
+        An area that still has members is refused: they'd be left filed under
+        a note that no longer exists.
+
+        Deleting a project keeps its members: each note, task or subproject
+        routed to it has its ``project_id`` cleared first, through the normal
+        update path, so it falls back to its area's routing and stays editable.
+
+        A note whose file can't be parsed must still be deletable. It can't be
+        known to be a project, so it has no members to clear, but it gets the
+        area membership check, which reads the members, not the note.
+        """
         with self._write_locked():
+            try:
+                note = self.repository.get(note_id)
+            except IOError:
+                note = None
+            if note and note.note_type == NoteType.PROJECT:
+                for member in self.repository.search(project_id=note_id):
+                    if member.id == note_id:
+                        continue
+                    # Best-effort, like the reference scrub in repository.delete:
+                    # an unreadable member is left byte-for-byte as it is rather
+                    # than blocking the delete. Only the read is guarded, so a
+                    # failed write still aborts.
+                    try:
+                        self.repository.get(member.id)
+                    except IOError as exc:
+                        logger.warning(
+                            "Could not clear project %s from member %s during "
+                            "delete: %s",
+                            note_id,
+                            member.id,
+                            exc,
+                        )
+                        continue
+                    self._update_note_locked(member.id, project_id=None)
+            if note is None or note.note_type == NoteType.AREA:
+                members = [
+                    member
+                    for member in self.repository.search(area_id=note_id)
+                    if member.id != note_id
+                ]
+                if members:
+                    raise ValueError(
+                        f"Area {note_id} still has {len(members)} note(s) filed under it; "
+                        "reassign them to another area first, then delete it."
+                    )
             self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
@@ -1379,6 +1430,43 @@ class ZettelService:
     )
 
     @classmethod
+    def is_routing_link(cls, note: Note, link: Link) -> bool:
+        """True for a PARA/GTD routing edge rather than a written connection:
+        part_of/has_part/blocks*, or the plain reference *note* carries to its
+        own area. Any other link type to the area (supports, extends, ...) is
+        still knowledge.
+        """
+        if link.link_type in cls._ROUTING_LINK_TYPES:
+            return True
+        return (
+            link.link_type == LinkType.REFERENCE
+            and bool(note.area_id)
+            and link.target_id == note.area_id
+        )
+
+    @staticmethod
+    def is_routing_inline_ref(source: Note, target: Note) -> bool:
+        """True when an inline ``[[id]]`` ref only says where a note is filed:
+        an area or project naming a note filed under it (a lane map naming its
+        own members), or a note naming its own area or project in its prose.
+
+        This mirrors the member's plain reference to its own area in
+        ``is_routing_link``: each says "this note is filed here", not "these two
+        ideas connect", so no sibling is reached only through the container.
+        ``_knowledge_link_targets`` is broader on purpose (it drops every link
+        type to the note's own area, for similarity scoring); the two rules
+        answer different questions, so don't unify them.
+        """
+        if target.id == source.id:
+            return False
+        if target.id in (source.area_id, source.project_id):
+            return True
+        return source.note_type in (
+            NoteType.AREA,
+            NoteType.PROJECT,
+        ) and source.id in (target.area_id, target.project_id)
+
+    @classmethod
     def _knowledge_link_targets(cls, note: Note) -> Set[str]:
         """Return target ids of a note's genuine knowledge links.
 
@@ -1455,8 +1543,8 @@ class ZettelService:
         title = note.title or ""
         body = note.content or ""
         # Drop the generated ## Links section so link IDs don't dominate overlap.
-        # Match only an actual heading line, never the literal text in prose.
-        body = re.split(r"(?m)^\s*##\s+Links\s*$", body, maxsplit=1)[0]
+        # Only a real heading counts, never the text in prose or a fenced example.
+        body = text_before_links_section(body)
         text = f"{title} {body}".lower()
         tokens = re.findall(r"[a-z0-9]+", text)
         return {
@@ -1585,6 +1673,7 @@ class ZettelService:
             )
 
         previous_project_id = task.project_id
+        previous_area_id = task.area_id
         if project_id is not _UNSET:
             if not project_id:
                 raise ValueError(
@@ -1623,8 +1712,16 @@ class ZettelService:
         if any(value is not _UNSET for value in pending_updates.values()):
             task.updated_at = datetime.datetime.now()
             task = self.repository.update(task)
+            if previous_area_id != task.area_id:
+                task = self._sync_area_reference_link(
+                    task.id, previous_area_id, task.area_id
+                )
+            # Like _update_note_locked, PART_OF follows the effective container:
+            # the project, or the area for a task whose project was deleted.
             task = self._sync_part_of_link(
-                task.id, previous_project_id, task.project_id
+                task.id,
+                previous_project_id or previous_area_id,
+                task.project_id or task.area_id,
             )
 
         if status is not _UNSET:

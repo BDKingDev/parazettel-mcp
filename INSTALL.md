@@ -4,7 +4,7 @@ Step-by-step installation for Parazettel MCP, including both direct usage and th
 
 ## Prerequisites
 
-- Python 3.13+ whose bundled SQLite includes FTS5 (true of uv-managed and most standard builds)
+- Python 3.11+ whose bundled SQLite includes FTS5 (true of uv-managed and most standard builds); the setup below uses 3.13
 - [uv](https://github.com/astral-sh/uv) recommended
 - Claude Code or another MCP client
 - Git
@@ -163,7 +163,7 @@ to convert, recover the script from history (this finds the commit that deleted
 it, so it works whatever the commit hashes are):
 
 ```bash
-git show "$(git rev-list -n 1 HEAD -- scripts/migrate_kuzu_to_sqlite.py)^:scripts/migrate_kuzu_to_sqlite.py" > migrate_kuzu_to_sqlite.py
+git show "$(git rev-list --full-history -n 1 HEAD -- scripts/migrate_kuzu_to_sqlite.py)^:scripts/migrate_kuzu_to_sqlite.py" > migrate_kuzu_to_sqlite.py
 pip install "kuzu>=0.11.3,<0.12"
 ```
 

@@ -7,9 +7,9 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Protocol, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from parazettel_mcp.config import config
 from parazettel_mcp.daemon.client import (
     DaemonRpcClient,
@@ -17,7 +17,9 @@ from parazettel_mcp.daemon.client import (
     RemoteServiceProxy,
 )
 from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.note_repository import NoteRepository
 from parazettel_mcp.models.schema import (
+    Link,
     LinkType,
     Note,
     NoteSource,
@@ -27,6 +29,7 @@ from parazettel_mcp.models.schema import (
 from parazettel_mcp.services.reranker import RerankerError, reranker_enabled
 from parazettel_mcp.services.search_service import SearchService
 from parazettel_mcp.services.zettel_service import ZettelService
+from parazettel_mcp.storage.note_repository import links_section_lines
 
 logger = logging.getLogger(__name__)
 
@@ -68,33 +71,60 @@ def _strip_links_section(content: str) -> Tuple[str, int]:
     lines that bloat context every time the note is read. This drops that section
     (heading through the next ``## `` heading or EOF) and returns
     ``(stripped_content, hidden_link_count)``. Inline ``[[id]]`` references in
-    prose are left untouched — only the structured section is removed.
+    prose are left untouched — only the structured section is removed. The
+    section is found by the same rule storage uses, so a fenced example of a
+    ``## Links`` heading stays visible.
     """
-    lines = content.splitlines()
     out: List[str] = []
     hidden = 0
-    i = 0
-    n = len(lines)
-    while i < n:
-        line = lines[i]
-        if line.strip().lower() == "## links":
-            j = i + 1
-            while j < n and not lines[j].lstrip().startswith("## "):
-                if lines[j].strip().startswith("- "):
-                    hidden += 1
-                j += 1
+    in_section = False
+    for line, in_links, is_fenced in links_section_lines(
+        "\n".join(content.splitlines())
+    ):
+        if in_links and not in_section:
             # Drop any blank lines we already emitted just before the heading so
             # the body doesn't end with a dangling gap.
             while out and out[-1].strip() == "":
                 out.pop()
-            i = j
-            continue
-        out.append(line)
-        i += 1
+        in_section = in_links
+        if not in_links:
+            out.append(line)
+        elif not is_fenced and line.strip().startswith("- "):
+            hidden += 1
     stripped = "\n".join(out).rstrip()
     if stripped:
         stripped += "\n"
     return stripped, hidden
+
+
+def _has_links_section(content: str) -> bool:
+    """Whether _strip_links_section removes a ``## Links`` section from *content*.
+
+    Asks the stripper itself rather than matching the heading separately, so
+    the hidden-section notice can never disagree with what was hidden.
+    """
+    shown, _ = _strip_links_section(content)
+    return shown.rstrip() != "\n".join(content.splitlines()).rstrip()
+
+
+def _container_body(note_id: str, content: str) -> str:
+    """Area/project body for display, with ``## Links`` hidden as pzk_get_note does.
+
+    A container's ``## Links`` holds one line per member, so for a busy area it
+    is nearly all of the note. Whatever the section holds — list lines or prose —
+    its removal is announced. These tools have no include_links flag, so the
+    notice points at pzk_get_note for the full section.
+    """
+    body, hidden = _strip_links_section(content)
+    if _has_links_section(content):
+        what = f"{hidden} link(s) hidden with the" if hidden else "Hidden:"
+        body += (
+            f"\n[{what} Links section — see pzk_get_linked_notes('{note_id}') "
+            "for direction and stored descriptions, or "
+            f"pzk_get_note('{note_id}', include_links=true) for the full "
+            "section]\n"
+        )
+    return body
 
 # Operating manual injected into every MCP client session. This is the one
 # piece of documentation the calling model is guaranteed to see, so the
@@ -150,6 +180,9 @@ class DirectBackendBundle:
     def initialize(self) -> None:
         self.zettel_service.initialize()
         self.search_service.initialize()
+        # MCP 2 runs sync tool handlers on worker threads, so the first embed
+        # would otherwise import fastembed there; load it on this thread instead.
+        self.zettel_service.repository.prewarm_embeddings()
 
     def close(self) -> None:
         self.zettel_service.close()
@@ -204,12 +237,10 @@ class ZettelkastenMcpServer:
 
     def __init__(self):
         """Initialize the MCP server."""
-        self.mcp = FastMCP(
+        self.mcp = MCPServer(
             config.server_name,
             instructions=_SERVER_INSTRUCTIONS,
             version=config.server_version,
-            host=config.server_host,
-            port=config.server_port,
         )
         self.backend = self._build_backend()
         self.zettel_service = self.backend.zettel_service
@@ -609,6 +640,12 @@ class ZettelkastenMcpServer:
                 f"\n[{hidden} link(s) hidden — explore with pzk_get_linked_notes / "
                 "pzk_get_neighborhood, or re-fetch with include_links=true]\n"
             )
+        elif not include_links and _has_links_section(note.content):
+            # A hand-written section with no list lines: still say it was hidden.
+            result += (
+                "\n[Links section hidden — explore with pzk_get_linked_notes, "
+                "or re-fetch with include_links=true]\n"
+            )
         return result
 
     def _resolve_note_identifier(self, identifier: str) -> Optional[Note]:
@@ -743,19 +780,52 @@ class ZettelkastenMcpServer:
         return notice + ")\n"
 
     @staticmethod
-    def _describe_relation(node: Note, neighbor: Note) -> str:
-        """Short label for how *neighbor* connects to *node* (direction + type)."""
-        for link in node.links:
-            if link.target_id == neighbor.id:
-                return f"-> {link.link_type.value}"
-        for link in neighbor.links:
-            if link.target_id == node.id:
-                return f"<- {link.link_type.value}"
-        if neighbor.id in getattr(node, "inline_refs", []):
-            return "-> inline"
-        if node.id in getattr(neighbor, "inline_refs", []):
-            return "<- inline"
-        return "linked"
+    def _neighbor_edges(
+        node: Note,
+        neighbor: Note,
+        inline_of: Callable[[Note], Set[str]],
+        links_to: Callable[[Note, str], List[Link]],
+    ) -> List[Tuple[str, str, Optional[str], bool]]:
+        """Every edge between *node* and *neighbor* as (arrow, type, description,
+        is_routing): outgoing first in *node*'s link order, then incoming.
+
+        *links_to(note, target_id)* returns note's stored links to the target, in
+        link order, from a per-request index (a container has one link per
+        member, so rescanning them per neighbor would be quadratic). Inline
+        edges come from the prose (*inline_of*), not the stored graph, which
+        skips an inline ref whose target is also linked explicitly; an inline
+        ref between a container and its own member, in either direction, is
+        routing (``ZettelService.is_routing_inline_ref``), but stays in the
+        label.
+        """
+        edges: List[Tuple[str, str, Optional[str], bool]] = []
+        for arrow, src, dst in (("->", node, neighbor), ("<-", neighbor, node)):
+            for link in links_to(src, dst.id):
+                if link.link_type == LinkType.INLINE:
+                    continue
+                edges.append(
+                    (
+                        arrow,
+                        link.link_type.value,
+                        link.description,
+                        ZettelService.is_routing_link(src, link),
+                    )
+                )
+            if dst.id in inline_of(src):
+                routing = ZettelService.is_routing_inline_ref(src, dst)
+                edges.append((arrow, LinkType.INLINE.value, None, routing))
+        return edges
+
+    @staticmethod
+    def _format_edges(edges: List[Tuple[str, str, Optional[str], bool]]) -> str:
+        """``-> refines: "why"; <- part_of (routing)`` — descriptions only when stored."""
+        parts = []
+        for arrow, kind, description, routing in edges:
+            part = f"{arrow} {kind}" + (" (routing)" if routing else "")
+            if description:
+                part += f': "{description}"'
+            parts.append(part)
+        return "; ".join(parts) or "linked"
 
     def _suggested_links_message(self, note_id: str) -> str:
         """Propose link candidates for a freshly created note (best-effort).
@@ -1381,9 +1451,14 @@ class ZettelkastenMcpServer:
                 note_id: The ID of the note to delete
             """
             try:
-                # Check if note exists
-                note = self.zettel_service.get_note(note_id)
-                if not note:
+                # Check if note exists. A file that no longer parses still
+                # exists, and delete_note handles it, so only a missing note
+                # is not found.
+                try:
+                    exists = self.zettel_service.get_note(note_id) is not None
+                except OSError:
+                    exists = True
+                if not exists:
                     return self._not_found_message(note_id)
 
                 # Delete the note
@@ -2652,7 +2727,7 @@ class ZettelkastenMcpServer:
                         )
                 else:
                     out += "- None\n"
-                out += f"\n\n{project.content}\n"
+                out += f"\n\n{_container_body(project.id, project.content)}\n"
                 return out
             except Exception as e:
                 return self.format_error_response(e)
@@ -2823,7 +2898,7 @@ class ZettelkastenMcpServer:
                 if cadence:
                     out += f"Cadence: {cadence}\n"
                 out += f"Projects: {len(projects)}\n"
-                out += f"\n{area.content}\n"
+                out += f"\n{_container_body(area.id, area.content)}\n"
                 if projects:
                     out += "\n## Projects\n"
                     for p in projects:
@@ -2953,17 +3028,36 @@ class ZettelkastenMcpServer:
 
         @self.mcp.tool(name="pzk_get_neighborhood")
         def pzk_get_neighborhood(
-            note_id: str, depth: int = 2, max_nodes: int = 25
+            note_id: str,
+            depth: int = 2,
+            max_nodes: int = 25,
+            include_routing: bool = False,
         ) -> str:
-            """Map the linked neighborhood around a note, grouped by hop distance.
+            """Map the knowledge-link neighborhood around a note, grouped by hop.
 
             Use for synthesis ('what do I know around X?') instead of chaining
-            pzk_get_linked_notes calls. Includes inline prose references.
+            pzk_get_linked_notes calls. Follows written links and inline prose
+            references. Each entry names the note it was reached from (via) and
+            every edge between the two, with the link's stored description when
+            it has one. Neighbors are visited in note-ID order, so the map is
+            stable.
+
+            PARA routing links (part_of/has_part/blocks, a note's plain
+            reference to its own area, a note's inline [[id]] to its own area
+            or project, and an area's or project's inline [[id]] to a note
+            filed under it, such as a lane map) are not traversed, because an
+            area links to every note filed under it. The center's own routing
+            neighbors — its area/project, or a container's members — are
+            listed once under "Routing" without being expanded.
 
             Args:
                 note_id: ID or title of the center note
                 depth: How many hops to traverse (1-3)
-                max_nodes: Cap on total notes returned (default 25)
+                max_nodes: Cap on notes shown, center and Routing entries
+                    included (default 25). Linked notes fill it first; routing
+                    neighbors get what is left
+                include_routing: Also traverse routing links (an area hub then
+                    pulls in its members)
             """
             try:
                 if not 1 <= depth <= 3:
@@ -2977,11 +3071,34 @@ class ZettelkastenMcpServer:
                 visited: Dict[str, Note] = {center.id: center}
                 hop_of: Dict[str, int] = {center.id: 0}
                 relation: Dict[str, str] = {}
+                via: Dict[str, str] = {}
+                routing: List[Tuple[Note, str]] = []
+                skipped_routing = False
+                capped = False
+                inline_cache: Dict[str, Set[str]] = {}
+
+                def inline_of(note: Note) -> Set[str]:
+                    if note.id not in inline_cache:
+                        inline_cache[note.id] = set(NoteRepository.inline_targets(note))
+                    return inline_cache[note.id]
+
+                links_cache: Dict[str, Dict[str, List[Link]]] = {}
+
+                def links_to(note: Note, target_id: str) -> List[Link]:
+                    if note.id not in links_cache:
+                        by_target: Dict[str, List[Link]] = {}
+                        for link in note.links:
+                            by_target.setdefault(link.target_id, []).append(link)
+                        links_cache[note.id] = by_target
+                    return links_cache[note.id].get(target_id, [])
+
                 frontier: List[Note] = [center]
                 for hop in range(1, depth + 1):
                     next_frontier: List[Note] = []
                     for node in frontier:
-                        if len(visited) >= max_nodes:
+                        # A full budget alone isn't a cap: the per-neighbor
+                        # check below sets it when a note is actually left out.
+                        if capped and node is not center:
                             break
                         try:
                             neighbors = self.zettel_service.get_linked_notes(
@@ -2992,24 +3109,44 @@ class ZettelkastenMcpServer:
                                 "Could not read neighbors for %s: %s", node.id, exc
                             )
                             continue
-                        for neighbor in neighbors:
+                        for neighbor in sorted(neighbors, key=lambda n: n.id):
                             if neighbor.id in visited:
                                 continue
+                            edges = self._neighbor_edges(
+                                node, neighbor, inline_of, links_to
+                            )
+                            if (
+                                not include_routing
+                                and edges
+                                and all(edge[3] for edge in edges)
+                            ):
+                                skipped_routing = True
+                                if node is center:
+                                    routing.append(
+                                        (neighbor, self._format_edges(edges))
+                                    )
+                                continue
                             if len(visited) >= max_nodes:
+                                capped = True
+                                # Keep scanning the center so its routing
+                                # neighbors are still listed.
+                                if node is center:
+                                    continue
                                 break
                             visited[neighbor.id] = neighbor
                             hop_of[neighbor.id] = hop
-                            relation[neighbor.id] = self._describe_relation(
-                                node, neighbor
-                            )
+                            relation[neighbor.id] = self._format_edges(edges)
+                            via[neighbor.id] = node.id
                             next_frontier.append(neighbor)
                     frontier = next_frontier
                     if not frontier:
                         break
+                routing = [(n, label) for n, label in routing if n.id not in visited]
 
                 out = (
                     f"Neighborhood of '{center.title}' (ID: {center.id}) — "
-                    f"{len(visited) - 1} connected note(s) within {depth} hop(s):\n"
+                    f"{len(visited) - 1} connected, {len(routing)} routing "
+                    f"note(s) within {depth} hop(s):\n"
                 )
                 for hop in range(1, depth + 1):
                     at_hop = [
@@ -3021,21 +3158,44 @@ class ZettelkastenMcpServer:
                         continue
                     out += f"\nHop {hop}:\n"
                     for note in at_hop:
-                        preview = note.content[:120].replace("\n", " ").strip()
+                        body, _ = _strip_links_section(note.content)
+                        preview = body[:120].replace("\n", " ").strip()
                         if len(preview) > 100:
                             preview = preview[:100] + "..."
                         out += (
                             f"- {note.title} (ID: {note.id}, "
-                            f"{note.note_type.value}) [{relation.get(note.id, 'linked')}]\n"
+                            f"{note.note_type.value}) "
+                            f"[via {via[note.id]}: {relation[note.id]}]\n"
                         )
                         if preview:
                             out += f"  {preview}\n"
-                if len(visited) - 1 == 0:
+                if routing:
+                    # Routing entries share the max_nodes budget with the map.
+                    shown = routing[: max(0, max_nodes - len(visited))]
+                    out += "\nRouting (not expanded):\n"
+                    for note, label in shown:
+                        out += (
+                            f"- {note.title} (ID: {note.id}, "
+                            f"{note.note_type.value}) [{label}]\n"
+                        )
+                    if len(routing) > len(shown):
+                        capped = True
+                        out += (
+                            f"- … {len(routing) - len(shown)} more; list them with "
+                            "pzk_search_notes (area_id/project_id) or "
+                            "pzk_get_linked_notes\n"
+                        )
+                if len(visited) - 1 == 0 and not routing and not capped:
                     out += "\n(No links yet — consider pzk_find_similar_notes to find candidates.)"
-                elif len(visited) >= max_nodes:
+                elif capped:
                     out += (
                         f"\n(Capped at {max_nodes} notes; raise max_nodes for "
                         "a wider map.)"
+                    )
+                if skipped_routing:
+                    out += (
+                        "\n(Routing links were not traversed; pass "
+                        "include_routing=true to follow them.)"
                     )
                 return out
             except Exception as e:
@@ -3433,4 +3593,9 @@ class ZettelkastenMcpServer:
 
     def run(self, transport: str = "stdio") -> None:
         """Run the MCP server."""
-        self.mcp.run(transport=transport)
+        if transport == "sse":
+            self.mcp.run(
+                transport="sse", host=config.server_host, port=config.server_port
+            )
+        else:
+            self.mcp.run(transport=transport)

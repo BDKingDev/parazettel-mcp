@@ -1,6 +1,7 @@
 """Tests for the CLI entrypoint."""
 
 import argparse
+import itertools
 import shutil
 import sys
 from pathlib import Path
@@ -14,11 +15,15 @@ from parazettel_mcp import __version__
 from parazettel_mcp.config import DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS, config
 from parazettel_mcp.daemon.client import DaemonUnavailableError
 
+# Anchored to the repo, like conftest.temp_dirs, so a run from another cwd
+# doesn't leave a .tmp there.
+_REPO_TMP = Path(__file__).resolve().parents[1] / ".tmp"
+
 
 @pytest.fixture
 def workspace_temp_dir():
     """Create a writable temp directory inside the repo workspace."""
-    base_dir = Path(".tmp") / "test-main" / str(uuid4())
+    base_dir = _REPO_TMP / "test-main" / str(uuid4())
     base_dir.mkdir(parents=True, exist_ok=True)
     try:
         yield base_dir
@@ -404,7 +409,9 @@ def test_main_exits_when_daemon_backend_cannot_start(
     daemon_client = MagicMock()
     daemon_client.health.side_effect = DaemonUnavailableError("down")
     spawn = MagicMock()
-    ticks = iter([0.0, 0.0, 11.0])
+    # Stays at 11.0 once past the deadline: on Python < 3.13, logging also calls
+    # time.time(), so a fixed-length iterator would run out (StopIteration).
+    ticks = itertools.chain([0.0, 0.0], itertools.repeat(11.0))
 
     monkeypatch.setattr(main_module, "parse_args", lambda: args)
     monkeypatch.setattr(main_module, "setup_logging", setup_logging)
@@ -528,6 +535,9 @@ def test_main_stops_daemon_and_prints_result(monkeypatch, capsys, workspace_temp
     assert "Parazettel daemon stopped." in output
 
 
+# Real Windows only: the spawn path builds a subprocess.STARTUPINFO, which POSIX
+# Pythons don't have, and faking os.name would change it process-wide.
+@pytest.mark.skipif(sys.platform != "win32", reason="uses Windows process APIs")
 def test_spawn_daemon_process_hides_windows_console(monkeypatch):
     """Windows daemon auto-start should use hidden detached process flags."""
     args = argparse.Namespace(
@@ -553,7 +563,6 @@ def test_spawn_daemon_process_hides_windows_console(monkeypatch):
     fake_pythonw = "C:/tmp/fake-pythonw.exe"
 
     monkeypatch.setattr(main_module.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(main_module.os, "name", "nt")
     monkeypatch.setattr(
         main_module, "_get_windows_background_python", lambda: fake_pythonw
     )

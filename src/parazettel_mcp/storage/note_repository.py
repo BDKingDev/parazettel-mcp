@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
@@ -63,12 +63,6 @@ from parazettel_mcp.storage.base import Repository
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level LRU cache  {(path_str, mtime_ns): Note}
-# ---------------------------------------------------------------------------
-_NOTE_CACHE: OrderedDict = OrderedDict()
-_NOTE_CACHE_LOCK = threading.Lock()
-_NOTE_CACHE_MAX = 256
 _ATOMIC_WRITE_ATTEMPTS = 5
 _ATOMIC_WRITE_BACKOFF_SECONDS = 0.05
 _RETRYABLE_ATOMIC_WRITE_WINERRORS = {5, 32}
@@ -126,28 +120,9 @@ _NOTE_ID_RE = re.compile(r"^\d{8}T\d{6,}$")
 # Hidden in Obsidian preview; lets link created_at survive rebuilds.
 _LINK_CREATED_RE = re.compile(r"\s*<!--\s*created:\s*([^>]+?)\s*-->\s*")
 
-# Matches an actual "## Links" heading line (not the literal text in prose), so
-# splitting a note body on it can't be tripped by an in-prose mention.
-_LINKS_HEADING_RE = re.compile(r"(?m)^\s*##\s+Links\s*$")
-
-def _cache_get(path_str: str, mtime_ns: int) -> Optional[Note]:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        note = _NOTE_CACHE.get(key)
-        if note is not None:
-            _NOTE_CACHE.move_to_end(key)
-            return note.model_copy(deep=True)
-    return None
-
-
-def _cache_put(path_str: str, mtime_ns: int, note: Note) -> None:
-    key = (path_str, mtime_ns)
-    with _NOTE_CACHE_LOCK:
-        _NOTE_CACHE[key] = note
-        _NOTE_CACHE.move_to_end(key)
-        while len(_NOTE_CACHE) > _NOTE_CACHE_MAX:
-            _NOTE_CACHE.popitem(last=False)
-
+# The Links heading exactly as the writer emits it, with up to three leading
+# spaces (four or more makes the line indented code) and trailing whitespace.
+_LINKS_HEADING_LINE_RE = re.compile(r" {0,3}## Links\s*")
 
 def _dedupe_preserve_order(values: List[str]) -> List[str]:
     """Return values without duplicates while preserving first-seen order."""
@@ -159,14 +134,6 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
         seen.add(value)
         deduped.append(value)
     return deduped
-
-
-def _cache_evict(path_str: str) -> None:
-    """Remove all cache entries for a given file path (any mtime)."""
-    with _NOTE_CACHE_LOCK:
-        stale = [k for k in _NOTE_CACHE if k[0] == path_str]
-        for k in stale:
-            del _NOTE_CACHE[k]
 
 
 def _json_default(obj: Any) -> Any:
@@ -197,6 +164,14 @@ _LEADING_H1_RE = re.compile(r"^\s*#\s+.*$")
 # Public (no underscore) because the service layer builds the rename pattern
 # from the same fragment — keeping one source of truth for the wiki-link grammar.
 WIKI_TARGET_SUFFIX = r"(?:\.md)?(?:#[^\]\|]*)?"
+
+
+def _read_note_file(file_path: Path) -> Tuple[str, datetime.datetime]:
+    """A note file's text and the modification time of those same bytes."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        modified = datetime.datetime.fromtimestamp(os.fstat(f.fileno()).st_mtime)
+    return content, modified
 
 
 def _coerce_datetime(value: Any, fallback: datetime.datetime) -> datetime.datetime:
@@ -270,6 +245,96 @@ def _db_dict_to_note(
             else None
         ),
     )
+
+
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _fenced_lines(lines: List[str]) -> List[bool]:
+    """Mark each line that is a fence or inside fenced code.
+
+    A fence opens on three or more backticks or tildes and closes on a line of
+    only the same character, at least as long (so a ```` fence can show ```).
+    Opener and closer take at most three leading spaces, like the Links
+    heading: indented four or more, a marker is indented code, not a fence.
+    The scan is flat, not list-aware, so a fence nested in a list item and
+    indented four or more isn't recognized either; its lines are read as
+    ordinary lines. An opener that never closes is treated as plain text, so a
+    stray fence can't hide what follows it, such as the generated Links section.
+    """
+    fenced = [False] * len(lines)
+    # Shortest fence of each character already known not to close: the scan
+    # only moves forward, so no later opener of that character at least as
+    # long can close either, and isn't rescanned.
+    unclosed: Dict[str, int] = {}
+    i = 0
+    while i < len(lines):
+        opener = _FENCE_OPEN_RE.match(lines[i])
+        # A backtick fence's info string can't hold a backtick (```x``` is a span).
+        if not opener or (
+            opener.group(1)[0] == "`" and "`" in lines[i][opener.end() :]
+        ):
+            i += 1
+            continue
+        fence = opener.group(1)
+        if len(fence) >= unclosed.get(fence[0], len(fence) + 1):
+            i += 1  # known unclosed: not a fence
+            continue
+        close = re.compile(rf"^ {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*$")
+        end = next((j for j in range(i + 1, len(lines)) if close.match(lines[j])), None)
+        if end is None:
+            unclosed[fence[0]] = len(fence)
+            i += 1  # unclosed: not a fence
+            continue
+        for j in range(i, end + 1):
+            fenced[j] = True
+        i = end + 1
+    return fenced
+
+
+def links_section_lines(content: str) -> Iterator[Tuple[str, bool, bool]]:
+    """Yield ``(line, in_links_section, is_fenced)`` for each line of *content*.
+
+    The Links section starts at the heading the writer emits, ``## Links``:
+    case-sensitive, one space, up to three leading spaces and any trailing
+    whitespace, outside fenced code. It runs to the next ``## `` heading. A
+    mention in prose, a code span, a fenced example, a longer heading such as
+    ``## Links to read`` and a variant such as ``## links`` are the person's own
+    text, and so is a heading line indented four or more columns (indented
+    code), which neither starts nor ends the section. Indented ``- `` lines
+    inside the section are still entries, since after a list item that indent
+    is a nested item. The
+    parser, the writer and the update reconciler all use this one rule, so they
+    agree on what the section is. A fenced block inside the section is part of
+    it, but its lines are examples, never link entries.
+    """
+    lines = content.split("\n")
+    fenced = _fenced_lines(lines)
+    in_links = False
+    for line, is_fenced in zip(lines, fenced):
+        stripped = line.strip()
+        indent = len(line.expandtabs(4)) - len(line.expandtabs(4).lstrip())
+        if not is_fenced and indent < 4:
+            if _LINKS_HEADING_LINE_RE.fullmatch(line):
+                in_links = True
+            elif in_links and stripped.startswith("## "):
+                in_links = False
+        yield line, in_links, is_fenced
+
+
+def has_links_heading(content: str) -> bool:
+    """Whether *content* has a real ``## Links`` section heading (see above)."""
+    return any(in_links for _, in_links, _ in links_section_lines(content))
+
+
+def text_before_links_section(content: str) -> str:
+    """*content* up to its real ``## Links`` heading, or all of it without one."""
+    lines: List[str] = []
+    for line, in_links, _ in links_section_lines(content):
+        if in_links:
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class NoteRepository(Repository[Note]):
@@ -552,10 +617,7 @@ class NoteRepository(Repository[Note]):
         for note_id in sorted(common):
             file_path = self.notes_dir / f"{note_id}.md"
             try:
-                # Read the file directly, bypassing the mtime-keyed note cache: a
-                # consistency check must see the true on-disk bytes, not a cached
-                # copy that may predate an external edit landing in the same
-                # coarse mtime tick.
+                # Only the body is compared, so parse just the frontmatter split.
                 with open(file_path, "r", encoding="utf-8") as f:
                     file_body = frontmatter.loads(f.read()).content
             except Exception:
@@ -574,17 +636,21 @@ class NoteRepository(Repository[Note]):
             # id-shaped target no longer exists on disk. Informational — these
             # don't affect file/index sync, but each is a broken thread in the
             # knowledge graph.
-            for match in _WIKI_LINK_RE.finditer(file_body):
-                target_id = _normalize_wiki_target(match.group(1))
-                if (
-                    _NOTE_ID_RE.match(target_id)
-                    and target_id != note_id
-                    and target_id not in file_stems
-                ):
-                    entry = f"{note_id} -> {target_id}"
-                    if entry not in seen_dangling:
-                        seen_dangling.add(entry)
-                        dangling_refs.append(entry)
+            # Fenced code is an example, not a reference.
+            for line, _, is_fenced in links_section_lines(file_body):
+                if is_fenced:
+                    continue
+                for match in _WIKI_LINK_RE.finditer(line):
+                    target_id = _normalize_wiki_target(match.group(1))
+                    if (
+                        _NOTE_ID_RE.match(target_id)
+                        and target_id != note_id
+                        and target_id not in file_stems
+                    ):
+                        entry = f"{note_id} -> {target_id}"
+                        if entry not in seen_dangling:
+                            seen_dangling.add(entry)
+                            dangling_refs.append(entry)
 
         in_sync = len(common) - len(content_drift) - len(unreadable_files)
         return {
@@ -638,9 +704,8 @@ class NoteRepository(Repository[Note]):
     def _parse_rebuild_note(self, file_path: Path) -> Optional[Note]:
         """Parse one markdown file for rebuild, logging and skipping failures."""
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_note_from_markdown(content)
+            content, modified = _read_note_file(file_path)
+            return self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             logger.error("Error processing file %s: %s", file_path, e)
             return None
@@ -812,8 +877,15 @@ class NoteRepository(Repository[Note]):
             )
         return rows
 
-    def _parse_note_from_markdown(self, content: str) -> Note:
-        """Parse a note from markdown content."""
+    def _parse_note_from_markdown(
+        self, content: str, fallback_time: Optional[datetime.datetime] = None
+    ) -> Note:
+        """Parse a note from markdown content.
+
+        *fallback_time* stands in for a missing ``created`` (and so ``updated``)
+        field. Callers reading a file pass its modification time, so repeated
+        reads and the index agree; without one it is now().
+        """
         post = frontmatter.loads(content)
         metadata = post.metadata
 
@@ -849,7 +921,9 @@ class NoteRepository(Repository[Note]):
         links = self.parse_links_in_content(note_id, post.content)
         inline_refs = self._parse_inline_refs(note_id, post.content, links)
 
-        created_at = _coerce_datetime(metadata.get("created"), datetime.datetime.now())
+        created_at = _coerce_datetime(
+            metadata.get("created"), fallback_time or datetime.datetime.now()
+        )
         updated_at = _coerce_datetime(metadata.get("updated"), created_at)
 
         _action_keys = {
@@ -937,16 +1011,9 @@ class NoteRepository(Repository[Note]):
         """
         links: List[Link] = []
         seen_link_keys: Set[Tuple[str, LinkType]] = set()
-        links_section = False
-        for line in content.split("\n"):
-            line = line.strip()
-            if line.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and line.startswith("## "):
-                links_section = False
-                continue
-            if links_section and line.startswith("- "):
+        for raw_line, in_links_section, is_fenced in links_section_lines(content):
+            line = raw_line.strip()
+            if in_links_section and not is_fenced and line.startswith("- "):
                 try:
                     line_content = line.strip()
                     if "[[" in line_content and "]]" in line_content:
@@ -999,6 +1066,14 @@ class NoteRepository(Repository[Note]):
         return links
 
     @staticmethod
+    def inline_targets(note: Note) -> List[str]:
+        """Every note ID ``[[linked]]`` in *note*'s prose, including targets it
+        also links explicitly — which ``inline_refs`` leaves out to avoid a
+        duplicate graph edge (e.g. an area's lane map naming its own members).
+        """
+        return NoteRepository._parse_inline_refs(note.id, note.content, [])
+
+    @staticmethod
     def _parse_inline_refs(
         note_id: str, content: str, links: List[Link]
     ) -> List[str]:
@@ -1007,7 +1082,8 @@ class NoteRepository(Repository[Note]):
         Only id-shaped targets count — a ``[[Some Title]]`` style link is not a
         managed reference. Targets already covered by an explicit ## Links entry
         are skipped so the graph doesn't grow a duplicate edge. Fenced code
-        blocks are ignored.
+        blocks are ignored, by the same fence and heading rules as the Links
+        section parser.
         """
         # Exclude INLINE links: a graph-sourced Note carries its inline edges in
         # ``links`` too, and treating those as "explicit" would suppress
@@ -1018,21 +1094,8 @@ class NoteRepository(Repository[Note]):
         }
         refs: List[str] = []
         seen: Set[str] = set()
-        links_section = False
-        in_code_fence = False
-        for line in content.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
-                continue
-            if in_code_fence:
-                continue
-            if stripped.startswith("## Links"):
-                links_section = True
-                continue
-            if links_section and stripped.startswith("## "):
-                links_section = False
-            if links_section:
+        for line, in_links_section, is_fenced in links_section_lines(content):
+            if in_links_section or is_fenced:
                 continue
             for match in _WIKI_LINK_RE.finditer(line):
                 target_id = _normalize_wiki_target(match.group(1))
@@ -1082,16 +1145,12 @@ class NoteRepository(Repository[Note]):
             metadata["last_verified"] = note.last_verified.isoformat()
         metadata.update(note.metadata)
 
-        content_parts = []
-        skip_section = False
-        for line in note.content.split("\n"):
-            if line.strip() == "## Links":
-                skip_section = True
-                continue
-            elif skip_section and line.startswith("## "):
-                skip_section = False
-            if not skip_section:
-                content_parts.append(line)
+        # Drop the old Links section; it is re-rendered from note.links below.
+        content_parts = [
+            line
+            for line, in_links_section, _ in links_section_lines(note.content)
+            if not in_links_section
+        ]
 
         content = "\n".join(content_parts).rstrip()
         content = self._ensure_title_heading(content, note.title)
@@ -1113,7 +1172,9 @@ class NoteRepository(Repository[Note]):
                 target_ref = self._format_wiki_link_target(link.target_id, title_map)
                 # Persist creation time as a markdown comment (invisible in
                 # Obsidian preview) so link provenance survives index rebuilds.
-                created = f" <!-- created: {link.created_at.isoformat(timespec='seconds')} -->"
+                # Full precision, like the frontmatter timestamps: the index
+                # stores the exact value, so a rebuild must parse it back.
+                created = f" <!-- created: {link.created_at.isoformat()} -->"
                 content += (
                     f"- {link.link_type.value} [[{target_ref}]]{desc}{created}\n"
                 )
@@ -1214,10 +1275,11 @@ class NoteRepository(Repository[Note]):
         lines are IDs and titles of OTHER notes, so they dilute the vector —
         and a container note (an area lists every direct member as a has_part
         line) would otherwise embed as a soup of member titles instead of its
-        own meaning. Only an actual ``## Links`` heading line is matched, so the
-        literal text appearing in prose never truncates the body.
+        own meaning. Only a real ``## Links`` heading counts (see
+        ``links_section_lines``), so the text in prose or a fenced example
+        never truncates the body.
         """
-        body = _LINKS_HEADING_RE.split(note.content or "", maxsplit=1)[0]
+        body = text_before_links_section(note.content or "")
         return f"{note.title or ''}\n\n{body}".strip()
 
     @staticmethod
@@ -1385,6 +1447,24 @@ class NoteRepository(Repository[Note]):
         except Exception as exc:
             logger.warning("Vector search failed: %s", exc)
             return {}
+
+    def prewarm_embeddings(self) -> None:
+        """Load the embedding model now, on the calling (startup) thread.
+
+        Same reason as ``FastEmbedReranker.prewarm``: fastembed's first import
+        can deadlock on the Windows loader lock when it runs on a worker thread
+        of a running MCP facade. Never raises; on failure the model lazy-loads
+        on first use as before.
+        """
+        if self._embedding_provider is None:
+            return
+        try:
+            self._embedding_provider.embed_query("warmup")
+        except Exception as exc:
+            logger.warning(
+                "Embedding model pre-warm failed (%s); it will load on first use",
+                exc,
+            )
 
     def vector_search(self, text: str, limit: int = 50) -> List[Tuple[str, float]]:
         """Nearest notes to *text* as (note_id, distance) pairs, closest first.
@@ -1834,23 +1914,29 @@ class NoteRepository(Repository[Note]):
         return note
 
     def get(self, id: str) -> Optional[Note]:
-        """Get a note by ID (reads the markdown file; uses an LRU cache)."""
+        """Get a note by ID, read and parsed from its markdown file.
+
+        Not cached: the file is the source of truth and can be edited outside
+        this process, and no stat signal (mtime, size, inode) proves the bytes
+        unchanged. The old cache was faster for repeat reads of small notes
+        (about 3x at 1 KB) but slower on a miss, and service writes don't
+        notice the difference.
+        """
         file_path = self.notes_dir / f"{id}.md"
         if not file_path.exists():
             return None
         try:
-            path_str = str(file_path)
-            mtime_ns = file_path.stat().st_mtime_ns
-            cached = _cache_get(path_str, mtime_ns)
-            if cached is not None:
-                return cached
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            note = self._parse_note_from_markdown(content)
-            _cache_put(path_str, mtime_ns, note)
-            return note.model_copy(deep=True)
+            content, modified = _read_note_file(file_path)
+            note = self._parse_note_from_markdown(content, fallback_time=modified)
         except Exception as e:
             raise IOError(f"Failed to read note {id}: {e}") from e
+        if note.id != id:
+            # Writes go to the file named by note.id, so returning this note
+            # would let an update overwrite a different note's file.
+            raise IOError(
+                f"Failed to read note {id}: its frontmatter id is {note.id!r}"
+            )
+        return note
 
     def get_by_title(self, title: str) -> Optional[Note]:
         """Get a note by exact title (indexed lookup)."""
@@ -1941,7 +2027,6 @@ class NoteRepository(Repository[Note]):
         markdown = self._note_to_markdown(note)
         file_path = self.notes_dir / f"{note.id}.md"
         self._write_markdown_atomically(file_path, markdown)
-        _cache_evict(str(file_path))
 
         rendered_body = frontmatter.loads(markdown).content
         # Re-derive inline prose refs from the body actually written, so edits
@@ -1985,7 +2070,6 @@ class NoteRepository(Repository[Note]):
 
         with self.file_lock:
             os.remove(file_path)
-        _cache_evict(str(file_path))
 
         # Match every inline form that normalizes to this id — bare, aliased,
         # and with a ".md"/"#fragment" suffix — so none dangle after delete.
