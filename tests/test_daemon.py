@@ -335,6 +335,28 @@ def test_daemon_client_round_trips_note_creation_and_lookup(daemon_server):
     assert fetched.title == "Daemon Created"
 
 
+def test_daemon_note_signals_match_direct_and_count_nothing(daemon_server):
+    """get_note_signals over RPC returns what the service returns directly, and
+    reading it twice changes no counter."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    area = _create_area(client)
+    note = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={"title": "Signalled", "content": "x", "area_id": area.id},
+    )
+    client.call("zettel_service", "record_retrieval", args=[[note.id]])
+    ids = [note.id, area.id, "missing-id"]
+
+    over_rpc = client.call("zettel_service", "get_note_signals", args=[ids])
+    again = client.call("zettel_service", "get_note_signals", args=[ids])
+
+    assert over_rpc == daemon_server.zettel_service.get_note_signals(ids)
+    assert again == over_rpc
+    assert over_rpc[note.id]["retrievals"]["hit_count"] == 1
+    assert over_rpc["missing-id"] == {"status": "not_found"}
+
+
 def test_daemon_task_queries_reflect_live_task_writes(daemon_server):
     """Task queries should see new and reassigned tasks without requiring rebuild."""
     client = DaemonRpcClient(daemon_server.base_url)

@@ -29,6 +29,9 @@ from parazettel_mcp.storage.note_repository import (
 
 logger = logging.getLogger(__name__)
 _UNSET = object()
+# Frontmatter key (in note.metadata) of the record written by an explicit
+# "mark verified": its date, basis, scope and the self-reported verifier.
+VERIFICATION_KEY = "verification"
 # How long a write waits for another process's write to finish. Generous: a full
 # rebuild of a large vault (re-embedding on CPU) can hold the lock for minutes.
 _WRITE_LOCK_TIMEOUT_SECONDS = 600.0
@@ -479,6 +482,91 @@ class ZettelService:
         except Exception:  # pragma: no cover - advisory only
             return {}
 
+    def get_note_signals(self, note_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Usage and verification evidence per note id, read without counting.
+
+        Never records a retrieval and never writes Markdown, so inspecting the
+        signals can't change them. A note that doesn't exist is
+        ``{"status": "not_found"}``; one whose file won't parse is
+        ``"unreadable"`` (its index signals are still read). Each part
+        (``retrievals``, ``citations``, ``verification``) has its own status, so
+        a signal that was never recorded (``none``) is not confused with one
+        that couldn't be read (``unavailable``, with the error).
+        """
+        ids = list(dict.fromkeys(str(nid) for nid in note_ids if nid))
+        result: Dict[str, Dict[str, Any]] = {}
+        for note_id in ids:
+            try:
+                note = self.repository.get(note_id)
+            except Exception as exc:
+                result[note_id] = {
+                    "status": "unreadable",
+                    "title": None,
+                    "verification": {"status": "unavailable", "error": str(exc)},
+                }
+                continue
+            if note is None:
+                result[note_id] = {"status": "not_found"}
+                continue
+            result[note_id] = {
+                "status": "found",
+                "title": note.title,
+                "verification": self._verification_signal(note),
+            }
+        present = [nid for nid, entry in result.items() if entry["status"] != "not_found"]
+        if not present:
+            return result
+
+        try:
+            retrievals = self.repository.get_retrieval_signals(present)
+        except Exception as exc:
+            retrievals = exc
+        try:
+            citations = self.repository.get_citation_signals(
+                present, [link_type.value for link_type in self._ROUTING_LINK_TYPES]
+            )
+        except Exception as exc:
+            citations = exc
+        for note_id in present:
+            entry = result[note_id]
+            if isinstance(retrievals, Exception):
+                entry["retrievals"] = {"status": "unavailable", "error": str(retrievals)}
+            elif note_id in retrievals:
+                entry["retrievals"] = {"status": "recorded", **retrievals[note_id]}
+            else:
+                entry["retrievals"] = {"status": "none"}
+            if isinstance(citations, Exception):
+                entry["citations"] = {"status": "unavailable", "error": str(citations)}
+            elif note_id in citations:
+                entry["citations"] = {"status": "recorded", **citations[note_id]}
+            else:
+                entry["citations"] = {"status": "none"}
+        return result
+
+    @staticmethod
+    def _verification_signal(note: Note) -> Dict[str, Any]:
+        """The note's last_verified and verification record, values as text."""
+        record = note.metadata.get(VERIFICATION_KEY)
+        if note.last_verified is None and record is None:
+            return {"status": "none"}
+        signal: Dict[str, Any] = {
+            "status": "recorded",
+            "last_verified": (
+                note.last_verified.isoformat() if note.last_verified else None
+            ),
+            "record": None,
+        }
+        if isinstance(record, dict):
+            # Hand edits or YAML may turn values into dates or numbers.
+            signal["record"] = {
+                str(key): (value.isoformat() if hasattr(value, "isoformat") else str(value))
+                for key, value in record.items()
+                if value is not None
+            }
+        elif record is not None:
+            signal["record"] = {"unrecognized": str(record)}
+        return signal
+
     def update_note(
         self,
         note_id: str,
@@ -492,6 +580,7 @@ class ZettelService:
         area_id: Any = _UNSET,
         origin: Any = _UNSET,
         last_verified: Any = _UNSET,
+        verification: Any = _UNSET,
     ) -> Note:
         """Update an existing note.
 
@@ -499,6 +588,10 @@ class ZettelService:
         whole read-modify-write (including the cross-note routing updates that
         rewrite a parent's HAS_PART link, and the incoming-link alias refresh)
         runs atomically with respect to other mutations.
+
+        *verification* replaces the note's verification record in its metadata
+        (``None`` removes it), merged here rather than by the caller so a
+        concurrent metadata change isn't lost.
         """
         with self._write_locked():
             return self._update_note_locked(
@@ -513,6 +606,7 @@ class ZettelService:
                 area_id=area_id,
                 origin=origin,
                 last_verified=last_verified,
+                verification=verification,
             )
 
     def _reconcile_links_from_content(self, note: Note, content: str) -> None:
@@ -576,6 +670,7 @@ class ZettelService:
         area_id: Any = _UNSET,
         origin: Any = _UNSET,
         last_verified: Any = _UNSET,
+        verification: Any = _UNSET,
     ) -> Note:
         """Update implementation; caller holds the write lock."""
         note = self.repository.get(note_id)
@@ -607,6 +702,14 @@ class ZettelService:
             note.origin = origin
         if last_verified is not _UNSET:
             note.last_verified = last_verified
+        if verification is not _UNSET:
+            note.metadata = {
+                key: value
+                for key, value in note.metadata.items()
+                if key != VERIFICATION_KEY
+            }
+            if verification is not None:
+                note.metadata[VERIFICATION_KEY] = verification
 
         if note.note_type == NoteType.AREA:
             if note.project_id:

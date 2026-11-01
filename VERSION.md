@@ -6,6 +6,7 @@ Merged to `main` after v0.5.1.1; not yet version-bumped.
 
 ### Highlights
 
+- **New `pzk_note_signals` tool** — read-only usage and verification evidence for explicit note IDs (recorded retrievals, last verification with its basis, current citing notes), without counting the look. `pzk_update_note(mark_verified=true)` can now record the basis, scope and self-reported verifier. `pzk_get_notes` records a retrieval only for `detail="full"`; earlier counts also include its summary and id-list reads.
 - **Search ranks by BM25 relevance.** `pzk_search_notes` now orders text results by the full-text index's own relevance score (Kuzu FTS at the time; SQLite FTS5 since the storage change below) (lexical hits act only as a tiebreaker) instead of a substring heuristic that flattened most matches to a constant. Results surface a `Relevance:` score and a `Match:` context line.
 - **`pzk_rebuild_index` rebuilt for safety.** Under Kuzu it built a fresh index into a temporary database and atomically swapped it in (no in-place clear), fixing a Kuzu bulk-delete segfault on large graphs; on SQLite it backs up the index and refills it in one transaction that rolls back on failure. It reports unparseable/skipped files instead of dropping them silently, and reliably drops orphaned tag nodes. The pre-rebuild backup no longer races the open DB on Windows (WinError 33).
 - **New `pzk_check_consistency` tool** — read-only audit of file-vs-index drift (missing-from-index, missing-from-files, content drift). `31` MCP tools total.

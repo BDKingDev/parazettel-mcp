@@ -325,6 +325,8 @@ Cover the full area → project → task → today view flow.
 
 Retrieves multiple notes by ID or title in one call. This is the batch companion to `pzk_get_note` when an agent needs several note bodies as working context.
 
+Only `detail: "full"` records a retrieval for the returned notes, as with `pzk_get_notes_by_tag` and `pzk_get_project_notes`; a `summary` or `ids` batch is inspection, not a read.
+
 **Call:**
 
 ```json
@@ -392,6 +394,31 @@ Area ID: {AREA_ID}
 # Atomic notes are the foundation of Zettelkasten
 
 Each note contains exactly one idea.
+```
+
+---
+
+### `pzk_note_signals`
+
+Shows, for explicit note IDs, how each note has been used and checked: recorded retrievals (count and last time), `last_verified` with the verification record's basis, scope and self-reported verifier, and how many notes cite it now, with the latest explicit link and the latest inline mention. It is read-only: it records no retrieval and writes no file, so looking doesn't change what it reports. Titles are not resolved; pass IDs. A signal that was never recorded reads "none recorded" / "not recorded" / "none now"; one that couldn't be read reads "unavailable (reason)". Citations count distinct citing notes over the links that exist now, without area/project routing (`part_of`, `has_part`, `blocks`, and a `reference` or inline edge between a note and its own area or project). An inline mention's time is the citing note's last update, so it is shown as approximate. Every response ends with a coverage line: Obsidian reads, search, briefing and recall-hook injections are not counted, and counts recorded before `pzk_get_notes` was limited to full detail include its summary and id-list reads.
+
+**Call:**
+
+```json
+{
+  "ids": ["{NOTE_ID}"]
+}
+```
+
+**Expected output:**
+
+```
+Atomic notes are the foundation of a durable Zettelkasten (ID: {NOTE_ID})
+- Recorded retrievals: 3, last 2026-11-01 13:06
+- Last verified: 2026-11-01; basis: RFC 9110 section 9; scope: not recorded; verifier (self-reported): km-archivist
+- Citing notes: 2 now; latest explicit link 2026-10-30 09:12 from {NOTE_ID_2} (supports); latest inline mention about 2026-10-31 18:40 from {NOTE_ID_3} (approximate: that note's last update)
+
+Coverage: recorded retrievals count pzk_get_note and full-detail reads by ...
 ```
 
 ---
@@ -699,6 +726,18 @@ Use `parent_project_id` when you want to express project routing in parent-proje
 
 ```
 Note updated successfully: {NOTE_ID}
+```
+
+After actually checking a note's claim, record what was checked. `verified_basis`, `verified_scope` and `verified_by` are each optional, and are accepted only with `mark_verified: true`. The record is stored under `verification` in the note's frontmatter. A later `mark_verified: true` replaces the whole record, and `mark_verified: false` clears it with `last_verified`. `verified_by` is stored as given and shown as self-reported. Nothing else (opening, citing, searching) stamps a note.
+
+```json
+{
+  "note_id": "{NOTE_ID}",
+  "mark_verified": true,
+  "verified_basis": "RFC 9110 section 9",
+  "verified_scope": "the caching claim",
+  "verified_by": "km-archivist"
+}
 ```
 
 ---
@@ -1234,6 +1273,7 @@ Creates many notes, links, and tasks in one call — links reference notes by po
 | `pzk_check_consistency` | — | — |
 | `pzk_get_notes` | identifiers | detail |
 | `pzk_get_notes_by_tag` | tag | limit, detail |
+| `pzk_note_signals` | ids | — |
 | `pzk_briefing` | — | — |
 | `pzk_find_similar_to_text` | text | threshold, limit |
 | `pzk_get_neighborhood` | note\_id | depth, max\_nodes |
