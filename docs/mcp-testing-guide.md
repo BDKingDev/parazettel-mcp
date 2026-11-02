@@ -836,6 +836,8 @@ Verify deletion: `pzk_get_note {TEMP_NOTE_ID}` should return `Note not found: {T
 
 **Link cleanup verification** — if any other note had an outgoing link to the deleted note, that link is automatically removed from its markdown file on deletion. Verify by calling `pzk_get_note` on any source note that linked to it — the reference should be gone.
 
+**File already removed outside the server** — if `{TEMP_NOTE_ID}.md` was deleted by hand while the server was running, its index entry is still there until the next startup. The call removes that entry, scrubs references the same way, and starts with `Note file was already gone: {TEMP_NOTE_ID}`. A note with no file and no index entry is `Note not found`.
+
 ---
 
 ## Section 4 — Discovery and Search

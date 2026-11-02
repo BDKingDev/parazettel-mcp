@@ -399,6 +399,29 @@ def test_delete_refused_for_an_unreadable_area_that_has_members(zettel_service):
     assert [note.id for note in indexed if note.id != area.id] == [member.id]
 
 
+def test_delete_refusal_says_when_the_area_no_longer_exists(zettel_service):
+    """Members filed under an area with neither a file nor an index entry
+    still refuse the delete, worded so it doesn't claim the area exists."""
+    area = zettel_service.create_area_note(title="Gone Area", content="a")
+    zettel_service.create_note(
+        title="Filed Note", content="m", note_type=NoteType.PERMANENT, area_id=area.id
+    )
+    repo = zettel_service.repository
+    area_file = repo.notes_dir / f"{area.id}.md"
+
+    area_file.unlink()  # file gone, index entry still present
+    with pytest.raises(ValueError, match=rf"^Area {area.id} still has 1 note"):
+        zettel_service.delete_note(area.id)
+
+    repo.rebuild_index()  # now no index entry either
+    assert not repo.has_note(area.id)
+    with pytest.raises(
+        ValueError,
+        match=rf"^1 note\(s\) are still filed under area {area.id}, which no longer exists",
+    ):
+        zettel_service.delete_note(area.id)
+
+
 def test_create_link(zettel_service):
     """Test creating a link between notes through the service."""
     # Create test notes

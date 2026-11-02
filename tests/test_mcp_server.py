@@ -1998,14 +1998,13 @@ class TestMcpServer:
         assert result == "No project notes found for project project123."
 
     def test_delete_note_tool_deletes_existing_note(self):
-        """pzk_delete_note removes a note after confirming it exists."""
-        self.mock_zettel_service.get_note.return_value = MagicMock()
+        """pzk_delete_note reports a deletion that removed the note's file."""
+        self.mock_zettel_service.delete_note.return_value = True
 
         fn = self.registered_tools["pzk_delete_note"]
         result = fn(note_id="note123")
 
         assert result.startswith("Note deleted successfully: note123")
-        self.mock_zettel_service.get_note.assert_called_once_with("note123")
         self.mock_zettel_service.delete_note.assert_called_once_with("note123")
 
     def test_remove_link_tool_passes_bidirectional_flag(self):

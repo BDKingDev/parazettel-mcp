@@ -489,8 +489,9 @@ class ZettelService:
 
         Never records a retrieval and never writes Markdown, so inspecting the
         signals can't change them. A note that doesn't exist is
-        ``{"status": "not_found"}``; one whose file won't parse is
-        ``"unreadable"`` (its index signals are still read). Each part
+        ``{"status": "not_found"}``; one whose file won't parse or can't be
+        read is ``"unreadable"``, with ``"reason"`` saying which (its index
+        signals are still read). Each part
         (``retrievals``, ``citations``, ``verification``) has its own status, so
         a signal that was never recorded (``none``) is not confused with one
         that couldn't be read (``unavailable``, with the error).
@@ -504,12 +505,19 @@ class ZettelService:
                 # The read error names the file's absolute path; keep it in
                 # the log, not in what the tool shows.
                 logger.warning("Could not read note %s for its signals: %s", note_id, exc)
+                # repository.get wraps every failure in IOError; an OS-level
+                # one (permissions, a directory in the file's place) is its cause.
+                os_error = isinstance(exc.__cause__, OSError)
                 result[note_id] = {
                     "status": "unreadable",
+                    "reason": "unreadable" if os_error else "unparseable",
                     "title": None,
                     "verification": {
                         "status": "unavailable",
-                        "error": "its file couldn't be read",
+                        "error": (
+                            "its file couldn't be read" if os_error
+                            else "its file doesn't parse"
+                        ),
                     },
                 }
                 continue
@@ -836,7 +844,7 @@ class ZettelService:
                 existing_links_source=incoming_note,
             )
 
-    def delete_note(self, note_id: str) -> None:
+    def delete_note(self, note_id: str) -> bool:
         """Delete a note (serialized against all writers by the global write lock).
 
         An area that still has members is refused: they'd be left filed under
@@ -849,6 +857,9 @@ class ZettelService:
         A note whose file can't be parsed must still be deletable. It can't be
         known to be a project, so it has no members to clear, but it gets the
         area membership check, which reads the members, not the note.
+
+        Returns whether a file was removed: False means the file was already
+        gone and only its stale index entry was removed.
         """
         with self._write_locked():
             try:
@@ -882,11 +893,18 @@ class ZettelService:
                     if member.id != note_id
                 ]
                 if members:
+                    if note is None and not self.repository.has_note(note_id):
+                        # Nothing left to delete, but the members still name it.
+                        raise ValueError(
+                            f"{len(members)} note(s) are still filed under area "
+                            f"{note_id}, which no longer exists on disk or in the "
+                            "index; reassign them before this id can be cleared."
+                        )
                     raise ValueError(
                         f"Area {note_id} still has {len(members)} note(s) filed under it; "
                         "reassign them to another area first, then delete it."
                     )
-            self.repository.delete(note_id)
+            return self.repository.delete(note_id)
 
     def get_all_notes(self) -> List[Note]:
         """Get all notes."""

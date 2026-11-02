@@ -16,7 +16,10 @@ from parazettel_mcp.daemon.client import (
     DaemonUnavailableError,
     RemoteServiceProxy,
 )
-from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.index_db import (
+    GraphDatabaseReadOnlyError,
+    NoteNotFoundError,
+)
 from parazettel_mcp.storage.note_repository import NoteRepository
 from parazettel_mcp.models.schema import (
     Link,
@@ -893,7 +896,10 @@ class ZettelkastenMcpServer:
         if not entry or entry.get("status") == "not_found":
             return f"Note not found: {note_id}"
         if entry["status"] == "unreadable":
-            lines = [f"Note {note_id} (its file doesn't parse)"]
+            if entry.get("reason") == "unreadable":
+                lines = [f"Note {note_id} (its file couldn't be read)"]
+            else:
+                lines = [f"Note {note_id} (its file doesn't parse)"]
         else:
             lines = [f"{entry['title']} (ID: {note_id})"]
 
@@ -1451,23 +1457,24 @@ class ZettelkastenMcpServer:
                 note_id: The ID of the note to delete
             """
             try:
-                # Check if note exists. A file that no longer parses still
-                # exists, and delete_note handles it, so only a missing note
-                # is not found.
+                # delete_note also handles a file that no longer parses, and
+                # one already removed outside the server whose index entry
+                # remains; only a note with neither is not found.
                 try:
-                    exists = self.zettel_service.get_note(note_id) is not None
-                except OSError:
-                    exists = True
-                if not exists:
+                    file_removed = self.zettel_service.delete_note(str(note_id))
+                except NoteNotFoundError:
                     return self._not_found_message(note_id)
-
-                # Delete the note
-                self.zettel_service.delete_note(str(note_id))
-                return (
-                    f"Note deleted successfully: {note_id}\n"
+                scrubbed = (
                     "Incoming references were scrubbed: ## Links entries "
                     "removed and inline [[wiki-links]] in prose unlinked."
                 )
+                # A daemon still on older code returns None for a deletion.
+                if file_removed is False:
+                    return (
+                        f"Note file was already gone: {note_id}\n"
+                        f"Its stale index entry was removed. {scrubbed}"
+                    )
+                return f"Note deleted successfully: {note_id}\n{scrubbed}"
             except Exception as e:
                 return self.format_error_response(e)
 

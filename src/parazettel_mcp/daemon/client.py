@@ -8,7 +8,10 @@ from typing import Any, Callable, Dict, Optional
 from urllib import error, request
 
 from parazettel_mcp.daemon.codec import decode_value, encode_value
-from parazettel_mcp.storage.index_db import GraphDatabaseReadOnlyError
+from parazettel_mcp.storage.index_db import (
+    GraphDatabaseReadOnlyError,
+    NoteNotFoundError,
+)
 from parazettel_mcp.services.reranker import RerankerError, RerankerLoadTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,7 @@ ERROR_REGISTRY = {
     "RerankerLoadTimeoutError": RerankerLoadTimeoutError,
     "RuntimeError": RuntimeError,
     "ValueError": ValueError,
+    "NoteNotFoundError": NoteNotFoundError,
     "FileNotFoundError": FileNotFoundError,
     "IOError": IOError,
     "OSError": OSError,
