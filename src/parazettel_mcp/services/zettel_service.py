@@ -893,6 +893,13 @@ class ZettelService:
                     if member.id != note_id
                 ]
                 if members:
+                    if note is None and not self.repository.has_note(note_id):
+                        # Nothing left to delete, but the members still name it.
+                        raise ValueError(
+                            f"{len(members)} note(s) are still filed under area "
+                            f"{note_id}, which no longer exists on disk or in the "
+                            "index; reassign them before this id can be cleared."
+                        )
                     raise ValueError(
                         f"Area {note_id} still has {len(members)} note(s) filed under it; "
                         "reassign them to another area first, then delete it."

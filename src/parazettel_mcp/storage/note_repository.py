@@ -1939,6 +1939,14 @@ class NoteRepository(Repository[Note]):
             )
         return note
 
+    def has_note(self, id: str) -> bool:
+        """Whether *id* has a file or an index entry, readable or not."""
+        if (self.notes_dir / f"{id}.md").exists():
+            return True
+        with self._connection() as conn:
+            row = conn.execute("SELECT 1 FROM notes WHERE id = ?", (id,)).fetchone()
+        return row is not None
+
     def get_by_title(self, title: str) -> Optional[Note]:
         """Get a note by exact title (indexed lookup)."""
         with self._connection() as conn:
