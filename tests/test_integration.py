@@ -174,10 +174,17 @@ class TestIntegration:
         note_file.unlink()
         note_file.mkdir()
         out = signals(ids=[note.id])
-        assert "(its file doesn't parse)" in out
+        assert f"Note {note.id} (its file couldn't be read)" in out
         assert "- Last verified: unavailable (its file couldn't be read)" in out
         assert note_file.name not in out.replace(f"Note {note.id} ", "")
         assert str(self.notes_dir) not in out
+
+        # A file that reads but won't parse is told apart from that.
+        note_file.rmdir()
+        note_file.write_text("---\nid: [unclosed\ntitle: : :\n---\nGarbled.\n")
+        out = signals(ids=[note.id])
+        assert f"Note {note.id} (its file doesn't parse)" in out
+        assert "- Last verified: unavailable (its file doesn't parse)" in out
 
     def test_listing_and_search_record_no_retrieval(self):
         area = self.zettel_service.create_area_note(title="Area", content="a")
@@ -291,6 +298,33 @@ class TestIntegration:
         assert result.startswith(f"Note deleted successfully: {note.id}"), result
         assert not note_file.exists()
         assert "deleted successfully" not in delete(note_id=note.id)
+
+    def test_delete_tool_removes_the_index_entry_of_a_file_removed_outside(self):
+        """A note whose file was deleted outside the server is still indexed;
+        pzk_delete_note removes that entry and scrubs references to it, and
+        says the file was already gone rather than that it deleted it."""
+        svc = self.zettel_service
+        area = svc.create_area_note(title="Area", content="a")
+        gone = svc.create_note(title="Gone Note", content="g", area_id=area.id)
+        citer = svc.create_note(
+            title="Citer", content=f"See [[{gone.id}]] here.", area_id=area.id
+        )
+        svc.create_link(citer.id, gone.id, LinkType.SUPPORTS)
+        (self.notes_dir / f"{gone.id}.md").unlink()
+        repo = self.server.zettel_service.repository  # the tools' service
+        assert repo.find_linked_notes(gone.id, "incoming")
+
+        delete = self.registered_tools["pzk_delete_note"]
+        result = delete(note_id=gone.id)
+
+        assert result.startswith(f"Note file was already gone: {gone.id}"), result
+        assert "stale index entry was removed" in result
+        assert gone.id not in {n.id for n in repo.get_all()}
+        assert repo.find_linked_notes(gone.id, "incoming") == []
+        citer_text = (self.notes_dir / f"{citer.id}.md").read_text()
+        assert gone.id not in citer_text
+        assert "See Gone Note here." in citer_text
+        assert delete(note_id=gone.id).startswith(f"Note not found: {gone.id}")
 
     def test_knowledge_graph_flow(self):
         """Test creating a small knowledge graph with links and semantic relationships."""

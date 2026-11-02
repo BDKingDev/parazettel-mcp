@@ -20,6 +20,7 @@ from parazettel_mcp.daemon.codec import encode_value
 from parazettel_mcp.daemon.server import ParazettelDaemonServer
 from parazettel_mcp.models.schema import Note, NoteSource, NoteType
 from parazettel_mcp.server.mcp_server import ZettelkastenMcpServer
+from parazettel_mcp.storage.index_db import NoteNotFoundError
 
 
 @pytest.fixture
@@ -355,6 +356,25 @@ def test_daemon_note_signals_match_direct_and_count_nothing(daemon_server):
     assert again == over_rpc
     assert over_rpc[note.id]["retrievals"]["hit_count"] == 1
     assert over_rpc["missing-id"] == {"status": "not_found"}
+
+
+def test_daemon_delete_of_a_file_removed_outside_reports_it(daemon_server):
+    """Over RPC, deleting a note whose file is already gone removes its index
+    entry and returns False; a note with no entry left is NoteNotFoundError."""
+    client = DaemonRpcClient(daemon_server.base_url)
+    area = _create_area(client)
+    note = client.call(
+        "zettel_service",
+        "create_note",
+        kwargs={"title": "Gone", "content": "x", "area_id": area.id},
+    )
+    repo = daemon_server.zettel_service.repository
+    (repo.notes_dir / f"{note.id}.md").unlink()
+
+    assert client.call("zettel_service", "delete_note", args=[note.id]) is False
+    assert note.id not in {n.id for n in repo.get_all()}
+    with pytest.raises(NoteNotFoundError):
+        client.call("zettel_service", "delete_note", args=[note.id])
 
 
 def test_daemon_task_queries_reflect_live_task_writes(daemon_server):

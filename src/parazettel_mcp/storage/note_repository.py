@@ -31,6 +31,7 @@ from parazettel_mcp.config import config
 from parazettel_mcp.storage.index_db import (
     EMBEDDING_GENERATION_KEY,
     FTS_WEIGHTS,
+    NoteNotFoundError,
     backup_to,
     bump_counter,
     connect,
@@ -2040,7 +2041,7 @@ class NoteRepository(Repository[Note]):
 
         return note
 
-    def delete(self, id: str) -> None:
+    def delete(self, id: str) -> bool:
         """Delete a note by ID.
 
         Incoming references are scrubbed from every source note: the matching
@@ -2048,28 +2049,41 @@ class NoteRepository(Repository[Note]):
         wiki-links in prose are unlinked in place — replaced by their alias text
         (or the deleted note's title) so the sentence stays readable but no
         dangling reference remains.
+
+        A note whose file was already removed outside this process still has
+        its index entry until the next startup rebuild; that entry is removed
+        and its references scrubbed the same way. Returns whether a file was
+        removed. Raises NoteNotFoundError if there is neither a file nor an
+        index entry.
         """
         self._assert_writable()
         self._invalidate_fts_term_df_cache()
         file_path = self.notes_dir / f"{id}.md"
-        if not file_path.exists():
-            raise ValueError(f"Note with ID {id} does not exist")
+        file_exists = file_path.exists()
+        with self._connection() as conn:
+            row = conn.execute("SELECT title FROM notes WHERE id = ?", (id,)).fetchone()
+        if not file_exists and row is None:
+            raise NoteNotFoundError(f"Note with ID {id} does not exist")
 
         # Read the note before removal so inline refs can be replaced with its
         # title when they carry no alias. A corrupted/unparseable note must
-        # still be deletable, so fall back to its id as the replacement text.
+        # still be deletable, so fall back to its indexed title, then its id.
         try:
             deleted_note = self.get(id)
         except Exception:
             deleted_note = None
-        deleted_title = deleted_note.title if deleted_note else id
+        if deleted_note:
+            deleted_title = deleted_note.title
+        else:
+            deleted_title = (row[0] if row else None) or id
 
         # Incoming sources come from the graph, which includes inline edges, so
         # prose-only referencers are scrubbed too.
         source_notes = self.find_linked_notes(id, "incoming")
 
-        with self.file_lock:
-            os.remove(file_path)
+        if file_exists:
+            with self.file_lock:
+                os.remove(file_path)
 
         # Match every inline form that normalizes to this id — bare, aliased,
         # and with a ".md"/"#fragment" suffix — so none dangle after delete.
@@ -2124,6 +2138,7 @@ class NoteRepository(Repository[Note]):
                 conn.execute("DELETE FROM notes WHERE id = ?", (id,))
                 conn.execute("DELETE FROM retrieval_signals WHERE note_id = ?", (id,))
                 bump_counter(conn, EMBEDDING_GENERATION_KEY)
+        return file_exists
 
     def search(self, **kwargs: Any) -> List[Note]:
         """Search for notes based on criteria.

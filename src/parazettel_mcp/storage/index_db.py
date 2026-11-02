@@ -72,6 +72,10 @@ class GraphDatabaseReadOnlyError(RuntimeError):
     """
 
 
+class NoteNotFoundError(ValueError):
+    """A note to delete has neither a file nor an index entry."""
+
+
 class IndexCapabilityError(RuntimeError):
     """The Python SQLite build lacks a feature the index requires."""
 
