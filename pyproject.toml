@@ -34,9 +34,6 @@ dev = [
     "isort>=5.12.0",
     "mypy>=1.0.0",
 ]
-migration = [
-    "sqlalchemy>=2.0.0",
-]
 # Optional semantic embeddings (PARAZETTEL_EMBEDDING_ENABLED=true). Two tiers:
 # "lite" = fastembed (ONNX, no PyTorch — small, fast, recommended default);
 # full   = sentence-transformers (PyTorch — widest model support incl.
