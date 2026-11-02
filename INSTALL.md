@@ -58,7 +58,9 @@ Optional tuning:
 - `PARAZETTEL_INDEX_BACKUP_KEEP`: timestamped pre-rebuild index backups to keep (default 5)
 - `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS`: how long to wait on a locked index (default 10000)
 - `PARAZETTEL_DEDUP_MIN_BM25`: lexical dedup-on-create floor (default 1.5)
-- `PARAZETTEL_DEDUP_RERANK_MODEL`: dedup confirm cross-encoder (default `Xenova/ms-marco-MiniLM-L-6-v2`, needs `fastembed`; empty disables it)
+- `PARAZETTEL_DEDUP_RERANK_MODEL`: dedup confirm cross-encoder (default `Xenova/ms-marco-MiniLM-L-6-v2`, needs `fastembed`; empty disables it). The duplicate score threshold is calibrated for the default model, so another model may need recalibration.
+
+A running daemon keeps the environment it was started with: changing a setting only in the MCP client's environment doesn't reconfigure it until the daemon restarts.
 
 Legacy compatibility:
 
