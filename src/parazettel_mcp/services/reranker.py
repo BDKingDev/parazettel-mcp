@@ -33,6 +33,7 @@ loud, actionable error instead of hanging. The load lifecycle is logged at INFO
 from __future__ import annotations
 
 import concurrent.futures
+import importlib.util
 import logging
 import os
 import threading
@@ -311,6 +312,9 @@ class FastEmbedReranker:
         return scores
 
 
+_warned_fastembed_missing = False
+
+
 def reranker_enabled(config) -> bool:  # type: ignore[no-untyped-def]
     """Whether the dedup reranker is configured — WITHOUT constructing it.
 
@@ -318,10 +322,33 @@ def reranker_enabled(config) -> bool:  # type: ignore[no-untyped-def]
     backend (the daemon, over RPC) without building or importing anything
     locally — the reranker now lives in the service that owns the data, not in
     every facade.
+
+    An install without fastembed (e.g. only the sentence-transformers
+    ``embeddings`` extra) has no cross-encoder, so the confirm is off there and
+    dedup keeps its unconfirmed candidates, with one warning per process. Only
+    a missing package degrades: any failure loading or scoring with fastembed
+    installed still fails loudly. ``find_spec`` locates the package without
+    importing its C extensions, so this stays safe to call from the facade.
     """
+    global _warned_fastembed_missing
     if not getattr(config, "embedding_enabled", False):
         return False
-    return bool((getattr(config, "dedup_rerank_model", "") or "").strip())
+    model = (getattr(config, "dedup_rerank_model", "") or "").strip()
+    if not model:
+        return False
+    if importlib.util.find_spec("fastembed") is None:
+        if not _warned_fastembed_missing:
+            _warned_fastembed_missing = True
+            logger.warning(
+                "dedup reranker off: %s needs fastembed, which isn't installed. "
+                "Duplicate candidates are reported unconfirmed, so expect more "
+                "false positives. Install parazettel-mcp[embeddings-lite] to "
+                "confirm them, or set PARAZETTEL_DEDUP_RERANK_MODEL= (empty) "
+                "to turn the confirm off without this warning.",
+                model,
+            )
+        return False
+    return True
 
 
 def build_reranker(config) -> Optional[RerankerProvider]:  # type: ignore[no-untyped-def]

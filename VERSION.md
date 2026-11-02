@@ -13,6 +13,7 @@ Merged to `main` after v0.5.1.1; not yet version-bumped.
 - **`pzk_get_all_tags` is edge-derived** — returns only tags actually in use across the vault (via `HAS_TAG` edges), so orphaned tag nodes never surface.
 - **`pzk_find_similar_notes` is content-aware** — blends length-aware lexical overlap of title/content with the structural tag/link signal (excluding PARA routing links), so notes with no shared tags or links can still match.
 - **Area reference link syncs on re-route** — changing a note's `area_id` (directly or via project) now rewrites its `## Links` area reference to match.
+- **Dedup works on a sentence-transformers-only install** — with the `embeddings` extra but no `fastembed`, the dedup cross-encoder is turned off with one warning per process (candidates are reported unconfirmed) instead of every near-duplicate create failing. New `PARAZETTEL_DEDUP_RERANK_MODEL` sets the confirm model (empty turns it off).
 - **Actionable daemon-down errors** — the daemon-unavailable message now includes an absolute, runnable command to start the daemon.
 
 ### AI memory: link integrity, retrieval ergonomics, bidirectional membership

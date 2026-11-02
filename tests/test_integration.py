@@ -292,6 +292,71 @@ class TestIntegration:
         assert not note_file.exists()
         assert "deleted successfully" not in delete(note_id=note.id)
 
+    def test_near_duplicate_create_without_fastembed(self, monkeypatch, caplog):
+        """With embeddings on but no fastembed (the sentence-transformers-only
+        extra), a create whose duplicate check finds a candidate reports it
+        instead of failing on the missing cross-encoder, and says why once."""
+        import builtins
+        import importlib.util
+
+        from parazettel_mcp.config import DEFAULT_DEDUP_RERANK_MODEL
+        from parazettel_mcp.services import reranker
+
+        real_find_spec, real_import = importlib.util.find_spec, builtins.__import__
+
+        def no_fastembed(name, *args, **kwargs):
+            if name == "fastembed" or name.startswith("fastembed."):
+                raise ImportError("fastembed not installed")
+            return real_import(name, *args, **kwargs)
+
+        def find_spec(name, *args, **kwargs):
+            if name == "fastembed":
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        monkeypatch.setattr(builtins, "__import__", no_fastembed)
+        monkeypatch.setattr(reranker, "_warned_fastembed_missing", False)
+        monkeypatch.setattr(config, "embedding_enabled", True)
+        monkeypatch.setattr(config, "embedding_provider", "hash")
+        monkeypatch.setattr(config, "dedup_rerank_model", DEFAULT_DEDUP_RERANK_MODEL)
+
+        tools = {}
+        mock_mcp = type("MockMCP", (), {})()
+        mock_mcp.tool = lambda *a, **k: (lambda f: tools.setdefault(k.get("name"), f))
+        with caplog.at_level("WARNING"):
+            with patch(
+                "parazettel_mcp.server.mcp_server.MCPServer", return_value=mock_mcp
+            ):
+                server = ZettelkastenMcpServer()
+            try:
+                svc = server.zettel_service
+                area = svc.create_area_note(title="Baking", content="a")
+                create = tools["pzk_create_note"]
+                # Unrelated notes give the shared words below enough BM25 weight
+                # for the duplicate check to find a candidate.
+                for topic in ("Tax deadlines", "Bike repair", "Jazz chords", "Tides"):
+                    svc.create_note(
+                        title=topic, content=f"{topic} notes.", area_id=area.id
+                    )
+                body = "Feed the sourdough starter the night before baking bread."
+                first = create(
+                    title="Sourdough needs a lively starter",
+                    content=body, area_id=area.id, source="manual",
+                )
+                second = create(
+                    title="A lively sourdough starter matters",
+                    content=body, area_id=area.id, source="manual",
+                )
+            finally:
+                server.close()
+
+        assert first.startswith("Note created successfully"), first
+        assert second.startswith('Not created: "A lively sourdough'), second
+        assert "Sourdough needs a lively starter" in second
+        warned = [r for r in caplog.records if "needs fastembed" in r.getMessage()]
+        assert len(warned) == 1
+
     def test_knowledge_graph_flow(self):
         """Test creating a small knowledge graph with links and semantic relationships."""
         # Create several notes to form a knowledge graph

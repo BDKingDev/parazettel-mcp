@@ -330,6 +330,7 @@ Key runtime settings:
 - `PARAZETTEL_INDEX_BACKUP_KEEP`: number of timestamped pre-rebuild index backups to keep (default 5)
 - `PARAZETTEL_SQLITE_BUSY_TIMEOUT_MS`: how long a connection waits on a locked index before giving up (default 10000)
 - `PARAZETTEL_DEDUP_MIN_BM25`: minimum BM25 score for a lexical dedup-on-create candidate (default 1.5)
+- `PARAZETTEL_DEDUP_RERANK_MODEL`: cross-encoder that confirms dedup-on-create candidates when embeddings are enabled (default `Xenova/ms-marco-MiniLM-L-6-v2`; needs `fastembed` from `embeddings-lite`; empty disables the confirm)
 - `PARAZETTEL_BACKEND_MODE` / `--backend-mode`: `direct` or `daemon`
 - `PARAZETTEL_DAEMON_HOST` / `--daemon-host`: local daemon bind/connect host
 - `PARAZETTEL_DAEMON_PORT` / `--daemon-port`: local daemon bind/connect port
