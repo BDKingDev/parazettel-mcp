@@ -1,5 +1,8 @@
 """Tests for the dedup cross-encoder reranker (no heavy ML deps required)."""
 
+import builtins
+import importlib.machinery
+import importlib.util
 import sys
 import threading
 import time
@@ -8,6 +11,7 @@ import types
 import pytest
 
 from parazettel_mcp.config import ZettelkastenConfig
+from parazettel_mcp.services import reranker as reranker_module
 from parazettel_mcp.services.reranker import (
     FastEmbedReranker,
     RerankerError,
@@ -16,6 +20,54 @@ from parazettel_mcp.services.reranker import (
     build_reranker,
     reranker_enabled,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fastembed_found(monkeypatch):
+    """Report fastembed as installed, so the on/off tests don't depend on
+    whether this environment has it (no test here loads the real model)."""
+    real_find_spec = importlib.util.find_spec
+
+    def find_spec(name, *args, **kwargs):
+        if name == "fastembed":
+            return importlib.machinery.ModuleSpec("fastembed", None)
+        return real_find_spec(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+
+
+def _hide_fastembed(monkeypatch):
+    """Make fastembed look uninstalled: not found, and not importable."""
+    real_find_spec, real_import = importlib.util.find_spec, builtins.__import__
+
+    def find_spec(name, *args, **kwargs):
+        return None if name == "fastembed" else real_find_spec(name, *args, **kwargs)
+
+    def no_fastembed(name, *args, **kwargs):
+        if name == "fastembed" or name.startswith("fastembed."):
+            raise ImportError("fastembed not installed")
+        return real_import(name, *args, **kwargs)
+
+    for name in list(sys.modules):
+        if name == "fastembed" or name.startswith("fastembed."):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(builtins, "__import__", no_fastembed)
+    monkeypatch.setattr(
+        reranker_module, "_warned_fastembed_missing", False, raising=False
+    )
+
+
+def test_reranker_off_with_one_warning_when_fastembed_is_missing(monkeypatch, caplog):
+    _hide_fastembed(monkeypatch)
+    cfg = ZettelkastenConfig(embedding_enabled=True, dedup_rerank_model="x/model")
+    with caplog.at_level("WARNING", logger="parazettel_mcp.services.reranker"):
+        assert reranker_enabled(cfg) is False
+        assert build_reranker(cfg) is None
+        assert reranker_enabled(cfg) is False
+    warnings = [r for r in caplog.records if "needs fastembed" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "embeddings-lite" in warnings[0].getMessage()
 
 
 def test_build_returns_none_when_embeddings_disabled():
@@ -335,6 +387,18 @@ def test_reranker_enabled_matches_build_reranker():
     on = ZettelkastenConfig(embedding_enabled=True, dedup_rerank_model="x/model")
     assert reranker_enabled(on) is True
     assert (build_reranker(on) is not None) == reranker_enabled(on)
+
+
+def test_rerank_model_env_override(monkeypatch):
+    """PARAZETTEL_DEDUP_RERANK_MODEL sets the model; empty turns the confirm off."""
+    monkeypatch.setenv("PARAZETTEL_DEDUP_RERANK_MODEL", " x/other-model ")
+    cfg = ZettelkastenConfig(embedding_enabled=True)
+    assert cfg.dedup_rerank_model == "x/other-model"
+    monkeypatch.setenv("PARAZETTEL_DEDUP_RERANK_MODEL", "")
+    assert reranker_enabled(ZettelkastenConfig(embedding_enabled=True)) is False
+    monkeypatch.delenv("PARAZETTEL_DEDUP_RERANK_MODEL")
+    default = ZettelkastenConfig(embedding_enabled=True).dedup_rerank_model
+    assert default == "Xenova/ms-marco-MiniLM-L-6-v2"
 
 
 def test_build_passes_load_timeout_from_config():

@@ -41,11 +41,12 @@ DEFAULT_DAEMON_IDLE_TIMEOUT_SECONDS = 3600.0
 # inactivity before recycling, so an in-flight request is never cut off.
 DEFAULT_DAEMON_MEMORY_RECYCLE_IDLE_GRACE_SECONDS = 20.0
 
-# --- Dedup-on-create reranker defaults (code constants, not env-configurable) ---
+# --- Dedup-on-create reranker defaults (env-overridable where noted below) ---
 # Cross-encoder that confirms BM25 dedup candidates: it reads both notes together
 # and is far more precise than BM25 alone, which over-flags on shared vocabulary
 # (true duplicates scored ~7-9, distinct-but-adjacent notes <~1 in testing). The
 # 80 MB ms-marco model is lite-tier-friendly. Empty string disables the confirm.
+# Override with PARAZETTEL_DEDUP_RERANK_MODEL.
 DEFAULT_DEDUP_RERANK_MODEL = "Xenova/ms-marco-MiniLM-L-6-v2"
 # Minimum cross-encoder score for a candidate to count as a duplicate. Re-derive
 # if the model changes.
@@ -264,7 +265,12 @@ class ZettelkastenConfig(BaseModel):
     # Dedup-on-create cross-encoder reranker (see DEFAULT_DEDUP_RERANK_MODEL). Only
     # active when embeddings are enabled; empty string disables the rerank confirm
     # (dedup falls back to the BM25 prefilter alone).
-    dedup_rerank_model: str = Field(default=DEFAULT_DEDUP_RERANK_MODEL)
+    # PARAZETTEL_DEDUP_RERANK_MODEL overrides it.
+    dedup_rerank_model: str = Field(
+        default_factory=lambda: os.getenv(
+            "PARAZETTEL_DEDUP_RERANK_MODEL", DEFAULT_DEDUP_RERANK_MODEL
+        ).strip()
+    )
     dedup_rerank_min_score: float = Field(default=DEFAULT_DEDUP_RERANK_MIN_SCORE)
     # Reduce a long text FTS query to its K most discriminative (lowest-DF) terms
     # so it doesn't match most of the corpus and drop its best lexical hit. 0
