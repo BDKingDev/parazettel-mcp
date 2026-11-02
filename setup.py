@@ -8,7 +8,6 @@ setup(
     include_package_data=True,
     install_requires=[
         "mcp[cli]>=2.3.0,<3",
-        "sqlalchemy>=2.0.0",
         "pydantic>=2.0.0",
         "python-frontmatter>=1.0.0",
         "markdown>=3.4.0",

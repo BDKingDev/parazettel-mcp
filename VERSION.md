@@ -13,6 +13,7 @@ Merged to `main` after v0.5.1.1; not yet version-bumped.
 - **`pzk_get_all_tags` is edge-derived** — returns only tags actually in use across the vault (via `HAS_TAG` edges), so orphaned tag nodes never surface.
 - **`pzk_find_similar_notes` is content-aware** — blends length-aware lexical overlap of title/content with the structural tag/link signal (excluding PARA routing links), so notes with no shared tags or links can still match.
 - **Area reference link syncs on re-route** — changing a note's `area_id` (directly or via project) now rewrites its `## Links` area reference to match.
+- **The `migration` extra is removed.** It only installed SQLAlchemy for the SQLAlchemy → Kuzu migration script, which was deleted in 69d364a (its models went in e77c847), so nothing has imported SQLAlchemy since. `pip install parazettel-mcp[migration]` now warns about the unknown extra and installs the package without it. The stale `setup.py` no longer lists SQLAlchemy either.
 - **Actionable daemon-down errors** — the daemon-unavailable message now includes an absolute, runnable command to start the daemon.
 
 ### AI memory: link integrity, retrieval ergonomics, bidirectional membership
